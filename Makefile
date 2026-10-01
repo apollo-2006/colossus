@@ -26,7 +26,12 @@ $(OBJ_DIR)/shaders/%.inc: viewer/shaders/% viewer/shaders/common.glsl
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -O -mfmt=num -o $@ $<
 
-nexus_view: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(LIB_OBJS)
+# shade.comp a second time, tracing shadows with ray queries.
+$(OBJ_DIR)/shaders/shade_rt.comp.inc: viewer/shaders/shade.comp viewer/shaders/common.glsl
+	@mkdir -p $(OBJ_DIR)/shaders
+	glslc --target-env=vulkan1.3 -DRAY_QUERY -O -mfmt=num -o $@ $<
+
+nexus_view: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(OBJ_DIR)/shaders/shade_rt.comp.inc $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) -Wno-missing-field-initializers $(INCLUDES) -I$(OBJ_DIR)/shaders viewer/main.cpp $(LIB_OBJS) -o $@ -lvulkan -lglfw
 
 clean:

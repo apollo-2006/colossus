@@ -6,7 +6,9 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,6 +37,7 @@ inline VKAPI_ATTR VkBool32 VKAPI_CALL on_message(VkDebugUtilsMessageSeverityFlag
 struct buffer {
     VkBuffer handle = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceAddress address = 0;
     VkDeviceSize size = 0;
     void* mapped = nullptr;  // For host-visible buffers
 };
@@ -60,6 +63,14 @@ public:
     std::string device_name;
 
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
+
+    // Ray queries, if the GPU has them: the viewer then traces shadows.
+    bool ray_query = false;
+    PFN_vkCreateAccelerationStructureKHR create_as = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR destroy_as = nullptr;
+    PFN_vkGetAccelerationStructureBuildSizesKHR as_build_sizes = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR build_as = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR as_address = nullptr;
 
     // With a window, the instance gets the extensions GLFW needs and the
     // device a swapchain.
@@ -121,11 +132,14 @@ public:
         b.size = size;
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = size ? size : 16;
-        bci.usage = usage;
+        bci.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         VK_CHECK(vkCreateBuffer(device, &bci, nullptr, &b.handle));
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, b.handle, &req);
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.pNext = &flags;
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = memory_type(req.memoryTypeBits, host_visible
             ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
@@ -133,6 +147,9 @@ public:
         VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &b.memory));
         VK_CHECK(vkBindBufferMemory(device, b.handle, b.memory, 0));
         if (host_visible) VK_CHECK(vkMapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped));
+        VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        bai.buffer = b.handle;
+        b.address = vkGetBufferDeviceAddress(device, &bai);
         return b;
     }
 
@@ -293,17 +310,28 @@ private:
         device_name = properties.deviceName;
     }
 
-    bool has_extensions(VkPhysicalDevice d) const {
+    static constexpr const char* ray_query_extensions[] = {
+        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+        VK_KHR_RAY_QUERY_EXTENSION_NAME,
+        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+    };
+
+    static bool has(VkPhysicalDevice d, const char* const* names, size_t count) {
         uint32_t n = 0;
         vkEnumerateDeviceExtensionProperties(d, nullptr, &n, nullptr);
         std::vector<VkExtensionProperties> ext(n);
         vkEnumerateDeviceExtensionProperties(d, nullptr, &n, ext.data());
-        for (const char* want : required()) {
+        for (size_t i = 0; i < count; ++i) {
             bool found = false;
-            for (const auto& e : ext) found |= std::strcmp(e.extensionName, want) == 0;
+            for (const auto& e : ext) found |= std::strcmp(e.extensionName, names[i]) == 0;
             if (!found) return false;
         }
         return true;
+    }
+
+    bool has_extensions(VkPhysicalDevice d) const {
+        const auto r = required();
+        return has(d, r.data(), r.size());
     }
 
     void create_device() {
@@ -327,9 +355,16 @@ private:
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
 
+        ray_query = has(gpu, ray_query_extensions, std::size(ray_query_extensions)) && !std::getenv("NEXUS_NO_RAY_QUERY");
+        VkPhysicalDeviceRayQueryFeaturesKHR rq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+        rq.rayQuery = VK_TRUE;
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR as{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+        as.accelerationStructure = VK_TRUE;
+        as.pNext = &rq;
         VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
         mesh.taskShader = VK_TRUE;
         mesh.meshShader = VK_TRUE;
+        if (ray_query) mesh.pNext = &as;
         VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         v13.dynamicRendering = VK_TRUE;
         v13.synchronization2 = VK_TRUE;
@@ -339,6 +374,7 @@ private:
         v12.scalarBlockLayout = VK_TRUE;
         v12.shaderBufferInt64Atomics = VK_TRUE;  // The visibility buffer
         v12.hostQueryReset = VK_TRUE;
+        v12.bufferDeviceAddress = VK_TRUE;
         v12.pNext = &v13;
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.features.shaderInt64 = VK_TRUE;
@@ -347,7 +383,8 @@ private:
         features.features.shaderStorageImageArrayDynamicIndexing = VK_TRUE;  // The depth pyramid's levels
         features.pNext = &v12;
 
-        const auto ext = required();
+        auto ext = required();
+        if (ray_query) ext.insert(ext.end(), std::begin(ray_query_extensions), std::end(ray_query_extensions));
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.pNext = &features;
         dci.queueCreateInfoCount = 1;
@@ -364,6 +401,16 @@ private:
 
         draw_mesh_tasks_indirect = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectEXT>(
             vkGetDeviceProcAddr(device, "vkCmdDrawMeshTasksIndirectEXT"));
+        if (ray_query) {
+            create_as = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
+            destroy_as = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR"));
+            as_build_sizes = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+                vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR"));
+            build_as = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+                vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR"));
+            as_address = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+                vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR"));
+        }
     }
 
     uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {

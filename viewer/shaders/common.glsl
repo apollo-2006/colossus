@@ -27,7 +27,8 @@ struct Cluster {
 struct Mesh {
     uint first_cluster;
     uint cluster_count;
-    uint pad0, pad1;
+    float shadow_error;  // How far the coarser copy that shadows are traced against strays
+    uint pad1;
     vec4 bounds;      // xyz center, w radius
     vec4 lod_bounds;  // Contains every LOD sphere of the model
 };
@@ -75,6 +76,7 @@ const uint flag_wireframe = 4u;
 const uint flag_occlusion = 8u;
 const uint flag_prev_valid = 16u;  // Last frame's pyramid fits this frame
 const uint flag_software_raster = 32u;
+const uint flag_shadows = 64u;
 
 // Which pass this is (0 or 1), and for the pyramid builder, which level.
 layout(push_constant, scalar) uniform Push {

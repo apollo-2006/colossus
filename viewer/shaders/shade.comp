@@ -4,17 +4,26 @@
 // it for exact barycentrics, and the vertex normals interpolated. Pixels
 // with nothing drawn get the ground or the sky. Debug modes color by
 // cluster, triangle, LOD level, group or instance instead.
+//
+// Built twice: with RAY_QUERY defined, sunlight is tested with a shadow ray
+// against acceleration structures over a coarser cut of each model (see
+// build_shadow_scene() in main.cpp).
 #include "common.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D out_image;
 
-const vec3 sun_dir = normalize(vec3(0.45, 0.8, 0.35));
-const vec3 sun_color = vec3(1.0, 0.94, 0.86) * 1.5;
+#ifdef RAY_QUERY
+#extension GL_EXT_ray_query : require
+layout(set = 0, binding = 18) uniform accelerationStructureEXT shadow_scene;
+#endif
+
+const vec3 sun_dir = normalize(vec3(0.75, 0.5, 0.3));
+const vec3 sun_color = vec3(1.0, 0.92, 0.82) * 1.7;
 
 vec3 sky(vec3 dir) {
     const float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    return mix(vec3(0.62, 0.66, 0.72), vec3(0.18, 0.32, 0.58), pow(t, 0.7)) * 0.9;
+    return mix(vec3(0.66, 0.68, 0.71), vec3(0.3, 0.42, 0.62), pow(t, 0.7)) * 0.9;
 }
 
 vec3 hash_color(uint x) {
@@ -36,6 +45,23 @@ vec3 aces(vec3 x) {
 vec2 to_pixel(vec3 world) {
     const vec4 clip = frame.view_proj * vec4(world, 1.0);
     return (clip.xy / clip.w * 0.5 + 0.5) * vec2(frame.width, frame.height);
+}
+
+// 1 where the sun reaches p, 0 where something is in the way. The ray
+// starts `bias` above the surface: the shadow geometry is a coarser copy
+// and can stand that far above the surface drawn.
+float sunlight(vec3 p, vec3 n, float bias) {
+#ifdef RAY_QUERY
+    if ((frame.flags & flag_shadows) == 0u) return 1.0;
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, shadow_scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFFu,
+                          p + n * bias, 0.0, sun_dir, 1e4);
+    while (rayQueryProceedEXT(q)) {
+    }
+    return rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+#else
+    return 1.0;
+#endif
 }
 
 float edge_distance(vec2 p, vec2 a, vec2 b) {
@@ -64,8 +90,9 @@ void main() {
             const vec3 hit = origin + dir * t;
             const vec2 cell = abs(fract(hit.xz * 0.5) - 0.5);
             const float line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
-            const vec3 ground = mix(vec3(0.34, 0.33, 0.31), vec3(0.26, 0.25, 0.24), line) *
-                                (sun_color * max(sun_dir.y, 0.0) * 0.25 + sky(vec3(0, 1, 0)) * 0.6);
+            const float lit = t < 200.0 ? sunlight(hit, vec3(0, 1, 0), 1e-3 + t * 1e-5) : 1.0;
+            const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) *
+                                (sun_color * max(sun_dir.y, 0.0) * 0.6 * lit + sky(vec3(0, 1, 0)) * 0.45);
             color = mix(ground, color, 1.0 - exp(-t * 0.012));
         }
     } else {
@@ -96,7 +123,7 @@ void main() {
         vec3 n = normalize(to_world_dir(inst, normals[i0] * (1.0 - bu - bv) + normals[i1] * bu + normals[i2] * bv));
         if (dot(n, dir) > 0.0) n = -n;  // Seen from behind, through a hole in a scan
 
-        vec3 albedo = vec3(0.62, 0.58, 0.53);
+        vec3 albedo = vec3(0.56, 0.52, 0.47);
         if (frame.debug_mode == 1u) albedo = hash_color(vc.y * 7919u + vc.x * 104729u);
         else if (frame.debug_mode == 2u) albedo = hash_color(id * 2654435761u + vc.x);
         else if (frame.debug_mode == 3u) albedo = level_color(c.level);
@@ -105,8 +132,14 @@ void main() {
         else if (frame.debug_mode == 6u) albedo = vec3(0.3);
         else if (frame.debug_mode == 7u) albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
 
-        const float diffuse = max(dot(n, sun_dir), 0.0);
-        const vec3 ambient = mix(vec3(0.22, 0.2, 0.18), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.5;
+        float diffuse = max(dot(n, sun_dir), 0.0);
+        if (diffuse > 0.0) {
+            // The shadow copy strays up to its own error from the original,
+            // and the drawn cut up to this cluster's: clear both.
+            const float bias = (meshes[inst.mesh].shadow_error + c.lod_error) * inst.scale * 1.5 + 1e-4 + t * 2e-5;
+            diffuse *= sunlight(hit, n, bias);
+        }
+        const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42;
         const float rim = pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25;
         color = albedo * (sun_color * diffuse + ambient) + rim * sky(n);
 

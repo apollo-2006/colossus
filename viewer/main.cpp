@@ -53,6 +53,9 @@ const uint32_t vis_frag_spv[] = {
 const uint32_t shade_spv[] = {
 #include "shade.comp.inc"
 };
+const uint32_t shade_rt_spv[] = {
+#include "shade_rt.comp.inc"
+};
 const uint32_t sw_raster_spv[] = {
 #include "sw_raster.comp.inc"
 };
@@ -68,7 +71,9 @@ constexpr uint32_t mode_count = 8;
 
 // Laid out as viewer/shaders/common.glsl declares them (scalar layout).
 struct gpu_mesh {
-    uint32_t first_cluster, cluster_count, pad0, pad1;
+    uint32_t first_cluster, cluster_count;
+    float shadow_error;
+    uint32_t pad1;
     float bounds[4];
     float lod_bounds[4];
 };
@@ -111,7 +116,10 @@ struct gpu_push {
 };
 
 constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
-                   flag_prev_valid = 16, flag_software_raster = 32;
+                   flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64;
+// Shadows are traced against a cut of each model with at most this many
+// triangles: the finest cut that fits.
+constexpr size_t shadow_triangle_budget = 1u << 18;
 constexpr uint32_t max_hzb_levels = 16;
 
 struct options {
@@ -165,12 +173,51 @@ void frustum_planes(const mat4& m, float out[5][4]) {
     }
 }
 
+// The coarser copy of a model that shadow rays are traced against.
+struct shadow_mesh {
+    uint32_t first_vertex, vertex_count;  // In the scene's positions
+    uint32_t first_index, index_count;    // In scene::shadow_indices, relative to first_vertex
+};
+
 struct scene {
     geometry all;  // Every model's arrays, concatenated
     std::vector<gpu_mesh> meshes;
     std::vector<gpu_instance> instances;
+    std::vector<shadow_mesh> shadow_meshes;
+    std::vector<uint32_t> shadow_indices;
     size_t instanced_triangles = 0;  // At full detail, over every instance
 };
+
+// The finest cut of a model's hierarchy within the shadow budget, as
+// indices into its own vertices, and the error of that cut.
+std::vector<uint32_t> shadow_cut(const geometry& g, float& error) {
+    auto triangles_at = [&](float t) {
+        size_t n = 0;
+        for (const gpu_cluster& c : g.clusters)
+            if (c.lod_error <= t && t < c.parent_error) n += c.triangle_count;
+        return n;
+    };
+    std::vector<float> errors;
+    for (const gpu_cluster& c : g.clusters) errors.push_back(c.lod_error);
+    std::sort(errors.begin(), errors.end());
+    errors.erase(std::unique(errors.begin(), errors.end()), errors.end());
+    size_t lo = 0, hi = errors.size() - 1;  // The cut at the coarsest error is the roots: small enough
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (triangles_at(errors[mid]) <= shadow_triangle_budget) hi = mid;
+        else lo = mid + 1;
+    }
+    error = errors[lo];
+    std::vector<uint32_t> indices;
+    for (const gpu_cluster& c : g.clusters) {
+        if (!(c.lod_error <= error && error < c.parent_error)) continue;
+        for (uint32_t t = 0; t < c.triangle_count; ++t) {
+            const uint32_t p = g.cluster_triangles[c.triangle_offset + t];
+            for (int k = 0; k < 3; ++k) indices.push_back(g.cluster_vertices[c.vertex_offset + ((p >> (8 * k)) & 255)]);
+        }
+    }
+    return indices;
+}
 
 // Loads the models into one set of arrays, and places them on a grid,
 // turned and sized at random.
@@ -182,7 +229,13 @@ scene make_scene(const options& opt) {
         std::printf("%s: %zu clusters, %zu triangles at full detail, %zu levels\n", path.c_str(), g.clusters.size(),
                     g.leaf_triangles(), g.levels.size());
         leaf_triangles.push_back(g.leaf_triangles());
+        float shadow_error = 0;
+        const std::vector<uint32_t> shadow = shadow_cut(g, shadow_error);
+        s.shadow_meshes.push_back({static_cast<uint32_t>(s.all.positions.size() / 3), static_cast<uint32_t>(g.positions.size() / 3),
+                                   static_cast<uint32_t>(s.shadow_indices.size()), static_cast<uint32_t>(shadow.size())});
+        s.shadow_indices.insert(s.shadow_indices.end(), shadow.begin(), shadow.end());
         gpu_mesh m{};
+        m.shadow_error = shadow_error;
         m.first_cluster = static_cast<uint32_t>(s.all.clusters.size());
         m.cluster_count = static_cast<uint32_t>(g.clusters.size());
         m.bounds[0] = g.bounds.center.x; m.bounds[1] = g.bounds.center.y; m.bounds[2] = g.bounds.center.z;
@@ -273,6 +326,16 @@ public:
         for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
+        for (accel* a : {&tlas_}) {
+            if (a->handle) ctx_.destroy_as(ctx_.device, a->handle, nullptr);
+            ctx_.destroy(a->storage);
+        }
+        for (accel& a : blas_) {
+            ctx_.destroy_as(ctx_.device, a.handle, nullptr);
+            ctx_.destroy(a.storage);
+        }
+        ctx_.destroy(shadow_indices_);
+        ctx_.destroy(as_instances_);
         vkDestroyPipelineLayout(ctx_.device, layout_, nullptr);
         vkDestroyDescriptorPool(ctx_.device, pool_, nullptr);
         vkDestroyDescriptorSetLayout(ctx_.device, set_layout_, nullptr);
@@ -652,10 +715,12 @@ private:
 
     void create_static_buffers() {
         const VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        const VkBufferUsageFlags as_input = ctx_.ray_query ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
         clusters_ = ctx_.upload(sc_.all.clusters, ssbo);
         cluster_vertices_ = ctx_.upload(sc_.all.cluster_vertices, ssbo);
         cluster_triangles_ = ctx_.upload(sc_.all.cluster_triangles, ssbo);
-        positions_ = ctx_.upload(sc_.all.positions, ssbo);
+        positions_ = ctx_.upload(sc_.all.positions, ssbo | as_input);
+        if (ctx_.ray_query) build_shadow_scene();
         normals_ = ctx_.upload(sc_.all.normals, ssbo);
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
@@ -676,15 +741,104 @@ private:
         }
     }
 
+    struct accel {
+        VkAccelerationStructureKHR handle = VK_NULL_HANDLE;
+        vk::buffer storage;
+        VkDeviceAddress address = 0;
+    };
+    std::vector<accel> blas_;
+    accel tlas_;
+    vk::buffer shadow_indices_, as_instances_;
+
+    // Builds an acceleration structure over one geometry and waits for it.
+    accel build_accel(VkAccelerationStructureTypeKHR type, const VkAccelerationStructureGeometryKHR& geom, uint32_t primitives) {
+        VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+        info.type = type;
+        info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        info.geometryCount = 1;
+        info.pGeometries = &geom;
+        VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+        ctx_.as_build_sizes(ctx_.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &info, &primitives, &sizes);
+        accel a;
+        a.storage = ctx_.make_buffer(sizes.accelerationStructureSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
+        VkAccelerationStructureCreateInfoKHR ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+        ci.buffer = a.storage.handle;
+        ci.size = sizes.accelerationStructureSize;
+        ci.type = type;
+        VK_CHECK(ctx_.create_as(ctx_.device, &ci, nullptr, &a.handle));
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR asp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &asp;
+        vkGetPhysicalDeviceProperties2(ctx_.gpu, &p2);
+        const VkDeviceSize align = asp.minAccelerationStructureScratchOffsetAlignment;
+        vk::buffer scratch = ctx_.make_buffer(sizes.buildScratchSize + align, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+        info.dstAccelerationStructure = a.handle;
+        info.scratchData.deviceAddress = (scratch.address + align - 1) / align * align;
+        VkAccelerationStructureBuildRangeInfoKHR range{primitives, 0, 0, 0};
+        const VkAccelerationStructureBuildRangeInfoKHR* ranges = &range;
+        ctx_.submit([&](VkCommandBuffer cmd) { ctx_.build_as(cmd, 1, &info, &ranges); });
+        ctx_.destroy(scratch);
+        VkAccelerationStructureDeviceAddressInfoKHR ai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+        ai.accelerationStructure = a.handle;
+        a.address = ctx_.as_address(ctx_.device, &ai);
+        return a;
+    }
+
+    // What shadow rays are traced against: per model, a bottom level over
+    // the finest cut of its hierarchy within the shadow budget (see
+    // shadow_cut()), and a top level over every instance. Two-sided, as
+    // scans are drawn.
+    void build_shadow_scene() {
+        const auto start = std::chrono::steady_clock::now();
+        shadow_indices_ = ctx_.upload(sc_.shadow_indices, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+        size_t triangles = 0;
+        for (const shadow_mesh& m : sc_.shadow_meshes) {
+            VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+            geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+            auto& tris = geom.geometry.triangles;
+            tris.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            tris.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            tris.vertexData.deviceAddress = positions_.address + uint64_t(m.first_vertex) * 12;
+            tris.vertexStride = 12;
+            tris.maxVertex = m.vertex_count - 1;
+            tris.indexType = VK_INDEX_TYPE_UINT32;
+            tris.indexData.deviceAddress = shadow_indices_.address + uint64_t(m.first_index) * 4;
+            blas_.push_back(build_accel(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geom, m.index_count / 3));
+            triangles += m.index_count / 3;
+        }
+        std::vector<VkAccelerationStructureInstanceKHR> instances(sc_.instances.size());
+        for (size_t k = 0; k < instances.size(); ++k) {
+            auto& ai = instances[k];
+            std::memcpy(ai.transform.matrix, sc_.instances[k].rows, sizeof ai.transform.matrix);
+            ai.instanceCustomIndex = static_cast<uint32_t>(k);
+            ai.mask = 0xFF;
+            ai.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            ai.accelerationStructureReference = blas_[sc_.instances[k].mesh].address;
+        }
+        as_instances_ = ctx_.upload(instances, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+        VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+        geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+        geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        geom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        geom.geometry.instances.data.deviceAddress = as_instances_.address;
+        tlas_ = build_accel(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, geom, static_cast<uint32_t>(instances.size()));
+        std::printf("shadows: %s triangles over %zu models, built in %.2f s\n", human(double(triangles)).c_str(),
+                    sc_.shadow_meshes.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    }
+
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 17; ++i) {
+        const uint32_t last_binding = ctx_.ray_query ? 18 : 17;
+        for (uint32_t i = 0; i <= last_binding; ++i) {
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
             x.descriptorCount = i == 17 ? max_hzb_levels : 1;
             x.descriptorType = i == 0                ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
                              : i == 13 || i == 17    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                              : i == 16               ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                             : i == 18               ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
                                                      : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             x.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
             b.push_back(x);
@@ -697,10 +851,11 @@ private:
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (1 + max_hzb_levels) * frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames_in_flight}};
+                                              {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, frames_in_flight}};
         VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pci.maxSets = frames_in_flight;
-        pci.poolSizeCount = 4;
+        pci.poolSizeCount = ctx_.ray_query ? 5 : 4;
         pci.pPoolSizes = sizes;
         VK_CHECK(vkCreateDescriptorPool(ctx_.device, &pci, nullptr, &pool_));
 
@@ -725,6 +880,18 @@ private:
                 w.descriptorCount = 1;
                 w.descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 w.pBufferInfo = &infos[i];
+                writes.push_back(w);
+            }
+            VkWriteDescriptorSetAccelerationStructureKHR as_info{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+            as_info.accelerationStructureCount = 1;
+            as_info.pAccelerationStructures = &tlas_.handle;
+            if (ctx_.ray_query) {
+                VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w.pNext = &as_info;
+                w.dstSet = f.set;
+                w.dstBinding = 18;
+                w.descriptorCount = 1;
+                w.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
                 writes.push_back(w);
             }
             vkUpdateDescriptorSets(ctx_.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -756,7 +923,7 @@ private:
     void create_pipelines() {
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
         args_ = compute_pipeline(args_spv, sizeof args_spv);
-        shade_ = compute_pipeline(shade_spv, sizeof shade_spv);
+        shade_ = ctx_.ray_query ? compute_pipeline(shade_rt_spv, sizeof shade_rt_spv) : compute_pipeline(shade_spv, sizeof shade_spv);
         cluster_cull_ = compute_pipeline(cluster_cull_spv, sizeof cluster_cull_spv);
         sw_raster_ = compute_pipeline(sw_raster_spv, sizeof sw_raster_spv);
         hzb_ = compute_pipeline(hzb_spv, sizeof hzb_spv);
@@ -891,7 +1058,7 @@ struct view_state {
     bool frozen = false;
     float threshold = 1;
     uint32_t mode = 0;
-    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster;
+    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster | flag_shadows;
     float sw_max_pixels = 32;
     float speed = 1.5f;
     bool looking = false;
@@ -939,6 +1106,7 @@ void on_key(GLFWwindow* w, int key, int, int action, int) {
     if (key == GLFW_KEY_V) v->flags ^= flag_frustum_culling;
     if (key == GLFW_KEY_O) v->flags ^= flag_occlusion;
     if (key == GLFW_KEY_R) v->flags ^= flag_software_raster;
+    if (key == GLFW_KEY_H) v->flags ^= flag_shadows;
     if (key == GLFW_KEY_T) v->flags ^= flag_wireframe;
     if (key == GLFW_KEY_P) v->print_camera = true;
     if (key == GLFW_KEY_F) {
@@ -1012,6 +1180,7 @@ options parse(int argc, char** argv) {
         else if (a == "--no-occlusion") o.disable |= flag_occlusion;
         else if (a == "--no-cone") o.disable |= flag_cone_culling;
         else if (a == "--no-sw") o.disable |= flag_software_raster;
+        else if (a == "--no-shadows") o.disable |= flag_shadows;
         else if (a == "--sw-pixels") o.sw_pixels = std::clamp(std::stof(next()), 0.0f, 64.0f);  // sw_raster.comp's 32-bit math holds to 64
         else if (a == "--cull-only") o.cull_only = true;
         else if (a == "--camera") {
@@ -1099,7 +1268,7 @@ int main(int argc, char** argv) {
             std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-8 view (shaded, clusters, triangles, LOD level, groups, instances, holes, rasterizer)\n"
                         "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling,\n"
-                        "      R software rasterizer, T wireframe, P print camera\n");
+                        "      R software rasterizer, H shadows, T wireframe, P print camera\n");
 
             auto last = std::chrono::steady_clock::now();
             const auto start = last;
