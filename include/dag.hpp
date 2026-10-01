@@ -45,6 +45,9 @@ struct lod_cluster {
     float parent_error = INFINITY;    // Infinite for a root: nothing coarser exists
     uint32_t level = 0;
     uint32_t group = UINT32_MAX;       // Number of the group it was simplified in, if any
+    // Number of the group whose simplification made it: the finer clusters
+    // it stands for are that group's members. None for the leaves.
+    uint32_t creator = UINT32_MAX;
 };
 
 struct lod_level_stats {

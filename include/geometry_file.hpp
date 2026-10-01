@@ -1,6 +1,7 @@
 #pragma once
-// The built hierarchy as the GPU reads it, and its file (.cgeo), which is
-// the same bytes: the viewer reads a file straight into buffers.
+// The built hierarchy, with the clusters as the GPU reads them and every
+// level indexing one shared vertex array: the form it is checked and
+// trimmed in, before page() packs it for shipping (paged_file.hpp).
 //
 // Each cluster lists the vertices it uses (indices into the shared vertex
 // arrays) and its triangles as three bytes indexing that list, packed into
@@ -11,7 +12,7 @@
 #include <string>
 #include <vector>
 
-// Laid out as the shaders read it (scalar layout): 96 bytes.
+// Laid out as the shaders read it: 112 bytes, a multiple of 16 for WGSL.
 struct gpu_cluster {
     float center[3];  // Culling bounds
     float radius;
@@ -28,9 +29,11 @@ struct gpu_cluster {
     uint32_t vertex_count;
     uint32_t triangle_count;
     uint32_t level;
-    uint32_t group;  // Unique over the whole hierarchy, for debug colors
+    uint32_t group;    // The group it was simplified in (UINT32_MAX for a root)
+    uint32_t creator;  // The group whose simplification made it (UINT32_MAX for a leaf)
+    uint32_t pad0, pad1, pad2;
 };
-static_assert(sizeof(gpu_cluster) == 96, "gpu_cluster must match the shaders");
+static_assert(sizeof(gpu_cluster) == 112, "gpu_cluster must match the shaders");
 
 struct geometry {
     std::vector<float> positions;  // xyz per vertex
@@ -53,5 +56,3 @@ geometry pack(const lod_mesh& lod);
 // unchanged, so cuts stay crack-free. Unused vertices are dropped. For
 // shipping a model somewhere memory is short, like a web page.
 geometry trim(const geometry& g, size_t max_triangles);
-void save_geometry(const geometry& g, const std::string& path);
-geometry load_geometry(const std::string& path);

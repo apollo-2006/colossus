@@ -8,6 +8,7 @@
 //                                          cut within 500k triangles up
 #include "geometry_file.hpp"
 #include "lod_check.hpp"
+#include "paged_file.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -46,9 +47,11 @@ int main(int argc, char** argv) {
             g = trim(g, max_triangles);
             std::printf("trimmed to %zu triangles at the finest\n", g.leaf_triangles());
         }
-        save_geometry(g, out);
-        std::printf("wrote %s: %zu clusters over %zu levels, %zu triangles in all (%.1fs)\n", out.c_str(), g.clusters.size(),
-                    g.levels.size(), g.cluster_triangles.size(), since());
+        const paged_geometry paged = page(g);
+        save_paged(paged, out);
+        std::printf("wrote %s: %zu clusters over %zu levels, %zu triangles in all, %zu pages, %.0f MB (%.1fs)\n", out.c_str(),
+                    g.clusters.size(), g.levels.size(), g.cluster_triangles.size(), paged.pages.size(),
+                    paged.data_size / 1048576.0, since());
         if (check) {
             size_t bad = 0;
             for (const cut_report& r : check_cuts(g, 24)) {

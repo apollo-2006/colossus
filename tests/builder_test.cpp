@@ -6,6 +6,7 @@
 #include "geometry_file.hpp"
 #include "lod_check.hpp"
 #include "mesh.hpp"
+#include "paged_file.hpp"
 #include "simplify.hpp"
 
 #include <algorithm>
@@ -221,14 +222,42 @@ void test_hierarchy(const char* name, const mesh& input) {
     CHECK(cracked == 0);
     CHECK(worst_area > 0.97);
 
-    // The file holds the same bytes.
+    // Paged and written, then read back: every cluster's vertices and
+    // triangles come out of its page as they went in, and every page's
+    // dependencies are coarser pages.
+    const paged_geometry paged = page(g);
     const std::string path = temp_path("test.cgeo");
-    save_geometry(g, path);
-    const geometry back = load_geometry(path);
-    CHECK(back.clusters.size() == g.clusters.size());
-    CHECK(std::memcmp(back.clusters.data(), g.clusters.data(), g.clusters.size() * sizeof(gpu_cluster)) == 0);
-    CHECK(back.cluster_triangles == g.cluster_triangles && back.cluster_vertices == g.cluster_vertices);
-    CHECK(back.positions == g.positions);
+    save_paged(paged, path);
+    const paged_geometry back = load_paged(path, true);
+    CHECK(back.clusters.size() == g.clusters.size() && back.pages.size() == paged.pages.size());
+    size_t wrong = 0;
+    float worst_normal = 1;
+    for (size_t i = 0; i < g.clusters.size(); ++i) {
+        const gpu_cluster& c = g.clusters[i];
+        const gpu_cluster& pc = back.clusters[i];
+        const uint32_t* base = &back.data[back.pages[pc.group].offset / 4];
+        for (uint32_t k = 0; k < c.vertex_count; ++k) {
+            const uint32_t v = g.cluster_vertices[c.vertex_offset + k];
+            float xyz[3];
+            std::memcpy(xyz, base + pc.vertex_offset + 4 * k, 12);
+            wrong += xyz[0] != g.positions[3 * v] || xyz[1] != g.positions[3 * v + 1] || xyz[2] != g.positions[3 * v + 2];
+            const vec3 n = decode_normal(base[pc.vertex_offset + 4 * k + 3]);
+            worst_normal = std::min(worst_normal, dot(n, vec3(g.normals[3 * v], g.normals[3 * v + 1], g.normals[3 * v + 2])));
+        }
+        for (uint32_t t = 0; t < c.triangle_count; ++t) wrong += base[pc.triangle_offset + t] != g.cluster_triangles[c.triangle_offset + t];
+    }
+    std::printf("  %zu pages; normals within %.4f degrees\n", back.pages.size(), std::acos(std::min(1.0f, worst_normal)) * 57.2958f);
+    CHECK(wrong == 0);
+    CHECK(worst_normal > 0.99999f);
+    size_t bad_deps = 0;
+    for (const gpu_cluster& c : back.clusters)
+        if (c.creator != no_page) {
+            const page_info& fine = back.pages[c.creator];
+            bad_deps += std::find(&back.deps[fine.dep_first], &back.deps[fine.dep_first] + fine.dep_count, c.group) ==
+                        &back.deps[fine.dep_first] + fine.dep_count;
+        }
+    CHECK(bad_deps == 0);
+    CHECK(back.pages[0].dep_count == 0);
 }
 
 }  // namespace

@@ -302,6 +302,7 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 out.clusters[c].group = group_id;
             }
             for (lod_cluster& c : made[g]) {
+                c.creator = group_id;
                 next.push_back(static_cast<uint32_t>(out.clusters.size()));
                 out.clusters.push_back(std::move(c));
             }
