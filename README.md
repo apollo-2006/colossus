@@ -10,6 +10,10 @@ pixel of the original. It is the technique behind Unreal Engine 5's Nanite, writ
 with no libraries beyond Vulkan and GLFW: the clustering, the simplifier, the graph
 partitioning, the culling, both rasterizers and the shading are all in this repository.
 
+**[Fly through it in your browser →](https://apollo-2006.github.io/nexus_geometry/)** A
+WebGPU port of the renderer (see [In the browser](#in-the-browser)), with the debug views,
+the error threshold and the crowd size to play with.
+
 ![900 instances of Lucy and the XYZ RGB dragon, lit by the sun with ray traced shadows](docs/crowd.png)
 
 900 instances of Lucy (28M triangles) and the XYZ RGB dragon (7.2M), 15.9 billion
@@ -96,6 +100,25 @@ and single instances mix levels where they recede.
 
 Which rasterizer drew each pixel (view 8): orange for the compute rasterizer, blue for
 mesh shaders. Only the nearest surfaces are worth sending to the hardware.
+
+## In the browser
+
+`web/` is the renderer ported to WebGPU, which has no mesh shaders, no 64-bit atomics and
+no ray queries:
+
+* Large clusters go through an ordinary render pipeline: one instance per visible
+  cluster, 384 vertices each, every vertex pulling its cluster, triangle and corner
+  from storage buffers.
+* The compute rasterizer cannot write depth and triangle in one atomic, so it runs
+  twice: a 32-bit atomic max keeps the nearest depth, then a second pass writes the
+  triangle wherever its depth won. Shading takes the nearer of the two rasterizers'
+  results at each pixel.
+* No shadows, and no occlusion culling yet.
+
+The models are trimmed to 400k triangles at their finest (`ngeo_build --max-triangles`,
+which keeps the hierarchy above that cut intact), 8 MB each gzipped. 900 instances take
+0.49 ms of GPU time at 1600x813 in Chrome on the RX 9070 XT. `web/build.sh` builds the
+models, and `node tests/web_screenshot.mjs` renders the page in a headless Chrome.
 
 ## Build & run
 
