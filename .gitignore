@@ -1,0 +1,9 @@
+/obj/
+/ngeo_build
+/nexus_view
+/models/*.ply
+/models/*.ngeo
+/models/dragon_recon/
+*.png
+!/docs/*.png
+*.d

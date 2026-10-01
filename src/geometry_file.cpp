@@ -1,0 +1,151 @@
+#include "geometry_file.hpp"
+
+#include <cfloat>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+#include <unordered_map>
+
+namespace {
+
+constexpr char magic[8] = {'N', 'G', 'E', 'O', 'v', '0', '0', '2'};
+
+template <class T>
+void write_vec(std::ofstream& f, const std::vector<T>& v) {
+    const uint64_t n = v.size();
+    f.write(reinterpret_cast<const char*>(&n), sizeof n);
+    f.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(n * sizeof(T)));
+}
+
+template <class T>
+void read_vec(std::ifstream& f, std::vector<T>& v) {
+    uint64_t n = 0;
+    f.read(reinterpret_cast<char*>(&n), sizeof n);
+    if (!f || n > (uint64_t(1) << 34) / sizeof(T)) throw std::runtime_error("geometry file: bad array length");
+    v.resize(n);
+    f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(n * sizeof(T)));
+    if (!f) throw std::runtime_error("geometry file: ends early");
+}
+
+}  // namespace
+
+size_t geometry::leaf_triangles() const {
+    size_t n = 0;
+    for (const gpu_cluster& c : clusters)
+        if (c.level == 0) n += c.triangle_count;
+    return n;
+}
+
+geometry pack(const lod_mesh& lod) {
+    geometry g;
+    g.levels = lod.levels;
+    g.positions.reserve(3 * lod.positions.size());
+    for (const vec3& p : lod.positions) g.positions.insert(g.positions.end(), {p.x, p.y, p.z});
+    for (const vec3& n : lod.normals) g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
+    g.bounds = bounding_sphere(lod.positions.size(), [&](size_t i) { return lod.positions[i]; });
+    // Every LOD sphere, which can stick out past the model a little.
+    g.lod_bounds = g.bounds;
+    for (const lod_cluster& c : lod.clusters) {
+        g.lod_bounds = merge(g.lod_bounds, c.lod_bounds);
+        if (!std::isinf(c.parent_error)) g.lod_bounds = merge(g.lod_bounds, c.parent_bounds);
+    }
+
+    // Sorted by parent error: a cluster can only be drawn while its parent
+    // looks too coarse, so from far away, only a tail of this order can be
+    // drawn, and the viewer skips the rest of a model with one binary search.
+    std::vector<uint32_t> order(lod.clusters.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](uint32_t a, uint32_t b) { return lod.clusters[a].parent_error < lod.clusters[b].parent_error; });
+
+    std::unordered_map<uint32_t, uint32_t> local;
+    for (uint32_t ci : order) {
+        const lod_cluster& c = lod.clusters[ci];
+        gpu_cluster out{};
+        auto put = [](float* dst, vec3 v) { dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; };
+        put(out.center, c.bounds.center);
+        out.radius = c.bounds.radius;
+        put(out.cone_axis, c.cone_axis);
+        out.cone_cutoff = c.cone_cutoff;
+        put(out.lod_center, c.lod_bounds.center);
+        out.lod_radius = c.lod_bounds.radius;
+        put(out.parent_center, c.parent_bounds.center);
+        out.parent_radius = c.parent_bounds.radius;
+        out.lod_error = c.lod_error;
+        out.parent_error = std::isinf(c.parent_error) ? FLT_MAX : c.parent_error;
+        out.level = c.level;
+        out.group = c.group;
+        out.vertex_offset = static_cast<uint32_t>(g.cluster_vertices.size());
+        out.triangle_offset = static_cast<uint32_t>(g.cluster_triangles.size());
+
+        local.clear();
+        for (size_t t = 0; t < c.indices.size(); t += 3) {
+            uint32_t packed = 0;
+            for (int k = 0; k < 3; ++k) {
+                auto [it, added] = local.emplace(c.indices[t + k], static_cast<uint32_t>(local.size()));
+                if (added) g.cluster_vertices.push_back(c.indices[t + k]);
+                packed |= it->second << (8 * k);
+            }
+            g.cluster_triangles.push_back(packed);
+        }
+        out.vertex_count = static_cast<uint32_t>(local.size());
+        out.triangle_count = static_cast<uint32_t>(c.indices.size() / 3);
+        if (out.vertex_count > cluster_max_vertices || out.triangle_count > cluster_max_triangles)
+            throw std::logic_error("cluster over the size limit");
+        g.clusters.push_back(out);
+    }
+    return g;
+}
+
+void save_geometry(const geometry& g, const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot write " + path);
+    f.write(magic, sizeof magic);
+    const float b[8] = {g.bounds.center.x,     g.bounds.center.y,     g.bounds.center.z,     g.bounds.radius,
+                        g.lod_bounds.center.x, g.lod_bounds.center.y, g.lod_bounds.center.z, g.lod_bounds.radius};
+    f.write(reinterpret_cast<const char*>(b), sizeof b);
+    write_vec(f, g.positions);
+    write_vec(f, g.normals);
+    write_vec(f, g.clusters);
+    write_vec(f, g.cluster_vertices);
+    write_vec(f, g.cluster_triangles);
+    write_vec(f, g.levels);
+    if (!f) throw std::runtime_error("writing " + path + " failed");
+}
+
+geometry load_geometry(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    char m[sizeof magic];
+    f.read(m, sizeof m);
+    if (!f || std::memcmp(m, magic, sizeof magic) != 0) throw std::runtime_error(path + " is not a geometry file (or an old one: rebuild it)");
+    geometry g;
+    float b[8];
+    f.read(reinterpret_cast<char*>(b), sizeof b);
+    g.bounds = {{b[0], b[1], b[2]}, b[3]};
+    g.lod_bounds = {{b[4], b[5], b[6]}, b[7]};
+    read_vec(f, g.positions);
+    read_vec(f, g.normals);
+    read_vec(f, g.clusters);
+    read_vec(f, g.cluster_vertices);
+    read_vec(f, g.cluster_triangles);
+    read_vec(f, g.levels);
+    // Every offset the shaders follow is checked here, once.
+    const size_t nv = g.positions.size() / 3;
+    if (g.normals.size() != g.positions.size()) throw std::runtime_error(path + ": normals do not match positions");
+    for (uint32_t v : g.cluster_vertices)
+        if (v >= nv) throw std::runtime_error(path + ": vertex index out of range");
+    for (const gpu_cluster& c : g.clusters) {
+        if (c.vertex_count > cluster_max_vertices || c.triangle_count > cluster_max_triangles ||
+            uint64_t(c.vertex_offset) + c.vertex_count > g.cluster_vertices.size() ||
+            uint64_t(c.triangle_offset) + c.triangle_count > g.cluster_triangles.size())
+            throw std::runtime_error(path + ": cluster out of range");
+        for (uint32_t t = 0; t < c.triangle_count; ++t) {
+            const uint32_t p = g.cluster_triangles[c.triangle_offset + t];
+            if ((p & 255) >= c.vertex_count || (p >> 8 & 255) >= c.vertex_count || (p >> 16 & 255) >= c.vertex_count)
+                throw std::runtime_error(path + ": triangle index out of range");
+        }
+    }
+    return g;
+}
