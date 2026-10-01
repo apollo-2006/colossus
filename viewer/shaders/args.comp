@@ -1,0 +1,13 @@
+#version 460
+// Turns the number of work items into the task shaders' dispatch size: rows
+// of up to 65535 workgroups, the most one dimension may hold.
+#include "common.glsl"
+
+layout(local_size_x = 1) in;
+
+void main() {
+    const uint n = min(work_count, frame.max_work_items);
+    draw_args.task_x = min(n, 65535u);
+    draw_args.task_y = (n + 65534u) / 65535u;
+    draw_args.task_z = 1u;
+}

@@ -1,0 +1,43 @@
+#version 460
+// One thread per instance: drops instances outside the view, then hands the
+// task shaders the clusters that might be drawn, in pieces of 64.
+//
+// Clusters are stored in order of parent error, and a cluster can only be
+// drawn while its parent looks too coarse. Nowhere on the model is nearer
+// than the model's LOD sphere, so every cluster whose parent error is under
+// threshold * distance / (scale * lod_scale) is fine enough everywhere and
+// skipped: a binary search finds where the rest begin. From far away that
+// is a short tail of the coarsest clusters.
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= frame.instance_count) return;
+    const Instance inst = instances[i];
+    const Mesh m = meshes[inst.mesh];
+    if ((frame.flags & flag_frustum_culling) != 0u &&
+        !sphere_in_frustum(to_world(inst, m.bounds.xyz), m.bounds.w * inst.scale))
+        return;
+    atomicAdd(stats.instances_visible, 1u);
+
+    const vec3 lc = to_world(inst, m.lod_bounds.xyz);
+    const float d = max(length(lc - frame.cull_origin.xyz) - m.lod_bounds.w * inst.scale, frame.near_z);
+    const float limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
+    uint lo = 0, hi = m.cluster_count;
+    while (lo < hi) {
+        const uint mid = (lo + hi) / 2;
+        if (clusters[m.first_cluster + mid].parent_error > limit) hi = mid;
+        else lo = mid + 1;
+    }
+    uint chunks = (m.cluster_count - lo + 63u) / 64u;
+    if (chunks == 0u) return;
+    const uint base = atomicAdd(work_count, chunks);
+    if (base + chunks > frame.max_work_items) {
+        atomicAdd(stats.work_overflow, 1u);
+        chunks = base < frame.max_work_items ? frame.max_work_items - base : 0u;
+    }
+    atomicAdd(stats.work_items, chunks);
+    for (uint k = 0; k < chunks; ++k) work[base + k] = WorkItem(i, m.first_cluster + lo + 64u * k);
+}

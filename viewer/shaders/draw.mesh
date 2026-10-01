@@ -1,0 +1,35 @@
+#version 460
+// Mesh shader: one workgroup per visible cluster, one invocation per vertex
+// and per triangle. Each triangle carries its visible-cluster number and
+// its index in the cluster, which is all shading needs to find it again.
+#extension GL_EXT_mesh_shader : require
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+layout(triangles, max_vertices = 128, max_primitives = 128) out;
+
+struct Payload {
+    uint base;
+};
+taskPayloadSharedEXT Payload payload;
+
+layout(location = 0) perprimitiveEXT flat out uint out_id[];
+
+void main() {
+    const uint vid = payload.base + gl_WorkGroupID.x;
+    const uvec2 v = visible[vid];
+    const Instance inst = instances[v.x];
+    const Cluster c = clusters[v.y];
+    SetMeshOutputsEXT(c.vertex_count, c.triangle_count);
+
+    const uint k = gl_LocalInvocationIndex;
+    if (k < c.vertex_count) {
+        const vec3 p = positions[cluster_vertices[c.vertex_offset + k]];
+        gl_MeshVerticesEXT[k].gl_Position = frame.view_proj * vec4(to_world(inst, p), 1.0);
+    }
+    if (k < c.triangle_count) {
+        const uint t = cluster_triangles[c.triangle_offset + k];
+        gl_PrimitiveTriangleIndicesEXT[k] = uvec3(t & 255u, (t >> 8) & 255u, (t >> 16) & 255u);
+        out_id[k] = (vid << 7) | k;
+    }
+}
