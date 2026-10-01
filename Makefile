@@ -34,9 +34,16 @@ $(OBJ_DIR)/shaders/shade_rt.comp.inc: viewer/shaders/shade.comp viewer/shaders/c
 nexus_view: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(OBJ_DIR)/shaders/shade_rt.comp.inc $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) -Wno-missing-field-initializers $(INCLUDES) -I$(OBJ_DIR)/shaders viewer/main.cpp $(LIB_OBJS) -o $@ -lvulkan -lglfw
 
+tests/builder_test: tests/builder_test.cpp $(LIB_OBJS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@
+
+# The builder's tests, on procedural meshes: no GPU or downloads needed.
+test: tests/builder_test
+	./tests/builder_test
+
 clean:
-	rm -rf $(OBJ_DIR) ngeo_build nexus_view
+	rm -rf $(OBJ_DIR) ngeo_build nexus_view tests/builder_test
 
 -include $(LIB_OBJS:.o=.d)
 
-.PHONY: all clean
+.PHONY: all clean test
