@@ -19,7 +19,8 @@
 //
 //   colossus --model models/lucy.cgeo --grid 10
 //   colossus --model a.cgeo --model b.cgeo --grid 40 --headless --frames 60 --screenshot out.png
-#include "geometry_file.hpp"
+#include "paged_file.hpp"
+#include "streamer.hpp"
 #include "png.hpp"
 #include "vk.hpp"
 
@@ -32,6 +33,9 @@
 #include <random>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -99,12 +103,14 @@ struct gpu_frame {
     uint32_t max_work_items;
     uint32_t max_visible;
     float time;
-    uint32_t pad;
+    uint32_t frame_index;
     float view[16];
     float prev_view[16];
     float p00, p11;
     uint32_t hzb_width, hzb_height, hzb_levels;
     float sw_max_pixels;
+    uint32_t max_requests;
+    uint32_t pad10, pad11, pad12;
 };
 struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
@@ -121,6 +127,7 @@ constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wirefra
 // triangles: the finest cut that fits.
 constexpr size_t shadow_triangle_budget = 1u << 18;
 constexpr uint32_t max_hzb_levels = 16;
+constexpr uint32_t max_requests = 1u << 14;  // Pages the GPU may ask for in a frame
 
 struct options {
     std::vector<std::string> models;
@@ -139,6 +146,10 @@ struct options {
     uint32_t disable = 0;  // Flags turned off from the command line
     bool cull_only = false;
     float sw_pixels = 32;
+    uint64_t pool_mb = 1024;   // The page pool
+    uint64_t upload_mb = 64;   // Pages loaded per frame, at most
+    int warmup = 0;            // Headless: frames drawn before timing starts
+    float fly = 0;             // Headless: move the camera this far forward each frame, turning slowly
 };
 
 struct camera {
@@ -175,22 +186,34 @@ void frustum_planes(const mat4& m, float out[5][4]) {
 
 // The coarser copy of a model that shadow rays are traced against.
 struct shadow_mesh {
-    uint32_t first_vertex, vertex_count;  // In the scene's positions
+    uint32_t first_vertex, vertex_count;  // In scene::shadow_positions
     uint32_t first_index, index_count;    // In scene::shadow_indices, relative to first_vertex
 };
 
 struct scene {
-    geometry all;  // Every model's arrays, concatenated
+    std::vector<gpu_cluster> clusters;  // Every model's, with page numbers made global
+    std::vector<stream_page> pages;
+    std::vector<uint32_t> deps;         // Global page numbers
+    std::vector<int> files;
     std::vector<gpu_mesh> meshes;
     std::vector<gpu_instance> instances;
     std::vector<shadow_mesh> shadow_meshes;
+    std::vector<float> shadow_positions;
     std::vector<uint32_t> shadow_indices;
     size_t instanced_triangles = 0;  // At full detail, over every instance
+    uint64_t total_page_bytes = 0;
+
+    scene() = default;
+    scene(const scene&) = delete;
+    ~scene() {
+        for (int fd : files) close(fd);
+    }
 };
 
-// The finest cut of a model's hierarchy within the shadow budget, as
-// indices into its own vertices, and the error of that cut.
-std::vector<uint32_t> shadow_cut(const geometry& g, float& error) {
+// The finest cut of a model's hierarchy within the shadow budget, read
+// from its pages: positions (three floats a vertex, repeated per cluster)
+// and indices into them. Returns the cut's error.
+float shadow_cut(const paged_geometry& g, int fd, std::vector<float>& positions, std::vector<uint32_t>& indices) {
     auto triangles_at = [&](float t) {
         size_t n = 0;
         for (const gpu_cluster& c : g.clusters)
@@ -207,55 +230,81 @@ std::vector<uint32_t> shadow_cut(const geometry& g, float& error) {
         if (triangles_at(errors[mid]) <= shadow_triangle_budget) hi = mid;
         else lo = mid + 1;
     }
-    error = errors[lo];
-    std::vector<uint32_t> indices;
+    const float error = errors[lo];
+    std::vector<uint32_t> words;
+    uint32_t loaded_page = no_page;
     for (const gpu_cluster& c : g.clusters) {
         if (!(c.lod_error <= error && error < c.parent_error)) continue;
+        if (c.group != loaded_page) {
+            const page_info& pg = g.pages[c.group];
+            words.resize(pg.size / 4);
+            if (pread(fd, words.data(), pg.size, static_cast<off_t>(g.data_offset + pg.offset)) != static_cast<ssize_t>(pg.size))
+                throw std::runtime_error("reading a page failed");
+            loaded_page = c.group;
+        }
+        const uint32_t first = static_cast<uint32_t>(positions.size() / 3);
+        for (uint32_t k = 0; k < c.vertex_count; ++k) {
+            float xyz[3];
+            std::memcpy(xyz, &words[c.vertex_offset + 4 * k], 12);
+            positions.insert(positions.end(), xyz, xyz + 3);
+        }
         for (uint32_t t = 0; t < c.triangle_count; ++t) {
-            const uint32_t p = g.cluster_triangles[c.triangle_offset + t];
-            for (int k = 0; k < 3; ++k) indices.push_back(g.cluster_vertices[c.vertex_offset + ((p >> (8 * k)) & 255)]);
+            const uint32_t w = words[c.triangle_offset + t];
+            for (int k = 0; k < 3; ++k) indices.push_back(first + ((w >> (8 * k)) & 255));
         }
     }
-    return indices;
+    return error;
 }
 
-// Loads the models into one set of arrays, and places them on a grid,
-// turned and sized at random.
-scene make_scene(const options& opt) {
-    scene s;
+// Reads the models' clusters and page lists (their geometry streams in
+// later), and places them on a grid, turned and sized at random.
+void make_scene(const options& opt, scene& s) {
     std::vector<size_t> leaf_triangles;
     for (const std::string& path : opt.models) {
-        geometry g = load_geometry(path);
-        std::printf("%s: %zu clusters, %zu triangles at full detail, %zu levels\n", path.c_str(), g.clusters.size(),
-                    g.leaf_triangles(), g.levels.size());
+        const paged_geometry g = load_paged(path, false);
+        const int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("cannot open " + path);
+        s.files.push_back(fd);
+        std::printf("%s: %zu clusters, %zu triangles at full detail, %zu pages, %.0f MB\n", path.c_str(), g.clusters.size(),
+                    g.leaf_triangles(), g.pages.size(), g.data_size / 1048576.0);
         leaf_triangles.push_back(g.leaf_triangles());
-        float shadow_error = 0;
-        const std::vector<uint32_t> shadow = shadow_cut(g, shadow_error);
-        std::printf("  shadow copy: %zu triangles, error %.3g\n", shadow.size() / 3, shadow_error);
-        s.shadow_meshes.push_back({static_cast<uint32_t>(s.all.positions.size() / 3), static_cast<uint32_t>(g.positions.size() / 3),
-                                   static_cast<uint32_t>(s.shadow_indices.size()), static_cast<uint32_t>(shadow.size())});
-        s.shadow_indices.insert(s.shadow_indices.end(), shadow.begin(), shadow.end());
+        s.total_page_bytes += g.data_size;
+
+        const uint32_t page_base = static_cast<uint32_t>(s.pages.size());
+        const uint32_t dep_base = static_cast<uint32_t>(s.deps.size());
+        for (uint32_t d : g.deps) s.deps.push_back(d + page_base);
+        for (uint32_t p = 0; p < g.pages.size(); ++p) {
+            const page_info& pg = g.pages[p];
+            s.pages.push_back({fd, g.data_offset + pg.offset, pg.size, pg.dep_first + dep_base, pg.dep_count, p == 0});
+        }
+
+        shadow_mesh sm{};
+        sm.first_vertex = static_cast<uint32_t>(s.shadow_positions.size() / 3);
+        sm.first_index = static_cast<uint32_t>(s.shadow_indices.size());
+        std::vector<float> positions;
+        std::vector<uint32_t> indices;
+        const float shadow_error = shadow_cut(g, fd, positions, indices);
+        sm.vertex_count = static_cast<uint32_t>(positions.size() / 3);
+        sm.index_count = static_cast<uint32_t>(indices.size());
+        s.shadow_positions.insert(s.shadow_positions.end(), positions.begin(), positions.end());
+        s.shadow_indices.insert(s.shadow_indices.end(), indices.begin(), indices.end());
+        s.shadow_meshes.push_back(sm);
+        std::printf("  shadow copy: %u triangles, error %.3g\n", sm.index_count / 3, shadow_error);
+
         gpu_mesh m{};
         m.shadow_error = shadow_error;
-        m.first_cluster = static_cast<uint32_t>(s.all.clusters.size());
+        m.first_cluster = static_cast<uint32_t>(s.clusters.size());
         m.cluster_count = static_cast<uint32_t>(g.clusters.size());
         m.bounds[0] = g.bounds.center.x; m.bounds[1] = g.bounds.center.y; m.bounds[2] = g.bounds.center.z;
         m.bounds[3] = g.bounds.radius;
         m.lod_bounds[0] = g.lod_bounds.center.x; m.lod_bounds[1] = g.lod_bounds.center.y;
         m.lod_bounds[2] = g.lod_bounds.center.z; m.lod_bounds[3] = g.lod_bounds.radius;
         s.meshes.push_back(m);
-        const uint32_t vertex_base = static_cast<uint32_t>(s.all.positions.size() / 3);
-        const uint32_t cv_base = static_cast<uint32_t>(s.all.cluster_vertices.size());
-        const uint32_t ct_base = static_cast<uint32_t>(s.all.cluster_triangles.size());
         for (gpu_cluster c : g.clusters) {
-            c.vertex_offset += cv_base;
-            c.triangle_offset += ct_base;
-            s.all.clusters.push_back(c);
+            c.group += page_base;
+            if (c.creator != no_page) c.creator += page_base;
+            s.clusters.push_back(c);
         }
-        for (uint32_t v : g.cluster_vertices) s.all.cluster_vertices.push_back(v + vertex_base);
-        s.all.cluster_triangles.insert(s.all.cluster_triangles.end(), g.cluster_triangles.begin(), g.cluster_triangles.end());
-        s.all.positions.insert(s.all.positions.end(), g.positions.begin(), g.positions.end());
-        s.all.normals.insert(s.all.normals.end(), g.normals.begin(), g.normals.end());
     }
 
     std::mt19937 rng(7);
@@ -276,7 +325,6 @@ scene make_scene(const options& opt) {
             s.instances.push_back(inst);
             s.instanced_triangles += leaf_triangles[mesh];
         }
-    return s;
 }
 
 std::string human(double v) {
@@ -290,8 +338,10 @@ std::string human(double v) {
 
 class renderer {
 public:
-    renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, bool cull_only = false)
-        : ctx_(ctx), sc_(sc), cull_only_(cull_only) {
+    renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, uint64_t pool_bytes, uint64_t upload_bytes,
+             bool cull_only = false)
+        : ctx_(ctx), sc_(sc), cull_only_(cull_only), upload_bytes_(upload_bytes),
+          streamer_(sc.pages, sc.deps, pool_bytes) {
         create_static_buffers();
         create_descriptors();
         create_pipelines();
@@ -321,7 +371,9 @@ public:
             ctx_.destroy(f.frame);
             ctx_.destroy(f.stats);
         }
-        for (vk::buffer* b : {&clusters_, &cluster_vertices_, &cluster_triangles_, &positions_, &normals_, &meshes_,
+        for (frame_slot& f : slots_)
+            for (vk::buffer* b : {&f.staging, &f.request_readback, &f.used_readback}) ctx_.destroy(*b);
+        for (vk::buffer* b : {&clusters_, &page_table_, &pool_buffer_, &page_used_, &requests_, &request_stamp_, &shadow_positions_, &meshes_,
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_})
             ctx_.destroy(*b);
         for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_})
@@ -379,6 +431,7 @@ public:
         // Pass 1 culling, pass 1 drawing, both pyramids and pass 2, shading,
         // and the total: from the frame that last used this slot.
         double ms[5] = {};
+        streamer::stats_t streaming;
         bool valid = false;
     };
 
@@ -403,9 +456,30 @@ public:
                 result.valid = true;
             }
         }
+        // Streaming: what the GPU asked for and drew from, two frames ago,
+        // and the pages loaded for it into this slot's staging buffer.
+        std::vector<std::pair<uint32_t, float>> wanted;
+        if (f.used) {
+            streamer_.note_used(static_cast<const uint32_t*>(f.used_readback.mapped));
+            const uint32_t* r = static_cast<const uint32_t*>(f.request_readback.mapped);
+            const uint32_t n = std::min(r[0], max_requests);
+            for (uint32_t k = 0; k < n; ++k) {
+                float priority;
+                std::memcpy(&priority, &r[4 + 2 * k + 1], 4);
+                wanted.push_back({r[4 + 2 * k], priority});
+            }
+        }
+        const uint32_t frame_index = ++frame_counter_;
+        const std::vector<streamer::copy> uploads =
+            streamer_.service(frame_index, std::move(wanted), static_cast<uint8_t*>(f.staging.mapped), upload_bytes_);
+        const std::vector<uint32_t>& table = streamer_.table();
+        std::memcpy(static_cast<uint8_t*>(f.staging.mapped) + upload_bytes_, table.data(), table.size() * 4);
+        result.streaming = streamer_.stats();
         f.used = true;
 
         gpu_frame fr = frame_in;
+        fr.frame_index = frame_index;
+        fr.max_requests = max_requests;
         fr.width = width_;
         fr.height = height_;
         fr.instance_count = static_cast<uint32_t>(sc_.instances.size());
@@ -431,6 +505,12 @@ public:
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 0);
+        std::vector<VkBufferCopy> regions;
+        for (const streamer::copy& c : uploads) regions.push_back({c.staging_offset, c.pool_offset, c.size});
+        if (!regions.empty()) vkCmdCopyBuffer(cmd, f.staging.handle, pool_buffer_.handle, uint32_t(regions.size()), regions.data());
+        const VkBufferCopy table_copy{upload_bytes_, 0, table.size() * 4};
+        vkCmdCopyBuffer(cmd, f.staging.handle, page_table_.handle, 1, &table_copy);
+        vkCmdFillBuffer(cmd, requests_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, vis_.handle, 0, VK_WHOLE_SIZE, 0);
         vkCmdFillBuffer(cmd, work_.handle, 0, 16, 0);  // Both passes' counts and the late counts
         vkCmdFillBuffer(cmd, visible_.handle, 0, 16, 0);
@@ -480,6 +560,13 @@ public:
                            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
         }
+        // What this frame asked for and drew from, for the streamer.
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_READ_BIT);
+        const VkBufferCopy request_copy{0, 0, f.request_readback.size};
+        vkCmdCopyBuffer(cmd, requests_.handle, f.request_readback.handle, 1, &request_copy);
+        const VkBufferCopy used_copy{0, 0, f.used_readback.size};
+        vkCmdCopyBuffer(cmd, page_used_.handle, f.used_readback.handle, 1, &used_copy);
         if (readback) {
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -542,6 +629,9 @@ private:
         VkQueryPool queries = VK_NULL_HANDLE;
         VkDescriptorSet set = VK_NULL_HANDLE;
         vk::buffer frame, stats;
+        vk::buffer staging;           // Pages loaded for this frame, then the page table
+        vk::buffer request_readback;  // What this frame asked for
+        vk::buffer used_readback;     // The frame each page was last drawn from
         bool used = false;
     };
 
@@ -551,7 +641,7 @@ private:
     std::array<frame_slot, frames_in_flight> slots_;
     uint32_t slot_ = 0;
 
-    vk::buffer clusters_, cluster_vertices_, cluster_triangles_, positions_, normals_, meshes_, instances_;
+    vk::buffer clusters_, page_table_, pool_buffer_, page_used_, requests_, request_stamp_, shadow_positions_, meshes_, instances_;
     vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_;
     vk::image depth_, color_, hzb_image_;
     std::vector<VkImageView> hzb_views_;
@@ -565,6 +655,9 @@ private:
     VkPipeline instance_cull_ = VK_NULL_HANDLE, args_ = VK_NULL_HANDLE, shade_ = VK_NULL_HANDLE, raster_ = VK_NULL_HANDLE,
                hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE, sw_raster_ = VK_NULL_HANDLE;
     bool cull_only_ = false;
+    uint64_t upload_bytes_;
+    streamer streamer_;
+    uint32_t frame_counter_ = 0;
 
     void destroy_targets() {
         ctx_.destroy(vis_);
@@ -717,12 +810,22 @@ private:
     void create_static_buffers() {
         const VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         const VkBufferUsageFlags as_input = ctx_.ray_query ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
-        clusters_ = ctx_.upload(sc_.all.clusters, ssbo);
-        cluster_vertices_ = ctx_.upload(sc_.all.cluster_vertices, ssbo);
-        cluster_triangles_ = ctx_.upload(sc_.all.cluster_triangles, ssbo);
-        positions_ = ctx_.upload(sc_.all.positions, ssbo | as_input);
-        if (ctx_.ray_query) build_shadow_scene();
-        normals_ = ctx_.upload(sc_.all.normals, ssbo);
+        clusters_ = ctx_.upload(sc_.clusters, ssbo);
+        const VkBufferUsageFlags dst = VK_BUFFER_USAGE_TRANSFER_DST_BIT, src = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        const uint64_t pages = sc_.pages.size();
+        page_table_ = ctx_.make_buffer(pages * 4, ssbo | dst, false);
+        pool_buffer_ = ctx_.make_buffer(streamer_.pool_bytes(), ssbo | dst, false);
+        page_used_ = ctx_.make_buffer(pages * 4, ssbo | src | dst, false);
+        request_stamp_ = ctx_.make_buffer(pages * 4, ssbo | dst, false);
+        requests_ = ctx_.make_buffer(16 + uint64_t(max_requests) * 8, ssbo | src | dst, false);
+        ctx_.submit([&](VkCommandBuffer cmd) {
+            vkCmdFillBuffer(cmd, page_used_.handle, 0, VK_WHOLE_SIZE, 0);
+            vkCmdFillBuffer(cmd, request_stamp_.handle, 0, VK_WHOLE_SIZE, 0);
+        });
+        if (ctx_.ray_query) {
+            shadow_positions_ = ctx_.upload(sc_.shadow_positions, ssbo | as_input);
+            build_shadow_scene();
+        }
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
         work_ = ctx_.make_buffer(16 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
@@ -739,6 +842,9 @@ private:
         for (frame_slot& f : slots_) {
             f.frame = ctx_.make_buffer(sizeof(gpu_frame), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
             f.stats = ctx_.make_buffer(sizeof(gpu_stats), ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+            f.staging = ctx_.make_buffer(upload_bytes_ + pages * 4, src, true);
+            f.request_readback = ctx_.make_buffer(16 + uint64_t(max_requests) * 8, dst, true);
+            f.used_readback = ctx_.make_buffer(pages * 4, dst, true);
         }
     }
 
@@ -801,7 +907,7 @@ private:
             auto& tris = geom.geometry.triangles;
             tris.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             tris.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            tris.vertexData.deviceAddress = positions_.address + uint64_t(m.first_vertex) * 12;
+            tris.vertexData.deviceAddress = shadow_positions_.address + uint64_t(m.first_vertex) * 12;
             tris.vertexStride = 12;
             tris.maxVertex = m.vertex_count - 1;
             tris.indexType = VK_INDEX_TYPE_UINT32;
@@ -831,8 +937,8 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        const uint32_t last_binding = ctx_.ray_query ? 18 : 17;
-        for (uint32_t i = 0; i <= last_binding; ++i) {
+        for (uint32_t i = 0; i <= 19; ++i) {
+            if (i == 18 && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
             x.descriptorCount = i == 17 ? max_hzb_levels : 1;
@@ -850,7 +956,7 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (1 + max_hzb_levels) * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, frames_in_flight}};
@@ -866,13 +972,13 @@ private:
             ai.descriptorSetCount = 1;
             ai.pSetLayouts = &set_layout_;
             VK_CHECK(vkAllocateDescriptorSets(ctx_.device, &ai, &f.set));
-            const vk::buffer* buffers[] = {&f.frame,   &clusters_, &cluster_vertices_, &cluster_triangles_, &positions_,
-                                           &normals_,  &meshes_,   &instances_,        &work_,              &visible_,
-                                           nullptr,    &f.stats,   &draw_args_,        nullptr,             &late_instances_,
-                                           &late_clusters_};
-            VkDescriptorBufferInfo infos[16];
+            const vk::buffer* buffers[] = {&f.frame,   &clusters_, &page_table_, &pool_buffer_,   &page_used_,
+                                           &requests_, &meshes_,   &instances_,  &work_,          &visible_,
+                                           nullptr,    &f.stats,   &draw_args_,  nullptr,         &late_instances_,
+                                           &late_clusters_, nullptr, nullptr,   nullptr,         &request_stamp_};
+            VkDescriptorBufferInfo infos[20];
             std::vector<VkWriteDescriptorSet> writes;
-            for (uint32_t i = 0; i < 16; ++i) {
+            for (uint32_t i = 0; i < 20; ++i) {
                 if (!buffers[i]) continue;  // The visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1154,7 +1260,10 @@ std::string stats_line(const renderer::frame_result& r, const view_state& v, siz
                   mode_names[v.mode], v.frozen ? " | FROZEN" : "", (v.flags & flag_cone_culling) ? "" : " | no cone",
                   (v.flags & flag_occlusion) ? "" : " | no occlusion", (v.flags & flag_software_raster) ? "" : " | no software raster",
                   (r.stats.work_overflow || r.stats.visible_overflow) ? " | OVERFLOW" : "");
-    return b;
+    const auto& st = r.streaming;
+    char m[160];
+    std::snprintf(m, sizeof m, " | pages %u/%u%s", st.resident, st.slots, st.waiting ? " (streaming)" : "");
+    return std::string(b) + m;
 }
 
 options parse(int argc, char** argv) {
@@ -1182,6 +1291,10 @@ options parse(int argc, char** argv) {
         else if (a == "--no-cone") o.disable |= flag_cone_culling;
         else if (a == "--no-sw") o.disable |= flag_software_raster;
         else if (a == "--no-shadows") o.disable |= flag_shadows;
+        else if (a == "--pool-mb") o.pool_mb = std::clamp<uint64_t>(std::stoull(next()), 16, 4095);
+        else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
+        else if (a == "--warmup") o.warmup = std::stoi(next());
+        else if (a == "--fly") o.fly = std::stof(next());
         else if (a == "--sw-pixels") o.sw_pixels = std::clamp(std::stof(next()), 0.0f, 64.0f);  // sw_raster.comp's 32-bit math holds to 64
         else if (a == "--cull-only") o.cull_only = true;
         else if (a == "--camera") {
@@ -1204,7 +1317,8 @@ options parse(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const options opt = parse(argc, argv);
-        const scene sc = make_scene(opt);
+        scene sc;
+        make_scene(opt, sc);
         std::printf("%zu instances, %s triangles at full detail\n", sc.instances.size(), human(double(sc.instanced_triangles)).c_str());
 
         view_state v;
@@ -1226,19 +1340,40 @@ int main(int argc, char** argv) {
         if (opt.headless) {
             vk::context ctx(nullptr, opt.validate);
             std::printf("GPU: %s\n", ctx.device_name.c_str());
-            renderer r(ctx, sc, opt.width, opt.height, opt.cull_only);
+            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.cull_only);
             std::vector<renderer::frame_result> results;
-            for (int i = 0; i < opt.frames + 2; ++i) {
-                const bool last = i == opt.frames - 1;
+            const int total = opt.warmup + opt.frames;
+            int settled = -1;
+            uint64_t streamed = 0;
+            uint32_t evicted = 0, most_resident = 0;
+            for (int i = 0; i < total + 2; ++i) {
+                if (opt.fly != 0 && i > 0) {
+                    v.cam.eye += v.cam.forward() * opt.fly;
+                    v.cam.yaw += 0.004f;
+                    v.cull_cam = v.cam;
+                }
+                const bool last = i == total - 1;
                 auto res = r.draw(frame_data(v, opt.width, opt.height, 0), VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
                                   last && !opt.screenshot.empty());
-                if (res.valid) results.push_back(res);
+                streamed += res.streaming.bytes_loaded;
+                evicted += res.streaming.evicted;
+                most_resident = std::max(most_resident, res.streaming.resident);
+                if (std::getenv("COLOSSUS_TRACE_STREAMING"))
+                    std::printf("frame %d: requests %u, loaded %u (%.1f MB), waiting %u, resident %u, drawn %u clusters\n", i,
+                                res.streaming.requested, res.streaming.loaded, res.streaming.bytes_loaded / 1048576.0,
+                                res.streaming.waiting, res.streaming.resident, res.stats.clusters_drawn);
+                // Settled: nothing asked for or waiting.
+                if (settled < 0 && i > 2 && res.streaming.requested == 0 && res.streaming.waiting == 0) settled = i;
+                if (res.valid && i >= opt.warmup + 2) results.push_back(res);
                 if (last && !opt.screenshot.empty()) {
                     png::write_rgb(opt.screenshot, opt.width, opt.height, r.read_pixels());
                     std::printf("wrote %s\n", opt.screenshot.c_str());
                 }
             }
             vkDeviceWaitIdle(ctx.device);
+            std::printf("streamed %.0f MB of %.0f MB on disk, evicted %u pages, at most %u resident; %s\n", streamed / 1048576.0,
+                        sc.total_page_bytes / 1048576.0, evicted, most_resident,
+                        settled >= 0 ? ("settled after " + std::to_string(settled) + " frames").c_str() : "still streaming");
             if (!results.empty()) {
                 // The median frame, by total time.
                 std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[4] < b.ms[4]; });
@@ -1265,7 +1400,7 @@ int main(int argc, char** argv) {
             glfwGetFramebufferSize(window, &fw, &fh);
             swapchain swap(ctx, opt.vsync);
             swap.create(fw, fh);
-            renderer r(ctx, sc, swap.extent.width, swap.extent.height);
+            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20);
             std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-8 view (shaded, clusters, triangles, LOD level, groups, instances, holes, rasterizer)\n"
                         "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling,\n"

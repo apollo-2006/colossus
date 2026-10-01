@@ -48,7 +48,7 @@ void main() {
     const uint t = gl_LocalInvocationIndex;
 
     if (t < c.vertex_count) {
-        const vec3 p = positions[cluster_vertices[c.vertex_offset + t]];
+        const vec3 p = cluster_position(page_table[c.group], c, t);
         const vec4 clip = frame.view_proj * vec4(to_world(inst, p), 1.0);
         const vec2 ndc = clip.xy / clip.w;
         const vec2 px = (ndc * 0.5 + 0.5) * vec2(frame.width, frame.height);
@@ -58,7 +58,7 @@ void main() {
     barrier();
     if (t >= c.triangle_count) return;
 
-    const uint packed = cluster_triangles[c.triangle_offset + t];
+    const uint packed = cluster_triangle(page_table[c.group], c, t);
     uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
     ivec2 a = screen[i0], b = screen[i1], d = screen[i2];
     float za = depth[i0], zb = depth[i1], zd = depth[i2];

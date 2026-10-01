@@ -3,7 +3,9 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// include/geometry_file.hpp's gpu_cluster.
+// include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
+// `group` is the page it lives in, `creator` the page of the finer clusters
+// it stands for, and the offsets are words into its page.
 struct Cluster {
     vec3 center;  // Culling bounds
     float radius;
@@ -21,6 +23,8 @@ struct Cluster {
     uint triangle_count;
     uint level;
     uint group;
+    uint creator;
+    uint pad0, pad1, pad2;
 };
 
 // One loaded model: its clusters are clusters[first_cluster, + cluster_count).
@@ -59,7 +63,7 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     uint max_work_items;
     uint max_visible;
     float time;
-    uint pad;
+    uint frame_index;  // Counts from 1: stamps pages used and requested
     // Occlusion culling: the depth pyramid (hzb) and the cameras it is
     // tested from. Pass 1 tests against last frame's pyramid, from last
     // frame's camera; pass 2 against this frame's, built after pass 1.
@@ -68,6 +72,8 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     float p00, p11;  // Projection scale in x and y
     uint hzb_width, hzb_height, hzb_levels;
     float sw_max_pixels;  // Clusters smaller than this on screen go to the software rasterizer
+    uint max_requests;
+    uint pad10, pad11, pad12;
 } frame;
 
 const uint flag_cone_culling = 1u;
@@ -85,10 +91,37 @@ layout(push_constant, scalar) uniform Push {
 } push;
 
 layout(set = 0, binding = 1, scalar) readonly buffer Clusters { Cluster clusters[]; };
-layout(set = 0, binding = 2, scalar) readonly buffer ClusterVertices { uint cluster_vertices[]; };
-layout(set = 0, binding = 3, scalar) readonly buffer ClusterTriangles { uint cluster_triangles[]; };
-layout(set = 0, binding = 4, scalar) readonly buffer Positions { vec3 positions[]; };
-layout(set = 0, binding = 5, scalar) readonly buffer Normals { vec3 normals[]; };
+// Streaming (viewer/streamer.hpp): where each page is in the pool (its
+// first word, or NO_PAGE), the pool, the frame each page was last drawn
+// from, and the pages asked for this frame, with their priority.
+const uint NO_PAGE = 0xffffffffu;
+layout(set = 0, binding = 2, scalar) readonly buffer PageTable { uint page_table[]; };
+layout(set = 0, binding = 3, scalar) readonly buffer Pool { uint pool[]; };
+layout(set = 0, binding = 4, scalar) buffer PageUsed { uint page_used[]; };
+layout(set = 0, binding = 5, scalar) buffer Requests {
+    uint request_count;
+    uint pad7, pad8, pad9;
+    uvec2 requests[];  // (page, priority as float bits)
+};
+layout(set = 0, binding = 19, scalar) buffer RequestStamp { uint request_stamp[]; };
+
+// A cluster's vertices and triangles, from its page at `base`.
+vec3 cluster_position(uint base, Cluster c, uint k) {
+    const uint at = base + c.vertex_offset + 4u * k;
+    return vec3(uintBitsToFloat(pool[at]), uintBitsToFloat(pool[at + 1u]), uintBitsToFloat(pool[at + 2u]));
+}
+
+vec3 cluster_normal(uint base, Cluster c, uint k) {
+    const uint packed = pool[base + c.vertex_offset + 4u * k + 3u];
+    const vec2 e = vec2(float(int(packed << 16) >> 16), float(int(packed) >> 16)) / 32767.0;
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+uint cluster_triangle(uint base, Cluster c, uint t) {
+    return pool[base + c.triangle_offset + t];
+}
 layout(set = 0, binding = 6, scalar) readonly buffer Meshes { Mesh meshes[]; };
 layout(set = 0, binding = 7, scalar) readonly buffer Instances { Instance instances[]; };
 
@@ -233,6 +266,30 @@ bool occluded(vec3 center, float radius) {
     far_depth = min(far_depth, texelFetch(hzb, t1, level).x);
     const float sphere_depth = frame.near_z / (c.z - radius);
     return sphere_depth < far_depth;
+}
+
+// The LOD test with streaming. A cluster is drawn when its own error on
+// screen is within the threshold and its parent's is not, as before, or
+// when the finer clusters it stands for are not resident: then it is the
+// finest copy there is. It must be resident itself. Every page of finer
+// clusters is resident only while the pages of the clusters standing for
+// them are (viewer/streamer.hpp), so exactly one level is drawn along
+// every path. wants_finer: drawn only for want of finer clusters.
+bool lod_test(Instance inst, Cluster c, out bool wants_finer, out float self_error) {
+    const float s = inst.scale;
+    self_error = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s);
+    const bool coarse_enough = projected_error(to_world(inst, c.parent_center), c.parent_radius * s, c.parent_error * s) >
+                               frame.lod_threshold;
+    const bool finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
+    wants_finer = self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
+    return page_table[c.group] != NO_PAGE && coarse_enough && (self_error <= frame.lod_threshold || !finer_resident);
+}
+
+// Asks the streamer for the finer clusters' page, once a frame.
+void request_finer(Cluster c, float priority) {
+    if (atomicExchange(request_stamp[c.creator], frame.frame_index) == frame.frame_index) return;
+    const uint k = atomicAdd(request_count, 1u);
+    if (k < frame.max_requests) requests[k] = uvec2(c.creator, floatBitsToUint(priority));
 }
 
 uint hash(uint x) {

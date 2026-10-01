@@ -23,11 +23,11 @@ void main() {
 
     const uint k = gl_LocalInvocationIndex;
     if (k < c.vertex_count) {
-        const vec3 p = positions[cluster_vertices[c.vertex_offset + k]];
+        const vec3 p = cluster_position(page_table[c.group], c, k);
         gl_MeshVerticesEXT[k].gl_Position = frame.view_proj * vec4(to_world(inst, p), 1.0);
     }
     if (k < c.triangle_count) {
-        const uint t = cluster_triangles[c.triangle_offset + k];
+        const uint t = cluster_triangle(page_table[c.group], c, k);
         gl_PrimitiveTriangleIndicesEXT[k] = uvec3(t & 255u, (t >> 8) & 255u, (t >> 16) & 255u);
         out_id[k] = (vid << 7) | k;
     }

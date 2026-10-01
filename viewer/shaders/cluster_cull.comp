@@ -23,7 +23,8 @@ void main() {
     const uint group = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
     const uint lane = gl_LocalInvocationIndex;
 
-    bool draw = false, tested = false, hidden = false;
+    bool draw = false, tested = false, hidden = false, wants_finer = false;
+    float self_error = 0.0;
     uint instance_id = 0u, cluster_id = 0u, triangles = 0u;
     const uint items = cull_args[pass].w;
     if (group < items) {
@@ -37,9 +38,7 @@ void main() {
             tested = true;
             const Cluster c = clusters[cluster_id];
             const float s = inst.scale;
-            const float tau = frame.lod_threshold;
-            draw = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s) <= tau &&
-                   projected_error(to_world(inst, c.parent_center), c.parent_radius * s, c.parent_error * s) > tau;
+            draw = lod_test(inst, c, wants_finer, self_error);
             const vec3 center = to_world(inst, c.center);
             const float r = c.radius * s;
             if (draw && (frame.flags & flag_frustum_culling) != 0u) draw = sphere_in_frustum(center, r);
@@ -67,9 +66,17 @@ void main() {
             const Cluster c = clusters[cluster_id];
             draw = !occluded(to_world(inst, c.center), c.radius * inst.scale);
             hidden = !draw;
+            if (draw) lod_test(inst, c, wants_finer, self_error);
         }
     }
-    if (draw) triangles = clusters[cluster_id].triangle_count;
+    if (draw) {
+        const Cluster c = clusters[cluster_id];
+        triangles = c.triangle_count;
+        // For the streamer: this page is in use, and this cluster would
+        // rather be finer clusters that are not loaded.
+        page_used[c.group] = frame.frame_index;
+        if (wants_finer) request_finer(c, self_error);
+    }
     if (hidden && pass == 0u) {
         const uint k = atomicAdd(late_cluster_count, 1u);
         if (k < frame.max_visible) late_clusters[k] = uvec2(instance_id, cluster_id);

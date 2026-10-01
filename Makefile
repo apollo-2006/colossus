@@ -37,12 +37,17 @@ colossus: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(OBJ_DIR)/shade
 tests/builder_test: tests/builder_test.cpp $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@
 
-# The builder's tests, on procedural meshes: no GPU or downloads needed.
-test: tests/builder_test
+tests/streamer_test: tests/streamer_test.cpp viewer/streamer.hpp $(LIB_OBJS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/streamer_test.cpp $(LIB_OBJS) -o $@
+
+# The builder's and the streamer's tests, on procedural meshes: no GPU or
+# downloads needed.
+test: tests/builder_test tests/streamer_test
 	./tests/builder_test
+	./tests/streamer_test
 
 clean:
-	rm -rf $(OBJ_DIR) colossus_build colossus tests/builder_test
+	rm -rf $(OBJ_DIR) colossus_build colossus tests/builder_test tests/streamer_test
 
 -include $(LIB_OBJS:.o=.d)
 

@@ -9,3 +9,4 @@
 *.d
 /tests/builder_test
 /web/models/
+/tests/streamer_test
