@@ -1,6 +1,6 @@
-# nexus_geometry
+# colossus
 
-[![ci](https://github.com/apollo-2006/nexus_geometry/actions/workflows/ci.yml/badge.svg)](https://github.com/apollo-2006/nexus_geometry/actions/workflows/ci.yml)
+[![ci](https://github.com/apollo-2006/colossus/actions/workflows/ci.yml/badge.svg)](https://github.com/apollo-2006/colossus/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Virtualized geometry from scratch, in C++20 and Vulkan: a builder that turns a scanned
@@ -10,7 +10,7 @@ pixel of the original. It is the technique behind Unreal Engine 5's Nanite, writ
 with no libraries beyond Vulkan and GLFW: the clustering, the simplifier, the graph
 partitioning, the culling, both rasterizers and the shading are all in this repository.
 
-**[Fly through it in your browser →](https://apollo-2006.github.io/nexus_geometry/)** A
+**[Fly through it in your browser →](https://apollo-2006.github.io/colossus/)** A
 WebGPU port of the renderer (see [In the browser](#in-the-browser)), with the debug views,
 the error threshold and the crowd size to play with.
 
@@ -22,7 +22,7 @@ triangles reach the screen.
 
 ## How it works
 
-### Building the hierarchy (`ngeo_build`)
+### Building the hierarchy (`colossus_build`)
 
 * **Clusters.** The mesh is split into clusters of at most 128 triangles and 128
   vertices (`src/cluster.cpp`), the unit every later step works in. A cluster grows
@@ -51,11 +51,11 @@ triangles reach the screen.
   cluster is tested on its own, by its own GPU thread, with no tree to walk.
 * **Checked for cracks.** Since every level uses the original vertices, a crack is
   exact to detect: an edge used by one triangle of a cut whose ends are not both on a
-  hole in the scan. `ngeo_build --check` selects 25 cuts across the error range and
+  hole in the scan. `colossus_build --check` selects 25 cuts across the error range and
   counts them. Lucy builds 18 levels in 24 s and the dragon 20 levels in 5.4 s, every
   cut with 0 cracked edges.
 
-### Drawing it (`nexus_view`)
+### Drawing it (`colossus`)
 
 1. **Instance culling** (`instance_cull.comp`) drops instances outside the view and,
    for the rest, finds which clusters could be drawn at all. Clusters are stored in
@@ -115,7 +115,7 @@ no ray queries:
   results at each pixel.
 * No shadows, and no occlusion culling yet.
 
-The models are trimmed to 400k triangles at their finest (`ngeo_build --max-triangles`,
+The models are trimmed to 400k triangles at their finest (`colossus_build --max-triangles`,
 which keeps the hierarchy above that cut intact), 8 MB each gzipped. 900 instances take
 0.49 ms of GPU time at 1600x813 in Chrome on the RX 9070 XT. `web/build.sh` builds the
 models, and `node tests/web_screenshot.mjs` renders the page in a headless Chrome.
@@ -126,14 +126,14 @@ Needs a GPU with Vulkan 1.3 and `VK_EXT_mesh_shader`, the Vulkan headers and loa
 GLFW, and `glslc`. Ray queries are optional: without them the viewer draws no shadows.
 
 ```bash
-git clone https://github.com/apollo-2006/nexus_geometry.git
-cd nexus_geometry
+git clone https://github.com/apollo-2006/colossus.git
+cd colossus
 make
 models/fetch.sh            # downloads Lucy and the dragon (380 MB) and builds both
 
-./nexus_view --model models/lucy.ngeo --model models/xyzrgb_dragon.ngeo --grid 30
-./nexus_view --model models/lucy.ngeo                       # one Lucy
-./ngeo_build any.ply out.ngeo --check                       # your own model, checked for cracks
+./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30
+./colossus --model models/lucy.cgeo                       # one Lucy
+./colossus_build any.ply out.cgeo --check                       # your own model, checked for cracks
 ```
 
 | keys | |

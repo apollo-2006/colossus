@@ -1,8 +1,8 @@
 /obj/
-/ngeo_build
-/nexus_view
+/colossus_build
+/colossus
 /models/*.ply
-/models/*.ngeo
+/models/*.cgeo
 /models/dragon_recon/
 *.png
 !/docs/*.png

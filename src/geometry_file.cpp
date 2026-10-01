@@ -10,7 +10,7 @@
 
 namespace {
 
-constexpr char magic[8] = {'N', 'G', 'E', 'O', 'v', '0', '0', '2'};
+constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '3'};
 
 template <class T>
 void write_vec(std::ofstream& f, const std::vector<T>& v) {

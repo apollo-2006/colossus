@@ -1,5 +1,5 @@
-// nexus_geometry viewer: draws instanced cluster LOD hierarchies (.ngeo
-// files from ngeo_build) with task and mesh shaders on Vulkan.
+// colossus viewer: draws instanced cluster LOD hierarchies (.cgeo
+// files from colossus_build) with task and mesh shaders on Vulkan.
 //
 // Each frame:
 //   1. instance_cull.comp drops instances outside the view and, for each
@@ -17,8 +17,8 @@
 // re-testing what the first pass found hidden.
 //   4. shade.comp rebuilds the triangle under every pixel and shades it.
 //
-//   nexus_view --model models/lucy.ngeo --grid 10
-//   nexus_view --model a.ngeo --model b.ngeo --grid 40 --headless --frames 60 --screenshot out.png
+//   colossus --model models/lucy.cgeo --grid 10
+//   colossus --model a.cgeo --model b.cgeo --grid 40 --headless --frames 60 --screenshot out.png
 #include "geometry_file.hpp"
 #include "png.hpp"
 #include "vk.hpp"
@@ -1194,7 +1194,7 @@ options parse(int argc, char** argv) {
             o.camera_set = true;
         } else throw std::runtime_error("unknown argument " + a);
     }
-    if (o.models.empty()) throw std::runtime_error("usage: nexus_view --model FILE.ngeo [--model ...] [--grid N] [--headless --frames N --screenshot out.png]");
+    if (o.models.empty()) throw std::runtime_error("usage: colossus --model FILE.cgeo [--model ...] [--grid N] [--headless --frames N --screenshot out.png]");
     if (o.headless && o.frames <= 0) o.frames = 1;
     return o;
 }
@@ -1253,7 +1253,7 @@ int main(int argc, char** argv) {
 
         if (!glfwInit()) throw std::runtime_error("glfwInit failed");
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        GLFWwindow* window = glfwCreateWindow(opt.width, opt.height, "nexus_geometry", nullptr, nullptr);
+        GLFWwindow* window = glfwCreateWindow(opt.width, opt.height, "colossus", nullptr, nullptr);
         if (!window) throw std::runtime_error("cannot open a window");
         glfwSetWindowUserPointer(window, &v);
         glfwSetKeyCallback(window, on_key);
@@ -1317,7 +1317,7 @@ int main(int argc, char** argv) {
                 title_timer += dt;
                 if (res.valid && title_timer > 0.25) {
                     title_timer = 0;
-                    glfwSetWindowTitle(window, ("nexus_geometry | " + stats_line(res, v, sc.instances.size())).c_str());
+                    glfwSetWindowTitle(window, ("colossus | " + stats_line(res, v, sc.instances.size())).c_str());
                 }
             }
             vkDeviceWaitIdle(ctx.device);

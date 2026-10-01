@@ -117,7 +117,7 @@ export class Renderer {
     this.gpuMs = null;
   }
 
-  // models: parsed .ngeo files. placements: {model, matrix (3x4 rows), scale}.
+  // models: parsed .cgeo files. placements: {model, matrix (3x4 rows), scale}.
   loadScene(models, placements) {
     const d = this.device;
     let vertexBase = 0, cvBase = 0, ctBase = 0, clusterBase = 0;

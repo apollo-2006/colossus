@@ -1,5 +1,5 @@
 #pragma once
-// The built hierarchy as the GPU reads it, and its file (.ngeo), which is
+// The built hierarchy as the GPU reads it, and its file (.cgeo), which is
 // the same bytes: the viewer reads a file straight into buffers.
 //
 // Each cluster lists the vertices it uses (indices into the shared vertex

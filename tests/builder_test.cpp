@@ -91,7 +91,7 @@ mesh grid(int n) {
 }
 
 std::string temp_path(const char* name) {
-    return std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/nexus_geometry_" + name;
+    return std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/colossus_" + name;
 }
 
 void test_ply_and_obj() {
@@ -222,7 +222,7 @@ void test_hierarchy(const char* name, const mesh& input) {
     CHECK(worst_area > 0.97);
 
     // The file holds the same bytes.
-    const std::string path = temp_path("test.ngeo");
+    const std::string path = temp_path("test.cgeo");
     save_geometry(g, path);
     const geometry back = load_geometry(path);
     CHECK(back.clusters.size() == g.clusters.size());

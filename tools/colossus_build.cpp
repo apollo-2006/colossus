@@ -1,9 +1,9 @@
-// ngeo_build: reads a PLY or OBJ model, builds its cluster LOD hierarchy and
-// writes it as a .ngeo file for the viewer.
+// colossus_build: reads a PLY or OBJ model, builds its cluster LOD hierarchy and
+// writes it as a .cgeo file for the viewer.
 //
-//   ngeo_build models/lucy.ply models/lucy.ngeo --up-z
-//   ngeo_build in.obj out.ngeo --check     also check every cut for cracks
-//   ngeo_build in.ply out.ngeo --max-triangles 500000
+//   colossus_build models/lucy.ply models/lucy.cgeo --up-z
+//   colossus_build in.obj out.cgeo --check     also check every cut for cracks
+//   colossus_build in.ply out.cgeo --max-triangles 500000
 //                                          keep only the levels from the finest
 //                                          cut within 500k triangles up
 #include "geometry_file.hpp"
@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unexpected argument %s\n", argv[i]); return 2; }
     }
     if (in.empty() || out.empty()) {
-        std::fprintf(stderr, "usage: ngeo_build IN.(ply|obj) OUT.ngeo [--up-z] [--check] [--max-triangles N]\n");
+        std::fprintf(stderr, "usage: colossus_build IN.(ply|obj) OUT.cgeo [--up-z] [--check] [--max-triangles N]\n");
         return 2;
     }
     try {

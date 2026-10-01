@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nexus_geometry</title>
+<title>colossus</title>
 <meta name="description" content="Virtualized geometry in the browser: thousands of scanned statues drawn cluster by cluster at a pixel of error, with WebGPU.">
 <link rel="stylesheet" href="demo.css">
 </head>
@@ -11,7 +11,7 @@
 <canvas id="view"></canvas>
 <div id="loading">loading models</div>
 <aside id="panel">
-  <h1>nexus_geometry</h1>
+  <h1>colossus</h1>
   <p class="lede">Virtualized geometry, as in Nanite: every cluster of every statue picks the coarsest detail
     within a pixel of the original.</p>
   <dl>
@@ -42,7 +42,7 @@
   <label class="check"><input id="freeze" type="checkbox"> freeze culling, then fly out</label>
   <p class="help">Drag to look, WASD to fly, Q and E down and up, wheel for speed.</p>
   <p class="help">Models are trimmed to 400k triangles at their finest for the web; the
-    <a href="https://github.com/apollo-2006/nexus_geometry">native viewer</a> draws all 28M of Lucy's, with mesh
+    <a href="https://github.com/apollo-2006/colossus">native viewer</a> draws all 28M of Lucy's, with mesh
     shaders, occlusion culling and ray traced shadows. Lucy and the dragon: Stanford 3D Scanning Repository.</p>
 </aside>
 <script type="module" src="app.js"></script>

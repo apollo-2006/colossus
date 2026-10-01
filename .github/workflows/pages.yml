@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build the builder
-        run: make -j"$(nproc)" ngeo_build
+        run: make -j"$(nproc)" colossus_build
       # The scans are 380 MB from Stanford's server; keep them between runs.
       - uses: actions/cache@v4
         with:

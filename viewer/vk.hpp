@@ -76,7 +76,7 @@ public:
     // device a swapchain.
     context(GLFWwindow* window, bool validate) {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "nexus_geometry";
+        app.pApplicationName = "colossus";
         app.apiVersion = VK_API_VERSION_1_3;
         std::vector<const char*> layers, extensions;
         if (window) {
@@ -355,7 +355,7 @@ private:
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
 
-        ray_query = has(gpu, ray_query_extensions, std::size(ray_query_extensions)) && !std::getenv("NEXUS_NO_RAY_QUERY");
+        ray_query = has(gpu, ray_query_extensions, std::size(ray_query_extensions)) && !std::getenv("COLOSSUS_NO_RAY_QUERY");
         VkPhysicalDeviceRayQueryFeaturesKHR rq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
         rq.rayQuery = VK_TRUE;
         VkPhysicalDeviceAccelerationStructureFeaturesKHR as{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};

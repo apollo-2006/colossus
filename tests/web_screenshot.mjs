@@ -4,7 +4,7 @@
 //
 //   node tests/web_screenshot.mjs [--out shot.png] [--wait SECONDS] [--eval JS]
 //
-// Serves web/ (with web/models/*.ngeo.gz built: see web/build.sh). Needs
+// Serves web/ (with web/models/*.cgeo.gz built: see web/build.sh). Needs
 // google-chrome-stable and a GPU Chrome can use.
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -36,7 +36,7 @@ const server = createServer((req, res) => {
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
-const profile = mkdtempSync(join(tmpdir(), 'nexus-web-'));
+const profile = mkdtempSync(join(tmpdir(), 'colossus-web-'));
 const chrome = spawn('google-chrome-stable', [
   '--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--no-first-run', '--window-size=1600,900',
   '--enable-unsafe-webgpu', '--enable-features=Vulkan,SkiaGraphite', '--ignore-gpu-blocklist', '--use-angle=vulkan',

@@ -1,7 +1,7 @@
-// Reads a .ngeo file (include/geometry_file.hpp), gzipped or not: the
+// Reads a .cgeo file (include/geometry_file.hpp), gzipped or not: the
 // hierarchy as the GPU reads it, so the arrays go to buffers as they are.
 
-const MAGIC = 'NGEOv002';
+const MAGIC = 'CGEOv003';
 
 // Streams a URL, reporting progress as (bytes so far, total or 0), and
 // gunzips it if its name ends in .gz.

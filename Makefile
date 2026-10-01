@@ -6,7 +6,7 @@ OBJ_DIR = obj
 LIB_SRCS = $(wildcard src/*.cpp)
 LIB_OBJS = $(patsubst src/%.cpp,$(OBJ_DIR)/%.o,$(LIB_SRCS))
 
-all: ngeo_build nexus_view
+all: colossus_build colossus
 
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
@@ -14,7 +14,7 @@ $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
-ngeo_build: tools/ngeo_build.cpp $(LIB_OBJS)
+colossus_build: tools/colossus_build.cpp $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@
 
 # The viewer. Needs the Vulkan headers and loader, GLFW, and glslc for the
@@ -31,7 +31,7 @@ $(OBJ_DIR)/shaders/shade_rt.comp.inc: viewer/shaders/shade.comp viewer/shaders/c
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -DRAY_QUERY -O -mfmt=num -o $@ $<
 
-nexus_view: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(OBJ_DIR)/shaders/shade_rt.comp.inc $(LIB_OBJS)
+colossus: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(OBJ_DIR)/shaders/shade_rt.comp.inc $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) -Wno-missing-field-initializers $(INCLUDES) -I$(OBJ_DIR)/shaders viewer/main.cpp $(LIB_OBJS) -o $@ -lvulkan -lglfw
 
 tests/builder_test: tests/builder_test.cpp $(LIB_OBJS)
@@ -42,7 +42,7 @@ test: tests/builder_test
 	./tests/builder_test
 
 clean:
-	rm -rf $(OBJ_DIR) ngeo_build nexus_view tests/builder_test
+	rm -rf $(OBJ_DIR) colossus_build colossus tests/builder_test
 
 -include $(LIB_OBJS:.o=.d)
 

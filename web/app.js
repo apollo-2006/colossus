@@ -1,10 +1,10 @@
 // The demo page: loads the models, places a crowd of them, and flies a
 // camera over it with the WebGPU renderer.
-import { fetchModel } from './ngeo.js';
+import { fetchModel } from './geometry.js';
 import { FLAG_CONE, FLAG_FRUSTUM, FLAG_SOFTWARE, Renderer } from './renderer.js';
 
 const $ = (id) => document.getElementById(id);
-const MODELS = ['models/lucy.ngeo.gz', 'models/dragon.ngeo.gz'];
+const MODELS = ['models/lucy.cgeo.gz', 'models/dragon.cgeo.gz'];
 
 const human = (v) => (v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : `${v}`);
 
@@ -149,7 +149,7 @@ async function main() {
   requestAnimationFrame(frame);
 }
 
-if (!window.NEXUS_TEST) main().catch((e) => {
+if (!window.COLOSSUS_TEST) main().catch((e) => {
   console.error(e);
   const l = $('loading');
   if (l) l.textContent = `error: ${e.message}`;

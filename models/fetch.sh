@@ -15,8 +15,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 names=("$@")
 [[ ${#names[@]} -eq 0 ]] && names=(dragon lucy)
-build=../ngeo_build
-[[ -x $build ]] || { echo "build ngeo_build first: make"; exit 1; }
+build=../colossus_build
+[[ -x $build ]] || { echo "build colossus_build first: make"; exit 1; }
 # --download-only fetches the scans without building (the web demo's
 # workflow builds trimmed copies itself).
 download_only=false
@@ -29,13 +29,13 @@ for name in "${names[@]}"; do
         curl -fL -o xyzrgb_dragon.ply.gz http://graphics.stanford.edu/data/3Dscanrep/xyzrgb/xyzrgb_dragon.ply.gz
         gunzip xyzrgb_dragon.ply.gz
       fi
-      $download_only || $build xyzrgb_dragon.ply xyzrgb_dragon.ngeo ;;
+      $download_only || $build xyzrgb_dragon.ply xyzrgb_dragon.cgeo ;;
     lucy)
       if [[ ! -f lucy.ply ]]; then
         curl -fL -o lucy.tar.gz http://graphics.stanford.edu/data/3Dscanrep/lucy.tar.gz
         tar xzf lucy.tar.gz lucy.ply && rm lucy.tar.gz
       fi
-      $download_only || $build lucy.ply lucy.ngeo --up-z ;;
+      $download_only || $build lucy.ply lucy.cgeo --up-z ;;
     *) echo "unknown model $name (dragon, lucy)"; exit 2 ;;
   esac
 done
