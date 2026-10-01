@@ -221,7 +221,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   let inst = instances[v.x];
   let c = clusters[v.y];
   if (lane < c.vertex_count) {
-    let clip = frame.view_proj * vec4f(to_world(inst, position(cluster_vertices[c.vertex_offset + lane])), 1.0);
+    let clip = frame.view_proj * vec4f(to_world(inst, cluster_position(c, lane)), 1.0);
     let ndc = clip.xy / clip.w;
     // Pixels run down; clip space runs up.
     let px = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(f32(frame.width), f32(frame.height));
@@ -231,7 +231,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   workgroupBarrier();
   if (lane >= c.triangle_count) { return; }
 
-  let packed = cluster_triangles[c.triangle_offset + lane];
+  let packed = cluster_triangle(c, lane);
   let i0 = packed & 255u;
   var i1 = (packed >> 8u) & 255u;
   var i2 = (packed >> 16u) & 255u;
@@ -376,13 +376,13 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
   } else {
     let inst = instances[vc.x];
     let c = clusters[vc.y];
-    let packed = cluster_triangles[c.triangle_offset + tri];
-    let i0 = cluster_vertices[c.vertex_offset + (packed & 255u)];
-    let i1 = cluster_vertices[c.vertex_offset + ((packed >> 8u) & 255u)];
-    let i2 = cluster_vertices[c.vertex_offset + ((packed >> 16u) & 255u)];
-    let p0 = to_world(inst, position(i0));
-    let p1 = to_world(inst, position(i1));
-    let p2 = to_world(inst, position(i2));
+    let packed = cluster_triangle(c, tri);
+    let i0 = packed & 255u;
+    let i1 = (packed >> 8u) & 255u;
+    let i2 = (packed >> 16u) & 255u;
+    let p0 = to_world(inst, cluster_position(c, i0));
+    let p1 = to_world(inst, cluster_position(c, i1));
+    let p2 = to_world(inst, cluster_position(c, i2));
     // The ray against the triangle's plane, for exact barycentrics.
     let e1 = p1 - p0;
     let e2 = p2 - p0;
@@ -399,9 +399,9 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let center = frame.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
     let forward = normalize(center.xyz / center.w - origin);
     let t = frame.near_z / z / dot(dir, forward);
-    let n0 = vec3f(normals[3u * i0], normals[3u * i0 + 1u], normals[3u * i0 + 2u]);
-    let n1 = vec3f(normals[3u * i1], normals[3u * i1 + 1u], normals[3u * i1 + 2u]);
-    let n2 = vec3f(normals[3u * i2], normals[3u * i2 + 1u], normals[3u * i2 + 2u]);
+    let n0 = cluster_normal(c, i0);
+    let n1 = cluster_normal(c, i1);
+    let n2 = cluster_normal(c, i2);
     var n = normalize(to_world_dir(inst, n0 * (1.0 - bu - bv) + n1 * bu + n2 * bv));
     // Seen from behind (the inside of a fold, or through a hole in the
     // scan): light the side we see, and leave the rim light off, which

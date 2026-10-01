@@ -23,9 +23,8 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Verte
     out.position = vec4f(2.0, 2.0, 2.0, 1.0);
     return out;
   }
-  let packed = cluster_triangles[c.triangle_offset + tri];
-  let local = (packed >> (8u * (vi % 3u))) & 255u;
-  let p = position(cluster_vertices[c.vertex_offset + local]);
+  let packed = cluster_triangle(c, tri);
+  let p = cluster_position(c, (packed >> (8u * (vi % 3u))) & 255u);
   out.position = frame.view_proj * vec4f(to_world(instances[v.x], p), 1.0);
   return out;
 }

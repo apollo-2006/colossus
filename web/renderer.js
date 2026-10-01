@@ -58,7 +58,7 @@ export class Renderer {
     const rw = (binding) => ({ binding, visibility: C, buffer: { type: 'storage' } });
     this.sceneLayout = d.createBindGroupLayout({
       entries: [{ binding: 0, visibility: C | V | F, buffer: { type: 'uniform' } },
-        ...[1, 2, 3, 4, 5, 6, 7].map((b) => ro(b, C | V))],
+        ...[1, 2, 3, 6, 7].map((b) => ro(b, C | V))],
     });
     this.workLayout = d.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5].map(rw) });
     this.imageLayout = d.createBindGroupLayout({
@@ -120,37 +120,30 @@ export class Renderer {
   // models: parsed .cgeo files. placements: {model, matrix (3x4 rows), scale}.
   loadScene(models, placements) {
     const d = this.device;
-    let vertexBase = 0, cvBase = 0, ctBase = 0, clusterBase = 0;
-    const counts = models.reduce((a, m) => ({
-      v: a.v + m.positions.length, cv: a.cv + m.clusterVertices.length,
-      ct: a.ct + m.clusterTriangles.length, c: a.c + m.clusterCount,
-    }), { v: 0, cv: 0, ct: 0, c: 0 });
-    const positions = new Float32Array(counts.v), normals = new Float32Array(counts.v);
-    const clusterVertices = new Uint32Array(counts.cv), clusterTriangles = new Uint32Array(counts.ct);
-    const clusters = new ArrayBuffer(counts.c * 96);
+    const totals = models.reduce((a, m) => ({ c: a.c + m.clusterCount, p: a.p + m.pageTable.length, w: a.w + m.data.length }),
+      { c: 0, p: 0, w: 0 });
+    const clusters = new ArrayBuffer(totals.c * 112);
+    const pageTable = new Uint32Array(totals.p);
+    const pool = new Uint32Array(totals.w);
     const meshes = new ArrayBuffer(models.length * 48);
-    this.leafTriangles = [];
+    let clusterBase = 0, pageBase = 0, wordBase = 0;
     models.forEach((m, k) => {
-      positions.set(m.positions, vertexBase * 3);
-      normals.set(m.normals, vertexBase * 3);
-      for (let i = 0; i < m.clusterVertices.length; i++) clusterVertices[cvBase + i] = m.clusterVertices[i] + vertexBase;
-      clusterTriangles.set(m.clusterTriangles, ctBase);
-      const src = new Uint32Array(m.clusters), dst = new Uint32Array(clusters, clusterBase * 96, m.clusterCount * 24);
-      dst.set(src);
+      const dst = new Uint32Array(clusters, clusterBase * 112, m.clusterCount * 28);
+      dst.set(new Uint32Array(m.clusters));
       for (let c = 0; c < m.clusterCount; c++) {
-        dst[24 * c + 18] += cvBase;
-        dst[24 * c + 19] += ctBase;
+        dst[28 * c + 23] += pageBase;                                   // Its page
+        if (dst[28 * c + 24] !== 0xffffffff) dst[28 * c + 24] += pageBase;  // The finer clusters' page
       }
+      for (let p = 0; p < m.pageTable.length; p++) pageTable[pageBase + p] = m.pageTable[p] + wordBase;
+      pool.set(m.data, wordBase);
       const mu = new Uint32Array(meshes, k * 48, 4), mf = new Float32Array(meshes, k * 48 + 16, 8);
       mu[0] = clusterBase;
       mu[1] = m.clusterCount;
       mf.set(m.bounds, 0);
       mf.set(m.lodBounds, 4);
-      this.leafTriangles.push(m.leafTriangles);
-      vertexBase += m.positions.length / 3;
-      cvBase += m.clusterVertices.length;
-      ctBase += m.clusterTriangles.length;
       clusterBase += m.clusterCount;
+      pageBase += m.pageTable.length;
+      wordBase += m.data.length;
     });
     const instances = new ArrayBuffer(Math.max(1, placements.length) * 64);
     this.fullDetail = 0;
@@ -162,17 +155,25 @@ export class Renderer {
     });
     this.instanceCount = placements.length;
 
-    for (const b of this.sceneBuffers || []) b.destroy();
+    // The geometry only changes when the models do; the instances whenever
+    // the crowd does.
     const upload = (data) => {
       const b = d.createBuffer({ size: Math.max(16, Math.ceil(data.byteLength / 4) * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       d.queue.writeBuffer(b, 0, data);
       return b;
     };
-    this.sceneBuffers = [clusters, clusterVertices, clusterTriangles, positions, normals, meshes, instances].map(upload);
+    if (this.loadedModels !== models) {
+      for (const b of this.geometryBuffers || []) b.destroy();
+      this.geometryBuffers = [clusters, pageTable, pool, meshes].map(upload);
+      this.loadedModels = models;
+    }
+    this.instanceBuffer?.destroy();
+    this.instanceBuffer = upload(instances);
+    const [bClusters, bTable, bPool, bMeshes] = this.geometryBuffers;
     this.sceneGroup = d.createBindGroup({
       layout: this.sceneLayout,
       entries: [{ binding: 0, resource: { buffer: this.frameBuffer } },
-        ...this.sceneBuffers.map((buffer, i) => ({ binding: i + 1, resource: { buffer } }))],
+        ...[1, 2, 3, 6, 7].map((binding) => ({ binding, resource: { buffer: { 1: bClusters, 2: bTable, 3: bPool, 6: bMeshes, 7: this.instanceBuffer }[binding] } }))],
     });
   }
 

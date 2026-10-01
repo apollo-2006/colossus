@@ -22,7 +22,8 @@ struct Frame {
   time: f32,
 }
 
-// include/geometry_file.hpp's gpu_cluster: 96 bytes.
+// include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
+// 112 bytes. `group` is its page, and the offsets are words into it.
 struct Cluster {
   center: vec3f,
   radius: f32,
@@ -40,6 +41,10 @@ struct Cluster {
   triangle_count: u32,
   level: u32,
   group: u32,
+  creator: u32,
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
 }
 
 struct Mesh {
@@ -65,10 +70,10 @@ const FLAG_SOFTWARE = 4u;
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
-@group(0) @binding(2) var<storage, read> cluster_vertices: array<u32>;
-@group(0) @binding(3) var<storage, read> cluster_triangles: array<u32>;
-@group(0) @binding(4) var<storage, read> positions: array<f32>;
-@group(0) @binding(5) var<storage, read> normals: array<f32>;
+// Every page is loaded on the web: the page table holds each one's first
+// word in the pool.
+@group(0) @binding(2) var<storage, read> page_table: array<u32>;
+@group(0) @binding(3) var<storage, read> pool: array<u32>;
 @group(0) @binding(6) var<storage, read> meshes: array<Mesh>;
 @group(0) @binding(7) var<storage, read> instances: array<Instance>;
 
@@ -81,8 +86,24 @@ fn to_world_dir(inst: Instance, v: vec3f) -> vec3f {
   return vec3f(dot(inst.rows[0].xyz, v), dot(inst.rows[1].xyz, v), dot(inst.rows[2].xyz, v));
 }
 
-fn position(i: u32) -> vec3f {
-  return vec3f(positions[3u * i], positions[3u * i + 1u], positions[3u * i + 2u]);
+fn cluster_position(c: Cluster, k: u32) -> vec3f {
+  let at = page_table[c.group] + c.vertex_offset + 4u * k;
+  return vec3f(bitcast<f32>(pool[at]), bitcast<f32>(pool[at + 1u]), bitcast<f32>(pool[at + 2u]));
+}
+
+// Octahedral, two snorm16.
+fn cluster_normal(c: Cluster, k: u32) -> vec3f {
+  let packed = pool[page_table[c.group] + c.vertex_offset + 4u * k + 3u];
+  let e = vec2f(f32((i32(packed) << 16u) >> 16u), f32(i32(packed) >> 16u)) / 32767.0;
+  var n = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
+  if (n.z < 0.0) {
+    n = vec3f((1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0), (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0), n.z);
+  }
+  return normalize(n);
+}
+
+fn cluster_triangle(c: Cluster, t: u32) -> u32 {
+  return pool[page_table[c.group] + c.triangle_offset + t];
 }
 
 fn sphere_in_frustum(c: vec3f, r: f32) -> bool {
