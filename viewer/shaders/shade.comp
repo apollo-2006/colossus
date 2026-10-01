@@ -31,11 +31,12 @@ vec3 hash_color(uint x) {
     return vec3(float(h & 255u), float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0 * 0.8 + 0.1;
 }
 
-// Cool to hot over the LOD levels.
+// Cool to hot over the LOD levels: a hue wheel from blue (level 0, full
+// detail) through green and yellow to red and magenta (level 16 and up).
 vec3 level_color(uint level) {
-    const vec3 ramp[8] = vec3[](vec3(0.15, 0.25, 0.9), vec3(0.1, 0.6, 0.95), vec3(0.1, 0.8, 0.6), vec3(0.4, 0.85, 0.2),
-                                vec3(0.9, 0.85, 0.15), vec3(0.95, 0.55, 0.1), vec3(0.9, 0.2, 0.15), vec3(0.85, 0.2, 0.7));
-    return ramp[min(level, 7u)];
+    const float h = 0.66 - 0.055 * float(min(level, 16u));
+    const vec3 k = abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return mix(vec3(1.0), clamp(k - 1.0, 0.0, 1.0), 0.75) * 0.85;
 }
 
 vec3 aces(vec3 x) {
