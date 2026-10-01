@@ -1,0 +1,102 @@
+#version 460
+// Cluster culling: one workgroup per work item, one invocation per cluster.
+// Each cluster is drawn if it is the right LOD for its distance (see
+// include/dag.hpp), inside the view, facing the camera and not hidden; the
+// survivors are appended to the visible list, which the mesh shaders draw.
+//
+// This was a task shader at first, emitting mesh workgroups directly. On
+// RADV, task workgroups cost enough each that testing 630k clusters took
+// 1.1 ms; as plain compute it takes a fraction of that.
+//
+// Pass 1 tests occlusion against last frame's depth, and lists what it
+// finds hidden. Pass 2 takes its own work items (instances pass 1 found
+// hidden) and then that list, 64 to a workgroup, and tests them against the
+// depth pass 1 drew: what was hidden last frame but is seen now is drawn.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+void main() {
+    const uint pass = push.pass;
+    const uint group = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationIndex;
+
+    bool draw = false, tested = false, hidden = false;
+    uint instance_id = 0u, cluster_id = 0u, triangles = 0u;
+    const uint items = cull_args[pass].w;
+    if (group < items) {
+        // A work item: 64 clusters of one instance, tested in full.
+        const WorkItem w = work[pass * frame.max_work_items + group];
+        const Instance inst = instances[w.instance];
+        const Mesh m = meshes[inst.mesh];
+        instance_id = w.instance;
+        cluster_id = w.first + lane;
+        if (cluster_id < m.first_cluster + m.cluster_count) {
+            tested = true;
+            const Cluster c = clusters[cluster_id];
+            const float s = inst.scale;
+            const float tau = frame.lod_threshold;
+            draw = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s) <= tau &&
+                   projected_error(to_world(inst, c.parent_center), c.parent_radius * s, c.parent_error * s) > tau;
+            const vec3 center = to_world(inst, c.center);
+            const float r = c.radius * s;
+            if (draw && (frame.flags & flag_frustum_culling) != 0u) draw = sphere_in_frustum(center, r);
+            // Every triangle faces away when the view direction lies inside
+            // the cone around the axis: see include/dag.hpp.
+            if (draw && (frame.flags & flag_cone_culling) != 0u && c.cone_cutoff < 1.0) {
+                const vec3 axis = normalize(to_world_dir(inst, c.cone_axis));
+                const vec3 view = center - frame.cull_origin.xyz;
+                if (dot(view, axis) >= c.cone_cutoff * length(view) + r) draw = false;
+            }
+            if (draw && occluded(center, r)) {
+                draw = false;
+                hidden = true;
+            }
+        }
+    } else if (pass == 1u) {
+        // A piece of pass 1's hidden clusters: only occlusion is left to test.
+        const uint k = (group - items) * 64u + lane;
+        if (k < min(late_cluster_count, frame.max_visible)) {
+            tested = true;
+            const uvec2 ic = late_clusters[k];
+            instance_id = ic.x;
+            cluster_id = ic.y;
+            const Instance inst = instances[instance_id];
+            const Cluster c = clusters[cluster_id];
+            draw = !occluded(to_world(inst, c.center), c.radius * inst.scale);
+            hidden = !draw;
+        }
+    }
+    if (draw) triangles = clusters[cluster_id].triangle_count;
+    if (hidden && pass == 0u) {
+        const uint k = atomicAdd(late_cluster_count, 1u);
+        if (k < frame.max_visible) late_clusters[k] = uvec2(instance_id, cluster_id);
+    }
+
+    const uint tested_n = subgroupAdd(tested ? 1u : 0u);
+    const uint triangles_n = subgroupAdd(triangles);
+    const uint hidden_n = subgroupAdd(hidden ? 1u : 0u);
+    const uint drawn_n = subgroupAdd(draw ? 1u : 0u);
+    if (subgroupElect()) {
+        atomicAdd(stats.clusters_tested, tested_n);
+        atomicAdd(stats.triangles_drawn, triangles_n);
+        if (pass == 0u) atomicAdd(stats.clusters_occluded, hidden_n);
+        else atomicAdd(stats.clusters_late, drawn_n);
+    }
+
+    // Survivors take consecutive slots: one atomic per subgroup.
+    const uint survivors = subgroupAdd(draw ? 1u : 0u);
+    uint base = 0u;
+    if (subgroupElect() && survivors > 0u) {
+        base = atomicAdd(visible_count, survivors);
+        atomicAdd(stats.clusters_drawn, survivors);
+    }
+    base = subgroupBroadcastFirst(base);
+    const uint slot = base + subgroupExclusiveAdd(draw ? 1u : 0u);
+    if (draw) {
+        if (slot < frame.max_visible) visible[slot] = uvec2(instance_id, cluster_id);
+        else atomicAdd(stats.visible_overflow, 1u);
+    }
+}

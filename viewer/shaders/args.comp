@@ -1,13 +1,29 @@
 #version 460
-// Turns the number of work items into the task shaders' dispatch size: rows
-// of up to 65535 workgroups, the most one dimension may hold.
+// Writes a pass's indirect arguments, in rows of up to 65535 workgroups,
+// the most one dimension may hold. Step 0 sizes the cluster culling
+// dispatch: one workgroup per work item, and in pass 2 also one per 64
+// clusters pass 1 found hidden. Step 1 sizes the mesh shader draw: one
+// workgroup per cluster the pass found visible.
 #include "common.glsl"
 
 layout(local_size_x = 1) in;
 
+uvec3 rows(uint n) {
+    return uvec3(min(n, 65535u), (n + 65534u) / 65535u, 1u);
+}
+
 void main() {
-    const uint n = min(work_count, frame.max_work_items);
-    draw_args.task_x = min(n, 65535u);
-    draw_args.task_y = (n + 65534u) / 65535u;
-    draw_args.task_z = 1u;
+    const uint pass = push.pass;
+    if (push.level == 0u) {
+        const uint items = min(work_count[pass], frame.max_work_items);
+        uint n = items;
+        if (pass == 1u) n += (min(late_cluster_count, frame.max_visible) + 63u) / 64u;
+        cull_args[pass] = uvec4(rows(n), items);
+        if (pass == 0u) pass_start[0] = 0u;
+    } else {
+        const uint end = min(visible_count, frame.max_visible);
+        pass_start[pass + 1u] = end;
+        const uint n = end - pass_start[pass];
+        draw_args[pass] = uvec4(rows(n), pass_start[pass]);
+    }
 }

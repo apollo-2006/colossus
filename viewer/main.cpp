@@ -5,10 +5,14 @@
 //   1. instance_cull.comp drops instances outside the view and, for each
 //      one left, finds by binary search the clusters that might be drawn
 //      at its distance, as work items of 64 clusters.
-//   2. cull.task tests each of those clusters: the LOD cut, the frustum and
-//      the normal cone. Survivors are numbered in a visible list.
+//   2. cluster_cull.comp tests each of those clusters: the LOD cut, the
+//      frustum, the normal cone and occlusion. Survivors are appended to a
+//      visible list.
 //   3. draw.mesh draws each survivor; vis.frag writes depth and triangle
 //      into a 64-bit visibility buffer with an atomic max.
+// Steps 1 to 3 run twice: first testing occlusion against last frame's
+// depth pyramid, then, after a pyramid is built from what that drew,
+// re-testing what the first pass found hidden.
 //   4. shade.comp rebuilds the triangle under every pixel and shades it.
 //
 //   nexus_view --model models/lucy.ngeo --grid 10
@@ -35,8 +39,8 @@ const uint32_t instance_cull_spv[] = {
 const uint32_t args_spv[] = {
 #include "args.comp.inc"
 };
-const uint32_t cull_task_spv[] = {
-#include "cull.task.inc"
+const uint32_t cluster_cull_spv[] = {
+#include "cluster_cull.comp.inc"
 };
 const uint32_t draw_mesh_spv[] = {
 #include "draw.mesh.inc"
@@ -46,6 +50,9 @@ const uint32_t vis_frag_spv[] = {
 };
 const uint32_t shade_spv[] = {
 #include "shade.comp.inc"
+};
+const uint32_t hzb_spv[] = {
+#include "hzb.comp.inc"
 };
 
 constexpr uint32_t frames_in_flight = 2;
@@ -83,13 +90,24 @@ struct gpu_frame {
     uint32_t max_visible;
     float time;
     uint32_t pad;
+    float view[16];
+    float prev_view[16];
+    float p00, p11;
+    uint32_t hzb_width, hzb_height, hzb_levels;
+    uint32_t pad2;
 };
 struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
-    uint32_t work_overflow, visible_overflow, pad;
+    uint32_t work_overflow, visible_overflow;
+    uint32_t instances_occluded, clusters_occluded, clusters_late, pad;
+};
+struct gpu_push {
+    uint32_t pass, level;
 };
 
-constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4;
+constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
+                   flag_prev_valid = 16;
+constexpr uint32_t max_hzb_levels = 16;
 
 struct options {
     std::vector<std::string> models;
@@ -105,6 +123,8 @@ struct options {
     vec3 eye;
     float yaw = 0, pitch = 0;
     bool wireframe = false;
+    uint32_t disable = 0;  // Flags turned off from the command line
+    bool cull_only = false;
 };
 
 struct camera {
@@ -210,7 +230,8 @@ std::string human(double v) {
 
 class renderer {
 public:
-    renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height) : ctx_(ctx), sc_(sc) {
+    renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, bool cull_only = false)
+        : ctx_(ctx), sc_(sc), cull_only_(cull_only) {
         create_static_buffers();
         create_descriptors();
         create_pipelines();
@@ -241,9 +262,10 @@ public:
             ctx_.destroy(f.stats);
         }
         for (vk::buffer* b : {&clusters_, &cluster_vertices_, &cluster_triangles_, &positions_, &normals_, &meshes_,
-                              &instances_, &work_, &visible_, &draw_args_, &readback_})
+                              &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_})
             ctx_.destroy(*b);
-        for (VkPipeline p : {instance_cull_, args_, shade_, raster_}) vkDestroyPipeline(ctx_.device, p, nullptr);
+        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_}) vkDestroyPipeline(ctx_.device, p, nullptr);
+        vkDestroySampler(ctx_.device, sampler_, nullptr);
         vkDestroyPipelineLayout(ctx_.device, layout_, nullptr);
         vkDestroyDescriptorPool(ctx_.device, pool_, nullptr);
         vkDestroyDescriptorSetLayout(ctx_.device, set_layout_, nullptr);
@@ -275,13 +297,17 @@ public:
             w[1].pImageInfo = &image_info;
             vkUpdateDescriptorSets(ctx_.device, 2, w, 0, nullptr);
         }
+        create_hzb();
+        prev_valid_ = false;
         ctx_.destroy(readback_);
         readback_ = ctx_.make_buffer(uint64_t(width) * height * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     }
 
     struct frame_result {
         gpu_stats stats{};
-        double ms[4] = {};  // Cull, raster, shade, total: from the frame that used this slot last
+        // Pass 1 culling, pass 1 drawing, both pyramids and pass 2, shading,
+        // and the total: from the frame that last used this slot.
+        double ms[5] = {};
         bool valid = false;
     };
 
@@ -301,10 +327,8 @@ public:
             if (vkGetQueryPoolResults(ctx_.device, f.queries, 0, timestamp_count, sizeof ts, ts, sizeof(uint64_t),
                                       VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
                 const double tick = ctx_.properties.limits.timestampPeriod * 1e-6;
-                result.ms[0] = (ts[1] - ts[0]) * tick;
-                result.ms[1] = (ts[2] - ts[1]) * tick;
-                result.ms[2] = (ts[3] - ts[2]) * tick;
-                result.ms[3] = (ts[3] - ts[0]) * tick;
+                for (int k = 0; k < 4; ++k) result.ms[k] = (ts[k + 1] - ts[k]) * tick;
+                result.ms[4] = (ts[4] - ts[0]) * tick;
                 result.valid = true;
             }
         }
@@ -316,6 +340,13 @@ public:
         fr.instance_count = static_cast<uint32_t>(sc_.instances.size());
         fr.max_work_items = max_work_items;
         fr.max_visible = max_visible;
+        fr.hzb_width = hzb_width_;
+        fr.hzb_height = hzb_height_;
+        fr.hzb_levels = hzb_levels_;
+        std::memcpy(fr.prev_view, prev_view_, sizeof prev_view_);
+        if (prev_valid_) fr.flags |= flag_prev_valid;
+        std::memcpy(prev_view_, fr.view, sizeof prev_view_);
+        prev_valid_ = true;
         std::memcpy(f.frame.mapped, &fr, sizeof fr);
 
         VkCommandBuffer cmd = f.cmd;
@@ -330,7 +361,7 @@ public:
                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 0);
         vkCmdFillBuffer(cmd, vis_.handle, 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, work_.handle, 0, 16, 0);
+        vkCmdFillBuffer(cmd, work_.handle, 0, 16, 0);  // Both passes' counts and the late counts
         vkCmdFillBuffer(cmd, visible_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, f.stats.handle, 0, sizeof(gpu_stats), 0);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -338,50 +369,27 @@ public:
 
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &f.set, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &f.set, 0, nullptr);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instance_cull_);
-        vkCmdDispatch(cmd, (fr.instance_count + 63) / 64, 1, 1);
-        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, args_);
-        vkCmdDispatch(cmd, 1, 1, 1);
-        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-                    VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 1);
-
         vk::transition(cmd, depth_.handle, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-        VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        depth.imageView = depth_.view;
-        depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        depth.clearValue.depthStencil = {0.0f, 0};
-        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        ri.renderArea = {{0, 0}, {width_, height_}};
-        ri.layerCount = 1;
-        ri.pDepthAttachment = &depth;
-        vkCmdBeginRendering(cmd, &ri);
-        VkViewport vp{0, 0, float(width_), float(height_), 0, 1};
-        VkRect2D sc{{0, 0}, {width_, height_}};
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, raster_);
-        ctx_.draw_mesh_tasks_indirect(cmd, draw_args_.handle, 0, 1, 12);
-        vkCmdEndRendering(cmd);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 2);
 
-        vk::barrier(cmd, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-                    VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+        // Pass 1: what last frame's depth does not hide. Then the pyramid
+        // from what it drew, and pass 2: what pass 1 thought hidden but is
+        // not. Then the pyramid again, for next frame's pass 1.
+        draw_pass(cmd, 0, f.queries);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 2);
+        build_hzb(cmd);
+        draw_pass(cmd, 1, f.queries);
+        build_hzb(cmd);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 3);
+
         vk::transition(cmd, color_.handle, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                        VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shade_);
         vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 3);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 4);
 
         vk::transition(cmd, color_.handle, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -454,7 +462,7 @@ public:
     }
 
 private:
-    static constexpr uint32_t timestamp_count = 4;
+    static constexpr uint32_t timestamp_count = 5;
 
     struct frame_slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -473,17 +481,162 @@ private:
     uint32_t slot_ = 0;
 
     vk::buffer clusters_, cluster_vertices_, cluster_triangles_, positions_, normals_, meshes_, instances_;
-    vk::buffer work_, visible_, draw_args_, vis_, readback_;
-    vk::image depth_, color_;
+    vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_;
+    vk::image depth_, color_, hzb_image_;
+    std::vector<VkImageView> hzb_views_;
+    VkSampler sampler_ = VK_NULL_HANDLE;
+    uint32_t hzb_width_ = 0, hzb_height_ = 0, hzb_levels_ = 0;
+    float prev_view_[16] = {};
+    bool prev_valid_ = false;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkPipeline instance_cull_ = VK_NULL_HANDLE, args_ = VK_NULL_HANDLE, shade_ = VK_NULL_HANDLE, raster_ = VK_NULL_HANDLE;
+    VkPipeline instance_cull_ = VK_NULL_HANDLE, args_ = VK_NULL_HANDLE, shade_ = VK_NULL_HANDLE, raster_ = VK_NULL_HANDLE,
+               hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE;
+    bool cull_only_ = false;
 
     void destroy_targets() {
         ctx_.destroy(vis_);
         ctx_.destroy(depth_);
         ctx_.destroy(color_);
+        for (VkImageView v : hzb_views_) vkDestroyImageView(ctx_.device, v, nullptr);
+        hzb_views_.clear();
+        ctx_.destroy(hzb_image_);
+    }
+
+    // The depth pyramid: level 0 half the screen (rounded up), each level
+    // half the last, down to 1x1. One view of every level for sampling,
+    // and one view per level for writing.
+    void create_hzb() {
+        hzb_width_ = (width_ + 1) / 2;
+        hzb_height_ = (height_ + 1) / 2;
+        hzb_levels_ = 1;
+        while ((std::max(hzb_width_, hzb_height_) >> hzb_levels_) > 0 && hzb_levels_ < max_hzb_levels) ++hzb_levels_;
+        VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ic.imageType = VK_IMAGE_TYPE_2D;
+        ic.format = VK_FORMAT_R32_SFLOAT;
+        ic.extent = {hzb_width_, hzb_height_, 1};
+        ic.mipLevels = hzb_levels_;
+        ic.arrayLayers = 1;
+        ic.samples = VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        hzb_image_ = ctx_.make_image(ic, VK_IMAGE_ASPECT_COLOR_BIT);
+        for (uint32_t l = 0; l < hzb_levels_; ++l) {
+            VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vc.image = hzb_image_.handle;
+            vc.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vc.format = VK_FORMAT_R32_SFLOAT;
+            vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l, 1, 0, 1};
+            VkImageView v;
+            VK_CHECK(vkCreateImageView(ctx_.device, &vc, nullptr, &v));
+            hzb_views_.push_back(v);
+        }
+        ctx_.submit([&](VkCommandBuffer cmd) {
+            VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            ib.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ib.image = hzb_image_.handle;
+            ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hzb_levels_, 0, 1};
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.imageMemoryBarrierCount = 1;
+            di.pImageMemoryBarriers = &ib;
+            vkCmdPipelineBarrier2(cmd, &di);
+        });
+        for (frame_slot& f : slots_) {
+            VkDescriptorImageInfo sampled{sampler_, hzb_image_.view, VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo levels[max_hzb_levels];
+            for (uint32_t l = 0; l < max_hzb_levels; ++l)
+                levels[l] = {VK_NULL_HANDLE, hzb_views_[std::min(l, hzb_levels_ - 1)], VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+            w[0].dstSet = f.set;
+            w[0].dstBinding = 16;
+            w[0].descriptorCount = 1;
+            w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[0].pImageInfo = &sampled;
+            w[1].dstSet = f.set;
+            w[1].dstBinding = 17;
+            w[1].descriptorCount = max_hzb_levels;
+            w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[1].pImageInfo = levels;
+            vkUpdateDescriptorSets(ctx_.device, 2, w, 0, nullptr);
+        }
+    }
+
+    void build_hzb(VkCommandBuffer cmd) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hzb_);
+        for (uint32_t l = 0; l < hzb_levels_; ++l) {
+            const gpu_push push{0, l};
+            vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
+            vkCmdDispatch(cmd, ((hzb_width_ >> l) + 8) / 8, ((hzb_height_ >> l) + 8) / 8, 1);
+            vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
+                        VK_ACCESS_2_SHADER_READ_BIT);
+        }
+    }
+
+    // Runs args.comp for a pass: step 0 sizes the cluster culling, step 1
+    // the draw.
+    void write_args(VkCommandBuffer cmd, uint32_t pass, uint32_t step) {
+        const gpu_push push{pass, step};
+        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, args_);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
+                    VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+        const gpu_push back{pass, 0};
+        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof back, &back);
+    }
+
+    // Culls and draws one pass: instances, then clusters, into the
+    // visibility buffer.
+    void draw_pass(VkCommandBuffer cmd, uint32_t pass, VkQueryPool queries) {
+        const gpu_push push{pass, 0};
+        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instance_cull_);
+        const uint32_t n = uint32_t(sc_.instances.size());
+        vkCmdDispatch(cmd, std::min(n, 65535u), (n + 65534) / 65535, 1);
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+        write_args(cmd, pass, 0);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cluster_cull_);
+        vkCmdDispatchIndirect(cmd, draw_args_.handle, 16 * pass);
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+        write_args(cmd, pass, 1);
+        if (pass == 0) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries, 1);
+
+        VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        depth.imageView = depth_.view;
+        depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        depth.loadOp = pass == 0 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depth.clearValue.depthStencil = {0.0f, 0};
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, {width_, height_}};
+        ri.layerCount = 1;
+        ri.pDepthAttachment = &depth;
+        vkCmdBeginRendering(cmd, &ri);
+        VkViewport vp{0, 0, float(width_), float(height_), 0, 1};
+        VkRect2D sc{{0, 0}, {width_, height_}};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, raster_);
+        if (!cull_only_) ctx_.draw_mesh_tasks_indirect(cmd, draw_args_.handle, 32 + 16 * pass, 1, 16);
+        vkCmdEndRendering(cmd);
+        vk::barrier(cmd,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
+                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
     }
 
     void create_static_buffers() {
@@ -495,9 +648,17 @@ private:
         normals_ = ctx_.upload(sc_.all.normals, ssbo);
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
-        work_ = ctx_.make_buffer(16 + uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+        work_ = ctx_.make_buffer(16 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         visible_ = ctx_.make_buffer(16 + uint64_t(max_visible) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
-        draw_args_ = ctx_.make_buffer(16, ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
+        draw_args_ = ctx_.make_buffer(80, ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
+        late_instances_ = ctx_.make_buffer(4 * sc_.instances.size(), ssbo, false);
+        late_clusters_ = ctx_.make_buffer(uint64_t(max_visible) * 8, ssbo, false);
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = VK_LOD_CLAMP_NONE;
+        VK_CHECK(vkCreateSampler(ctx_.device, &sci, nullptr, &sampler_));
         for (frame_slot& f : slots_) {
             f.frame = ctx_.make_buffer(sizeof(gpu_frame), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
             f.stats = ctx_.make_buffer(sizeof(gpu_stats), ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
@@ -506,15 +667,15 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 13; ++i) {
+        for (uint32_t i = 0; i <= 17; ++i) {
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
-            x.descriptorCount = 1;
-            x.descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-                             : i == 13 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            x.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT |
-                           VK_SHADER_STAGE_FRAGMENT_BIT;
+            x.descriptorCount = i == 17 ? max_hzb_levels : 1;
+            x.descriptorType = i == 0                ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                             : i == 13 || i == 17    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                             : i == 16               ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                     : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            x.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
             b.push_back(x);
         }
         VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -523,11 +684,12 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12 * frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, frames_in_flight}};
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (1 + max_hzb_levels) * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames_in_flight}};
         VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pci.maxSets = frames_in_flight;
-        pci.poolSizeCount = 3;
+        pci.poolSizeCount = 4;
         pci.pPoolSizes = sizes;
         VK_CHECK(vkCreateDescriptorPool(ctx_.device, &pci, nullptr, &pool_));
 
@@ -537,12 +699,14 @@ private:
             ai.descriptorSetCount = 1;
             ai.pSetLayouts = &set_layout_;
             VK_CHECK(vkAllocateDescriptorSets(ctx_.device, &ai, &f.set));
-            const vk::buffer* buffers[] = {&f.frame, &clusters_, &cluster_vertices_, &cluster_triangles_, &positions_,
-                                           &normals_, &meshes_, &instances_, &work_, &visible_, nullptr, &f.stats, &draw_args_};
-            VkDescriptorBufferInfo infos[13];
+            const vk::buffer* buffers[] = {&f.frame,   &clusters_, &cluster_vertices_, &cluster_triangles_, &positions_,
+                                           &normals_,  &meshes_,   &instances_,        &work_,              &visible_,
+                                           nullptr,    &f.stats,   &draw_args_,        nullptr,             &late_instances_,
+                                           &late_clusters_};
+            VkDescriptorBufferInfo infos[16];
             std::vector<VkWriteDescriptorSet> writes;
-            for (uint32_t i = 0; i < 13; ++i) {
-                if (!buffers[i]) continue;  // The visibility buffer: written by resize()
+            for (uint32_t i = 0; i < 16; ++i) {
+                if (!buffers[i]) continue;  // The visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 w.dstSet = f.set;
@@ -555,9 +719,12 @@ private:
             vkUpdateDescriptorSets(ctx_.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
 
+        const VkPushConstantRange push{VK_SHADER_STAGE_ALL, 0, sizeof(gpu_push)};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plci.setLayoutCount = 1;
         plci.pSetLayouts = &set_layout_;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &push;
         VK_CHECK(vkCreatePipelineLayout(ctx_.device, &plci, nullptr, &layout_));
     }
 
@@ -579,14 +746,15 @@ private:
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
         args_ = compute_pipeline(args_spv, sizeof args_spv);
         shade_ = compute_pipeline(shade_spv, sizeof shade_spv);
+        cluster_cull_ = compute_pipeline(cluster_cull_spv, sizeof cluster_cull_spv);
+        hzb_ = compute_pipeline(hzb_spv, sizeof hzb_spv);
 
-        VkShaderModule task = ctx_.shader(cull_task_spv, sizeof cull_task_spv);
         VkShaderModule mesh = ctx_.shader(draw_mesh_spv, sizeof draw_mesh_spv);
         VkShaderModule frag = ctx_.shader(vis_frag_spv, sizeof vis_frag_spv);
-        VkPipelineShaderStageCreateInfo stages[3] = {};
-        const VkShaderStageFlagBits kinds[3] = {VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT, VK_SHADER_STAGE_FRAGMENT_BIT};
-        const VkShaderModule modules[3] = {task, mesh, frag};
-        for (int i = 0; i < 3; ++i) {
+        VkPipelineShaderStageCreateInfo stages[2] = {};
+        const VkShaderStageFlagBits kinds[2] = {VK_SHADER_STAGE_MESH_BIT_EXT, VK_SHADER_STAGE_FRAGMENT_BIT};
+        const VkShaderModule modules[2] = {mesh, frag};
+        for (int i = 0; i < 2; ++i) {
             stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             stages[i].stage = kinds[i];
             stages[i].module = modules[i];
@@ -616,7 +784,7 @@ private:
         rendering.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
         VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gci.pNext = &rendering;
-        gci.stageCount = 3;
+        gci.stageCount = 2;
         gci.pStages = stages;
         gci.pViewportState = &viewport;
         gci.pRasterizationState = &raster;
@@ -711,7 +879,7 @@ struct view_state {
     bool frozen = false;
     float threshold = 1;
     uint32_t mode = 0;
-    uint32_t flags = flag_cone_culling | flag_frustum_culling;
+    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion;
     float speed = 1.5f;
     bool looking = false;
     double last_x = 0, last_y = 0;
@@ -729,7 +897,15 @@ gpu_frame frame_data(const view_state& v, uint32_t width, uint32_t height, float
     frustum_planes(cc.view_proj(aspect), f.cull_planes);
     f.cull_origin[0] = cc.eye.x; f.cull_origin[1] = cc.eye.y; f.cull_origin[2] = cc.eye.z;
     f.origin[0] = v.cam.eye.x; f.origin[1] = v.cam.eye.y; f.origin[2] = v.cam.eye.z;
+    const mat4 view = look_to(v.cam.eye, v.cam.forward(), {0, 1, 0});
+    std::memcpy(f.view, view.m, sizeof f.view);
+    const mat4 proj = perspective_reverse_z(v.cam.fov, aspect, v.cam.near_z);
+    f.p00 = proj.at(0, 0);
+    f.p11 = -proj.at(1, 1);  // The projection flips y for Vulkan; the sphere test wants it upright
     f.flags = v.flags;
+    // Depth from the drawing camera says nothing about what a frozen
+    // culling camera would see.
+    if (v.frozen) f.flags &= ~flag_occlusion;
     f.lod_scale = float(height) / (2 * std::tan(v.cam.fov / 2));
     f.lod_threshold = v.threshold;
     f.near_z = v.cam.near_z;
@@ -747,6 +923,7 @@ void on_key(GLFWwindow* w, int key, int, int action, int) {
     if (key == GLFW_KEY_RIGHT_BRACKET) v->threshold = std::min(256.0f, v->threshold * 2);
     if (key == GLFW_KEY_C) v->flags ^= flag_cone_culling;
     if (key == GLFW_KEY_V) v->flags ^= flag_frustum_culling;
+    if (key == GLFW_KEY_O) v->flags ^= flag_occlusion;
     if (key == GLFW_KEY_T) v->flags ^= flag_wireframe;
     if (key == GLFW_KEY_P) v->print_camera = true;
     if (key == GLFW_KEY_F) {
@@ -786,10 +963,12 @@ void move_camera(GLFWwindow* w, view_state& v, float dt) {
 
 std::string stats_line(const renderer::frame_result& r, const view_state& v, size_t instances) {
     char b[400];
-    std::snprintf(b, sizeof b, "%.2f ms (cull %.2f, raster %.2f, shade %.2f) | %s tris, %s clusters | %u/%zu instances | %.3gpx | %s%s%s%s",
-                  r.ms[3], r.ms[0], r.ms[1], r.ms[2], human(r.stats.triangles_drawn).c_str(),
-                  human(r.stats.clusters_drawn).c_str(), r.stats.instances_visible, instances, v.threshold,
+    std::snprintf(b, sizeof b, "%.2f ms (cull %.2f, raster %.2f, pass 2 %.2f, shade %.2f) | %s tris, %s clusters (%s late) | %u/%zu instances | %.3gpx | %s%s%s%s%s",
+                  r.ms[4], r.ms[0], r.ms[1], r.ms[2], r.ms[3], human(r.stats.triangles_drawn).c_str(),
+                  human(r.stats.clusters_drawn).c_str(), human(r.stats.clusters_late).c_str(), r.stats.instances_visible,
+                  instances, v.threshold,
                   mode_names[v.mode], v.frozen ? " | FROZEN" : "", (v.flags & flag_cone_culling) ? "" : " | no cone",
+                  (v.flags & flag_occlusion) ? "" : " | no occlusion",
                   (r.stats.work_overflow || r.stats.visible_overflow) ? " | OVERFLOW" : "");
     return b;
 }
@@ -815,6 +994,9 @@ options parse(int argc, char** argv) {
         else if (a == "--validate") o.validate = true;
         else if (a == "--no-vsync") o.vsync = false;
         else if (a == "--wireframe") o.wireframe = true;
+        else if (a == "--no-occlusion") o.disable |= flag_occlusion;
+        else if (a == "--no-cone") o.disable |= flag_cone_culling;
+        else if (a == "--cull-only") o.cull_only = true;
         else if (a == "--camera") {
             float x, y, z, yaw, pitch;
             if (std::sscanf(next().c_str(), "%f,%f,%f,%f,%f", &x, &y, &z, &yaw, &pitch) != 5)
@@ -842,6 +1024,7 @@ int main(int argc, char** argv) {
         v.threshold = opt.threshold;
         v.mode = opt.mode;
         if (opt.wireframe) v.flags |= flag_wireframe;
+        v.flags &= ~opt.disable;
         const float extent = std::max(1.0f, opt.grid * opt.spacing);
         v.cam.eye = {0, 0.35f + 0.25f * extent, 0.5f + 0.75f * extent};
         v.cam.pitch = opt.grid > 1 ? -0.35f : -0.1f;
@@ -855,7 +1038,7 @@ int main(int argc, char** argv) {
         if (opt.headless) {
             vk::context ctx(nullptr, opt.validate);
             std::printf("GPU: %s\n", ctx.device_name.c_str());
-            renderer r(ctx, sc, opt.width, opt.height);
+            renderer r(ctx, sc, opt.width, opt.height, opt.cull_only);
             std::vector<renderer::frame_result> results;
             for (int i = 0; i < opt.frames + 2; ++i) {
                 const bool last = i == opt.frames - 1;
@@ -870,10 +1053,12 @@ int main(int argc, char** argv) {
             vkDeviceWaitIdle(ctx.device);
             if (!results.empty()) {
                 // The median frame, by total time.
-                std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[3] < b.ms[3]; });
+                std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[4] < b.ms[4]; });
                 std::printf("%s\n", stats_line(results[results.size() / 2], v, sc.instances.size()).c_str());
                 const auto& s = results[results.size() / 2].stats;
-                std::printf("clusters tested %s, work items %s\n", human(s.clusters_tested).c_str(), human(s.work_items).c_str());
+                std::printf("clusters tested %s, work items %s, hidden by last frame %s, instances hidden %u\n",
+                            human(s.clusters_tested).c_str(), human(s.work_items).c_str(), human(s.clusters_occluded).c_str(),
+                            s.instances_occluded);
             }
             return vk::validation_errors ? 1 : 0;
         }
@@ -895,7 +1080,7 @@ int main(int argc, char** argv) {
             renderer r(ctx, sc, swap.extent.width, swap.extent.height);
             std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-7 view (shaded, clusters, triangles, LOD level, groups, instances, holes)\n"
-                        "      [ ] LOD threshold, F freeze culling, C cone culling, V frustum culling, T wireframe, P print camera\n");
+                        "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling, T wireframe, P print camera\n");
 
             auto last = std::chrono::steady_clock::now();
             const auto start = last;

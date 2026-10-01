@@ -1,0 +1,33 @@
+#version 460
+// Builds one level of the depth pyramid. Level 0 reads depth from the
+// visibility buffer, two pixels by two; each level after reads the one
+// before. A texel keeps the farthest depth it covers (the smallest, depth
+// being reversed), and an empty pixel counts as infinitely far, so nothing
+// is ever hidden behind a gap.
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 17, r32f) uniform writeonly image2D hzb_levels[16];
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(hzb_levels[push.level]);
+    if (any(greaterThanEqual(p, size))) return;
+    float far_depth = 1e30;
+    if (push.level == 0u) {
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+                const ivec2 q = 2 * p + ivec2(dx, dy);
+                if (q.x < int(frame.width) && q.y < int(frame.height))
+                    far_depth = min(far_depth, uintBitsToFloat(uint(vis[q.x + q.y * int(frame.width)] >> 32)));
+            }
+    } else {
+        const ivec2 src = textureSize(hzb, int(push.level) - 1);
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+                const ivec2 q = 2 * p + ivec2(dx, dy);
+                if (q.x < src.x && q.y < src.y) far_depth = min(far_depth, texelFetch(hzb, q, int(push.level) - 1).x);
+            }
+    }
+    imageStore(hzb_levels[push.level], p, vec4(far_depth));
+}

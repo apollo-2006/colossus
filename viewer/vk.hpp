@@ -189,6 +189,29 @@ public:
         return im;
     }
 
+    // An image from a full description, with a view of all its levels.
+    image make_image(const VkImageCreateInfo& ic, VkImageAspectFlags aspect) {
+        image im;
+        im.format = ic.format;
+        im.width = ic.extent.width;
+        im.height = ic.extent.height;
+        VK_CHECK(vkCreateImage(device, &ic, nullptr, &im.handle));
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device, im.handle, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &im.memory));
+        VK_CHECK(vkBindImageMemory(device, im.handle, im.memory, 0));
+        VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vc.image = im.handle;
+        vc.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vc.format = ic.format;
+        vc.subresourceRange = {aspect, 0, ic.mipLevels, 0, 1};
+        VK_CHECK(vkCreateImageView(device, &vc, nullptr, &im.view));
+        return im;
+    }
+
     void destroy(buffer& b) {
         if (!b.handle) return;
         if (b.mapped) vkUnmapMemory(device, b.memory);
@@ -321,6 +344,7 @@ private:
         features.features.shaderInt64 = VK_TRUE;
         features.features.fragmentStoresAndAtomics = VK_TRUE;
         features.features.multiDrawIndirect = VK_TRUE;
+        features.features.shaderStorageImageArrayDynamicIndexing = VK_TRUE;  // The depth pyramid's levels
         features.pNext = &v12;
 
         const auto ext = required();

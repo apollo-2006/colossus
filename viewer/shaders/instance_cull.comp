@@ -1,6 +1,12 @@
 #version 460
-// One thread per instance: drops instances outside the view, then hands the
-// task shaders the clusters that might be drawn, in pieces of 64.
+// One workgroup per instance: drops instances outside the view or hidden,
+// then hands cluster culling the clusters that might be drawn, in pieces of
+// 64. One invocation decides; all 64 write the pieces, since a nearby
+// Lucy is ten thousand of them.
+//
+// Pass 1 runs over every instance and tests occlusion against last frame's
+// depth; what it finds hidden is listed for pass 2, which runs over that
+// list only and tests against the depth pass 1 drew.
 //
 // Clusters are stored in order of parent error, and a cluster can only be
 // drawn while its parent looks too coarse. Nowhere on the model is nearer
@@ -12,32 +18,52 @@
 
 layout(local_size_x = 64) in;
 
-void main() {
-    const uint i = gl_GlobalInvocationID.x;
-    if (i >= frame.instance_count) return;
-    const Instance inst = instances[i];
-    const Mesh m = meshes[inst.mesh];
-    if ((frame.flags & flag_frustum_culling) != 0u &&
-        !sphere_in_frustum(to_world(inst, m.bounds.xyz), m.bounds.w * inst.scale))
-        return;
-    atomicAdd(stats.instances_visible, 1u);
+shared uint first_chunk;  // Where this instance's pieces go, and how many
+shared uint chunk_count;
+shared uint first_cluster;
 
-    const vec3 lc = to_world(inst, m.lod_bounds.xyz);
-    const float d = max(length(lc - frame.cull_origin.xyz) - m.lod_bounds.w * inst.scale, frame.near_z);
-    const float limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
-    uint lo = 0, hi = m.cluster_count;
-    while (lo < hi) {
-        const uint mid = (lo + hi) / 2;
-        if (clusters[m.first_cluster + mid].parent_error > limit) hi = mid;
-        else lo = mid + 1;
+void main() {
+    const uint pass = push.pass;
+    const uint n = pass == 0u ? frame.instance_count : late_instance_count;
+    const uint slot = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (slot >= n) return;
+    const uint i = pass == 0u ? slot : late_instances[slot];
+    if (gl_LocalInvocationIndex == 0u) {
+        chunk_count = 0u;
+        const Instance inst = instances[i];
+        const Mesh m = meshes[inst.mesh];
+        const vec3 center = to_world(inst, m.bounds.xyz);
+        const float radius = m.bounds.w * inst.scale;
+        bool keep = pass != 0u || (frame.flags & flag_frustum_culling) == 0u || sphere_in_frustum(center, radius);
+        if (keep && occluded(center, radius)) {
+            if (pass == 0u) late_instances[atomicAdd(late_instance_count, 1u)] = i;
+            else atomicAdd(stats.instances_occluded, 1u);
+            keep = false;
+        }
+        if (keep) {
+            atomicAdd(stats.instances_visible, 1u);
+            const vec3 lc = to_world(inst, m.lod_bounds.xyz);
+            const float d = max(length(lc - frame.cull_origin.xyz) - m.lod_bounds.w * inst.scale, frame.near_z);
+            const float limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
+            uint lo = 0, hi = m.cluster_count;
+            while (lo < hi) {
+                const uint mid = (lo + hi) / 2;
+                if (clusters[m.first_cluster + mid].parent_error > limit) hi = mid;
+                else lo = mid + 1;
+            }
+            uint chunks = (m.cluster_count - lo + 63u) / 64u;
+            const uint base = chunks > 0u ? atomicAdd(work_count[pass], chunks) : 0u;
+            if (base + chunks > frame.max_work_items) {
+                atomicAdd(stats.work_overflow, 1u);
+                chunks = base < frame.max_work_items ? frame.max_work_items - base : 0u;
+            }
+            atomicAdd(stats.work_items, chunks);
+            first_chunk = pass * frame.max_work_items + base;
+            chunk_count = chunks;
+            first_cluster = m.first_cluster + lo;
+        }
     }
-    uint chunks = (m.cluster_count - lo + 63u) / 64u;
-    if (chunks == 0u) return;
-    const uint base = atomicAdd(work_count, chunks);
-    if (base + chunks > frame.max_work_items) {
-        atomicAdd(stats.work_overflow, 1u);
-        chunks = base < frame.max_work_items ? frame.max_work_items - base : 0u;
-    }
-    atomicAdd(stats.work_items, chunks);
-    for (uint k = 0; k < chunks; ++k) work[base + k] = WorkItem(i, m.first_cluster + lo + 64u * k);
+    barrier();
+    for (uint k = gl_LocalInvocationIndex; k < chunk_count; k += 64u)
+        work[first_chunk + k] = WorkItem(i, first_cluster + 64u * k);
 }

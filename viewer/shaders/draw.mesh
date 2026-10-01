@@ -8,15 +8,14 @@
 layout(local_size_x = 128) in;
 layout(triangles, max_vertices = 128, max_primitives = 128) out;
 
-struct Payload {
-    uint base;
-};
-taskPayloadSharedEXT Payload payload;
-
 layout(location = 0) perprimitiveEXT flat out uint out_id[];
 
 void main() {
-    const uint vid = payload.base + gl_WorkGroupID.x;
+    const uint vid = draw_args[push.pass].w + gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (vid >= pass_start[push.pass + 1u]) {
+        SetMeshOutputsEXT(0, 0);
+        return;
+    }
     const uvec2 v = visible[vid];
     const Instance inst = instances[v.x];
     const Cluster c = clusters[v.y];
