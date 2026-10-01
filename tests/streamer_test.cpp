@@ -52,9 +52,11 @@ mesh bumpy_sphere(int subdivisions) {
     return m;
 }
 
-// The rule: a resident page's dependencies are resident; roots always are.
+// The rule: a resident page's dependencies are resident. (The root page
+// is checked at the end: with loader threads it is in flight on the first
+// frames, with nothing depending on it yet.)
 size_t broken(const streamer& s, const paged_geometry& g) {
-    size_t n = !s.resident(0);
+    size_t n = 0;
     for (uint32_t p = 0; p < g.pages.size(); ++p)
         if (s.resident(p))
             for (uint32_t k = 0; k < g.pages[p].dep_count; ++k) n += !s.resident(g.deps[g.pages[p].dep_first + k]);
@@ -78,9 +80,11 @@ int main() {
     std::printf("%zu pages, %.1f MB\n", file.pages.size(), file.data_size / 1048576.0);
 
     std::vector<uint8_t> staging(8 << 20);
-    {
-        std::printf("random requests into a pool a tenth of the model\n");
-        streamer s(pages, file.deps, file.data_size / 10);
+    // Synchronous, then with two loader threads: pages published frames
+    // after they were issued, in issue order.
+    for (unsigned threads : {0u, 2u}) {
+        std::printf("%u loader threads: random requests into a pool a tenth of the model\n", threads);
+        streamer s(pages, file.deps, file.data_size / 10, threads);
         std::mt19937 rng(1);
         std::vector<uint32_t> stamps(file.pages.size(), 0);
         size_t worst = 0, loaded = 0, evicted = 0;
@@ -96,7 +100,8 @@ int main() {
             loaded += s.stats().loaded;
             evicted += s.stats().evicted;
             worst = std::max(worst, broken(s, file));
-            // Copies land in distinct slots inside the pool.
+            // Copies land in distinct slots inside the pool, and the table
+            // points there.
             std::set<uint64_t> slots;
             for (const auto& c : copies) {
                 CHECK(c.pool_offset + c.size <= s.pool_bytes());
@@ -105,23 +110,26 @@ int main() {
         }
         std::printf("  %zu loads, %zu evictions, broken dependencies at worst: %zu\n", loaded, evicted, worst);
         CHECK(worst == 0);
+        CHECK(s.resident(0));
         CHECK(evicted > 100);  // The pool really was full and turning over
-    }
-    {
-        std::printf("everything, into a pool that holds it\n");
-        streamer s(pages, file.deps, file.data_size * 2);
+
+        std::printf("%u loader threads: everything, into a pool that holds it\n", threads);
+        streamer all_in(pages, file.deps, file.data_size * 2, threads);
         std::vector<std::pair<uint32_t, float>> all;
         for (uint32_t p = 0; p < file.pages.size(); ++p) all.push_back({p, 1});
-        for (uint32_t frame = 1; frame <= 50; ++frame) s.service(frame, all, staging.data(), staging.size());
         size_t resident = 0;
-        std::set<uint32_t> offsets;
-        for (uint32_t p = 0; p < file.pages.size(); ++p) {
-            resident += s.resident(p);
-            if (s.resident(p)) CHECK(offsets.insert(s.table()[p]).second);
+        for (uint32_t frame = 1; frame <= 2000 && resident < file.pages.size(); ++frame) {
+            all_in.service(frame, all, staging.data(), staging.size());
+            CHECK(broken(all_in, file) == 0);
+            resident = 0;
+            for (uint32_t p = 0; p < file.pages.size(); ++p) resident += all_in.resident(p);
+            if (threads) usleep(200);
         }
+        std::set<uint32_t> offsets;
+        for (uint32_t p = 0; p < file.pages.size(); ++p)
+            if (all_in.resident(p)) CHECK(offsets.insert(all_in.table()[p]).second);
         std::printf("  %zu of %zu pages resident\n", resident, file.pages.size());
         CHECK(resident == file.pages.size());
-        CHECK(broken(s, file) == 0);
     }
     close(fd);
     if (failures) {

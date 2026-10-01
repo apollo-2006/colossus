@@ -151,6 +151,8 @@ struct options {
     uint64_t upload_mb = 64;   // Pages loaded per frame, at most
     int warmup = 0;            // Headless: frames drawn before timing starts
     float fly = 0;             // Headless: move the camera this far forward each frame, turning slowly
+    unsigned loader_threads = 2;  // 0: read pages on the render thread
+    bool cold = false;         // Drop the models from the OS's file cache first, so pages come off the disk
 };
 
 struct camera {
@@ -264,6 +266,7 @@ void make_scene(const options& opt, scene& s) {
         const paged_geometry g = load_paged(path, false);
         const int fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path);
+        if (opt.cold) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         s.files.push_back(fd);
         std::printf("%s: %zu clusters, %zu triangles at full detail, %zu pages, %.0f MB\n", path.c_str(), g.clusters.size(),
                     g.leaf_triangles(), g.pages.size(), g.data_size / 1048576.0);
@@ -340,9 +343,9 @@ std::string human(double v) {
 class renderer {
 public:
     renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, uint64_t pool_bytes, uint64_t upload_bytes,
-             bool cull_only = false)
+             unsigned loader_threads, bool cull_only = false)
         : ctx_(ctx), sc_(sc), cull_only_(cull_only), upload_bytes_(upload_bytes),
-          streamer_(sc.pages, sc.deps, pool_bytes) {
+          streamer_(sc.pages, sc.deps, pool_bytes, loader_threads) {
         create_static_buffers();
         create_descriptors();
         create_pipelines();
@@ -433,6 +436,7 @@ public:
         // and the total: from the frame that last used this slot.
         double ms[5] = {};
         streamer::stats_t streaming;
+        double streaming_ms = 0;  // Render thread time in the streamer this frame
         bool valid = false;
     };
 
@@ -471,8 +475,10 @@ public:
             }
         }
         const uint32_t frame_index = ++frame_counter_;
+        const auto service_start = std::chrono::steady_clock::now();
         const std::vector<streamer::copy> uploads =
             streamer_.service(frame_index, std::move(wanted), static_cast<uint8_t*>(f.staging.mapped), upload_bytes_);
+        result.streaming_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - service_start).count();
         const std::vector<uint32_t>& table = streamer_.table();
         std::memcpy(static_cast<uint8_t*>(f.staging.mapped) + upload_bytes_, table.data(), table.size() * 4);
         result.streaming = streamer_.stats();
@@ -1296,6 +1302,9 @@ options parse(int argc, char** argv) {
         else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
         else if (a == "--warmup") o.warmup = std::stoi(next());
         else if (a == "--fly") o.fly = std::stof(next());
+        else if (a == "--sync-loads") o.loader_threads = 0;
+        else if (a == "--loader-threads") o.loader_threads = static_cast<unsigned>(std::stoul(next()));
+        else if (a == "--cold") o.cold = true;
         else if (a == "--sw-pixels") o.sw_pixels = std::clamp(std::stof(next()), 0.0f, 64.0f);  // sw_raster.comp's 32-bit math holds to 64
         else if (a == "--cull-only") o.cull_only = true;
         else if (a == "--camera") {
@@ -1341,12 +1350,13 @@ int main(int argc, char** argv) {
         if (opt.headless) {
             vk::context ctx(nullptr, opt.validate);
             std::printf("GPU: %s\n", ctx.device_name.c_str());
-            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.cull_only);
+            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.cull_only);
             std::vector<renderer::frame_result> results;
             const int total = opt.warmup + opt.frames;
             int settled = -1;
             uint64_t streamed = 0;
             uint32_t evicted = 0, most_resident = 0;
+            std::vector<double> service_ms;
             for (int i = 0; i < total + 2; ++i) {
                 if (opt.fly != 0 && i > 0) {
                     v.cam.eye += v.cam.forward() * opt.fly;
@@ -1358,6 +1368,7 @@ int main(int argc, char** argv) {
                                   last && !opt.screenshot.empty());
                 streamed += res.streaming.bytes_loaded;
                 evicted += res.streaming.evicted;
+                service_ms.push_back(res.streaming_ms);
                 most_resident = std::max(most_resident, res.streaming.resident);
                 if (std::getenv("COLOSSUS_TRACE_STREAMING"))
                     std::printf("frame %d: requests %u, loaded %u (%.1f MB), waiting %u, resident %u, drawn %u clusters\n", i,
@@ -1375,6 +1386,10 @@ int main(int argc, char** argv) {
             std::printf("streamed %.0f MB of %.0f MB on disk, evicted %u pages, at most %u resident; %s\n", streamed / 1048576.0,
                         sc.total_page_bytes / 1048576.0, evicted, most_resident,
                         settled >= 0 ? ("settled after " + std::to_string(settled) + " frames").c_str() : "still streaming");
+            std::sort(service_ms.begin(), service_ms.end());
+            std::printf("render thread in the streamer: median %.3f ms, 99th percentile %.3f ms, worst %.3f ms (%s)\n",
+                        service_ms[service_ms.size() / 2], service_ms[service_ms.size() * 99 / 100], service_ms.back(),
+                        opt.loader_threads ? (std::to_string(opt.loader_threads) + " loader threads").c_str() : "loads on the render thread");
             if (!results.empty()) {
                 // The median frame, by total time.
                 std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[4] < b.ms[4]; });
@@ -1401,7 +1416,7 @@ int main(int argc, char** argv) {
             glfwGetFramebufferSize(window, &fw, &fh);
             swapchain swap(ctx, opt.vsync);
             swap.create(fw, fh);
-            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20);
+            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads);
             std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-8 view (shaded, clusters, triangles, LOD level, groups, instances, holes, rasterizer)\n"
                         "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling,\n"
