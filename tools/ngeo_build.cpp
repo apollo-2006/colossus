@@ -3,11 +3,15 @@
 //
 //   ngeo_build models/lucy.ply models/lucy.ngeo --up-z
 //   ngeo_build in.obj out.ngeo --check     also check every cut for cracks
+//   ngeo_build in.ply out.ngeo --max-triangles 500000
+//                                          keep only the levels from the finest
+//                                          cut within 500k triangles up
 #include "geometry_file.hpp"
 #include "lod_check.hpp"
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -15,15 +19,17 @@
 int main(int argc, char** argv) {
     std::string in, out;
     bool up_z = false, check = false;
+    size_t max_triangles = 0;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--up-z")) up_z = true;
+        else if (!std::strcmp(argv[i], "--max-triangles") && i + 1 < argc) max_triangles = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--check")) check = true;
         else if (in.empty()) in = argv[i];
         else if (out.empty()) out = argv[i];
         else { std::fprintf(stderr, "unexpected argument %s\n", argv[i]); return 2; }
     }
     if (in.empty() || out.empty()) {
-        std::fprintf(stderr, "usage: ngeo_build IN.(ply|obj) OUT.ngeo [--up-z] [--check]\n");
+        std::fprintf(stderr, "usage: ngeo_build IN.(ply|obj) OUT.ngeo [--up-z] [--check] [--max-triangles N]\n");
         return 2;
     }
     try {
@@ -35,7 +41,11 @@ int main(int argc, char** argv) {
         normalize_placement(m, up_z);
         std::printf("welded: %zu vertices, %zu triangles (%.1fs)\n", m.positions.size(), m.triangle_count(), since());
         const lod_mesh lod = build_lod(m, true);
-        const geometry g = pack(lod);
+        geometry g = pack(lod);
+        if (max_triangles) {
+            g = trim(g, max_triangles);
+            std::printf("trimmed to %zu triangles at the finest\n", g.leaf_triangles());
+        }
         save_geometry(g, out);
         std::printf("wrote %s: %zu clusters over %zu levels, %zu triangles in all (%.1fs)\n", out.c_str(), g.clusters.size(),
                     g.levels.size(), g.cluster_triangles.size(), since());

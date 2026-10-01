@@ -46,5 +46,12 @@ struct geometry {
 };
 
 geometry pack(const lod_mesh& lod);
+
+// Drops the finest levels, keeping the finest cut with at most
+// max_triangles triangles as the new leaves (their error becomes 0) and
+// every cluster that can be drawn above it. Each kept leaf's parent is
+// unchanged, so cuts stay crack-free. Unused vertices are dropped. For
+// shipping a model somewhere memory is short, like a web page.
+geometry trim(const geometry& g, size_t max_triangles);
 void save_geometry(const geometry& g, const std::string& path);
 geometry load_geometry(const std::string& path);
