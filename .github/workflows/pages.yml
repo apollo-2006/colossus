@@ -1,0 +1,49 @@
+name: demo
+
+# Builds the web demo's models from the Stanford scans and publishes web/
+# to GitHub Pages, so the live demo always runs the code in the repository.
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'include/**', 'tools/**', 'web/**', 'models/fetch.sh', 'Makefile', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the builder
+        run: make -j"$(nproc)" ngeo_build
+      # The scans are 380 MB from Stanford's server; keep them between runs.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            models/lucy.ply
+            models/xyzrgb_dragon.ply
+          key: stanford-scans-v1
+      - name: Download the scans
+        run: models/fetch.sh --download-only dragon lucy
+      - name: Build the web models
+        run: web/build.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

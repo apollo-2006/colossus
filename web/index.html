@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nexus_geometry</title>
+<meta name="description" content="Virtualized geometry in the browser: thousands of scanned statues drawn cluster by cluster at a pixel of error, with WebGPU.">
+<link rel="stylesheet" href="demo.css">
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="loading">loading models</div>
+<aside id="panel">
+  <h1>nexus_geometry</h1>
+  <p class="lede">Virtualized geometry, as in Nanite: every cluster of every statue picks the coarsest detail
+    within a pixel of the original.</p>
+  <dl>
+    <dt>frame</dt><dd><span id="frame">...</span><small id="breakdown"></small></dd>
+    <dt>triangles drawn</dt><dd id="triangles">...</dd>
+    <dt>at full detail</dt><dd id="full">...</dd>
+    <dt>clusters drawn</dt><dd id="clusters">...</dd>
+    <dt>instances seen</dt><dd id="instances">...</dd>
+    <dt>image</dt><dd id="size">...</dd>
+  </dl>
+  <label>crowd <span id="grid-label"></span>
+    <input id="grid" type="range" min="1" max="64" value="30"></label>
+  <label>error allowed <span id="threshold-label">1 px</span>
+    <input id="threshold" type="range" min="-2" max="5" step="1" value="0"></label>
+  <label>view
+    <select id="mode">
+      <option value="0">shaded</option>
+      <option value="1">clusters</option>
+      <option value="2">triangles</option>
+      <option value="3">LOD level</option>
+      <option value="4">groups</option>
+      <option value="5">instances</option>
+      <option value="6">rasterizer (orange: compute)</option>
+      <option value="7">holes (magenta)</option>
+    </select></label>
+  <label class="check"><input id="software" type="checkbox" checked> compute rasterizer for small clusters</label>
+  <label class="check"><input id="cone" type="checkbox" checked> normal cone culling</label>
+  <label class="check"><input id="freeze" type="checkbox"> freeze culling, then fly out</label>
+  <p class="help">Drag to look, WASD to fly, Q and E down and up, wheel for speed.</p>
+  <p class="help">Models are trimmed to 400k triangles at their finest for the web; the
+    <a href="https://github.com/apollo-2006/nexus_geometry">native viewer</a> draws all 28M of Lucy's, with mesh
+    shaders, occlusion culling and ray traced shadows. Lucy and the dragon: Stanford 3D Scanning Repository.</p>
+</aside>
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -8,3 +8,4 @@
 !/docs/*.png
 *.d
 /tests/builder_test
+/web/models/

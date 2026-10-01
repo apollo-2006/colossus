@@ -1,0 +1,35 @@
+:root {
+  --panel: rgba(18, 22, 30, 0.72);
+  --text: #e8ebf0;
+  --muted: #9aa3b2;
+  --accent: #f0a85a;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #9fb0c4; color: var(--text);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+#view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+#view:active { cursor: grabbing; }
+#loading { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center;
+  font-size: 15px; color: #1d2430; }
+#panel { position: fixed; top: 16px; left: 16px; width: 300px; max-height: calc(100% - 32px); overflow: auto;
+  padding: 16px 18px; border-radius: 14px; background: var(--panel); backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25); }
+h1 { margin: 0 0 4px; font-size: 17px; letter-spacing: 0.01em; }
+.lede { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 0 0 14px; }
+dt { color: var(--muted); }
+dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+dd small { display: block; color: var(--muted); font-size: 11px; }
+#frame { color: var(--accent); font-weight: 600; }
+label { display: block; margin: 10px 0 0; color: var(--muted); font-size: 13px; }
+label span { float: right; color: var(--text); font-variant-numeric: tabular-nums; }
+input[type=range], select { display: block; width: 100%; margin-top: 4px; accent-color: var(--accent); }
+select { padding: 4px 6px; border-radius: 6px; border: 1px solid #3a4250; background: #1b212b; color: var(--text); }
+label.check { color: var(--text); }
+label.check input { accent-color: var(--accent); margin-right: 6px; vertical-align: -2px; }
+.help { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
+a { color: var(--accent); }
+@media (max-width: 640px) {
+  #panel { top: auto; bottom: 16px; left: 16px; right: 16px; width: auto; max-height: 45%; }
+}

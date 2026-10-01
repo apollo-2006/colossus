@@ -1,0 +1,108 @@
+#!/usr/bin/env node
+// Opens the web demo in a headless Chrome with WebGPU, lets it render, and
+// saves a screenshot, printing anything the page logs as an error:
+//
+//   node tests/web_screenshot.mjs [--out shot.png] [--wait SECONDS] [--eval JS]
+//
+// Serves web/ (with web/models/*.ngeo.gz built: see web/build.sh). Needs
+// google-chrome-stable and a GPU Chrome can use.
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, extname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..', 'web');
+const args = process.argv.slice(2);
+let out = 'web.png', wait = 6, script = '', clip = null;
+for (let k = 0; k < args.length; k++) {
+  if (args[k] === '--out') out = args[++k];
+  else if (args[k] === '--wait') wait = Number(args[++k]);
+  else if (args[k] === '--eval') script = args[++k];
+  else if (args[k] === '--clip') { const [x, y, width, height, scale] = args[++k].split(',').map(Number); clip = { x, y, width, height, scale }; }
+  else { console.error(`unknown flag ${args[k]}`); process.exit(2); }
+}
+
+const types = { '.js': 'text/javascript', '.wgsl': 'text/plain', '.html': 'text/html', '.css': 'text/css', '.gz': 'application/gzip' };
+const server = createServer((req, res) => {
+  let path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  if (path.endsWith('/')) path += 'index.html';
+  try {
+    const body = readFileSync(join(root, path));
+    res.writeHead(200, { 'content-type': types[extname(path)] || 'application/octet-stream', 'content-length': body.length });
+    res.end(body);
+  } catch { res.writeHead(404); res.end(); }
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const profile = mkdtempSync(join(tmpdir(), 'nexus-web-'));
+const chrome = spawn('google-chrome-stable', [
+  '--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--no-first-run', '--window-size=1600,900',
+  '--enable-unsafe-webgpu', '--enable-features=Vulkan,SkiaGraphite', '--ignore-gpu-blocklist', '--use-angle=vulkan',
+  'about:blank',
+], { stdio: ['ignore', 'ignore', 'pipe'] });
+let failed = false;
+try {
+  const devtools = await new Promise((resolve, reject) => {
+    let log = '';
+    chrome.stderr.on('data', (d) => {
+      log += d;
+      const m = log.match(/DevTools listening on (ws:\/\/\S+)/);
+      if (m) resolve(m[1]);
+    });
+    setTimeout(() => reject(new Error('Chrome did not start')), 20000);
+  });
+  console.error('devtools', devtools);
+  const httpBase = devtools.replace(/^ws:\/\/([^/]+).*/, 'http://$1');
+  const target = await (await fetch(`${httpBase}/json/new?about:blank`, { method: 'PUT' })).json();
+  console.error('target', target.webSocketDebuggerUrl);
+  const ws = new WebSocket(target.webSocketDebuggerUrl);
+  let id = 0;
+  const waits = new Map();
+  ws.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if (d.id && waits.has(d.id)) { waits.get(d.id)(d); waits.delete(d.id); }
+    else if (d.method === 'Runtime.exceptionThrown') { failed = true; console.error('page:', d.params.exceptionDetails.exception?.description); }
+    else if (d.method === 'Runtime.consoleAPICalled' && ['error', 'warning'].includes(d.params.type)) {
+      failed ||= d.params.type === 'error';
+      console.error('page:', d.params.args.map((a) => a.value ?? a.description).join(' '));
+    }
+  };
+  const send = (method, params = {}, seconds = 20) => new Promise((resolve, reject) => {
+    const i = ++id;
+    const timer = setTimeout(() => reject(new Error(`${method} timed out`)), seconds * 1000);
+    waits.set(i, (d) => { clearTimeout(timer); resolve(d); });
+    ws.send(JSON.stringify({ id: i, method, params }));
+  });
+  await new Promise((r) => (ws.onopen = r));
+  console.error('connected');
+  await send('Runtime.enable');
+  console.error('runtime enabled');
+  console.error('navigate:', JSON.stringify(await send('Page.navigate', { url: `http://127.0.0.1:${port}/` })));
+  for (let t = 0; t < wait; t++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const s = await send('Runtime.evaluate', { expression: 'document.readyState + " " + (document.getElementById("loading")?.textContent ?? "loaded")', returnByValue: true }, 5)
+      .catch((e) => ({ result: { result: { value: e.message } } }));
+    console.error(`${t + 1}s:`, s.result?.result?.value);
+  }
+  if (script) {
+    await send('Runtime.evaluate', { expression: script, awaitPromise: true });
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  const text = await send('Runtime.evaluate', {
+    expression: `[...document.querySelectorAll('dd')].map(d => d.previousElementSibling.textContent + ': ' + d.textContent).join('\\n') + '\\n' + (document.getElementById('loading')?.textContent || '')`,
+    returnByValue: true,
+  });
+  console.log(text.result.result.value);
+  const shot = await send('Page.captureScreenshot', clip ? { format: 'png', clip } : { format: 'png' });
+  writeFileSync(out, Buffer.from(shot.result.data, 'base64'));
+  console.log(`wrote ${out}`);
+  ws.close();
+} finally {
+  chrome.kill();
+  server.close();
+  await new Promise((r) => setTimeout(r, 500));
+  rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+}
+process.exit(failed ? 1 : 0);
