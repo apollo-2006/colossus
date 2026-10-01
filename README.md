@@ -87,6 +87,28 @@ triangles reach the screen.
    hierarchy also says how far that copy can stray from what is drawn, and shadow rays
    start that far above the surface.
 
+6. **Streaming.** Only the clusters' bounds and errors stay resident. Their geometry is
+   packed into pages, one per group, and paged from disk into a fixed pool
+   (`--pool-mb`, 1 GB by default) as the GPU asks for it. A cluster that is drawn but
+   would rather be its finer clusters, whose page is missing, requests that page,
+   with its error on screen as the priority. Two frames later `viewer/streamer.hpp`
+   reads the requests, loads the most wanted pages, and evicts the least recently
+   used ones when the pool is full.
+
+   What keeps a streamed cut whole: a cluster is drawn either when it is the right
+   level, or when the finer clusters it stands for are not resident. That only works
+   if those stand-ins are always there, so a page may only be resident while the
+   pages of the coarser clusters its group was simplified into are. Loads go coarsest
+   first, and a page is evicted only when no resident page depends on it. Then along
+   every path from leaf to root, exactly one cluster is drawn, whatever has been
+   loaded.
+
+   The 900 instance view at the top settles in 14 frames with 321 pages, 4 MB, of
+   the 1011 MB on disk resident, since every instance draws from the same pages; after
+   that it draws the same 856k triangles as with everything resident. A 300 frame
+   flight through the crowd with a 16 MB pool evicts 3,219 pages and shows no holes at
+   any frame checked.
+
 ![Lucy, each cluster in its own color](docs/clusters.png)
 
 Each cluster of Lucy in its own color (debug view 2).
@@ -113,11 +135,12 @@ no ray queries:
   twice: a 32-bit atomic max keeps the nearest depth, then a second pass writes the
   triangle wherever its depth won. Shading takes the nearer of the two rasterizers'
   results at each pixel.
-* No shadows, and no occlusion culling yet.
+* No shadows, no occlusion culling and no streaming yet.
 
 The models are trimmed to 400k triangles at their finest (`colossus_build --max-triangles`,
-which keeps the hierarchy above that cut intact), 8 MB each gzipped. 900 instances take
-0.49 ms of GPU time at 1600x813 in Chrome on the RX 9070 XT. `web/build.sh` builds the
+which keeps the hierarchy above that cut intact), 10.5 MB each gzipped. Every page is
+loaded up front, so the page table is just each page's place in the file. 900 instances
+take 0.47 ms of GPU time at 1600x813 in Chrome on the RX 9070 XT. `web/build.sh` builds the
 models, and `node tests/web_screenshot.mjs` renders the page in a headless Chrome.
 
 ## Build & run
@@ -158,9 +181,15 @@ make test
 downloads: PLY (ASCII and both byte orders) and OBJ reading, welding, cluster limits
 and coverage, the simplifier's locked vertices, flips and area on a flat grid, and a
 full hierarchy for a closed sphere, a sphere with holes and a flat grid, each checked
-for cracks at 31 cuts and written to a file and read back. CI runs them and builds the
-viewer on every push. With the group locks removed from the builder, the crack check
-reports 39,095 cracked edges on the closed sphere alone.
+for cracks at 31 cuts, paged, written to a file and read back exactly. With the group
+locks removed from the builder, the crack check reports 39,095 cracked edges on the
+closed sphere alone.
+
+`tests/streamer_test.cpp` runs the streamer for 3,000 frames of random requests into a
+pool a tenth the size of a model, checking after each that every resident page's
+dependencies are resident. It caught one way to break that (making room for a page
+could evict a page it was about to depend on), fixed before the streamer was
+committed. CI runs both and builds the viewer on every push.
 
 ## Performance
 
@@ -168,12 +197,14 @@ RX 9070 XT (RADV), 1920x1080, the 900 instance scene above, median of 200 frames
 
 | camera | frame | culling | raster | pass 2 | shading | triangles | clusters |
 |---|---|---|---|---|---|---|---|
-| beside Lucy (top image) | 0.72 ms | 0.13 | 0.12 | 0.08 | 0.39 | 0.86M | 9.8k |
-| raised (LOD image) | 0.78 ms | 0.04 | 0.15 | 0.08 | 0.51 | 1.15M | 16.6k |
-| ground level | 0.83 ms | 0.15 | 0.12 | 0.08 | 0.47 | 0.82M | 9.0k |
+| beside Lucy (top image) | 0.76 ms | 0.15 | 0.13 | 0.09 | 0.40 | 0.86M | 9.8k |
+| raised (LOD image) | 0.82 ms | 0.06 | 0.15 | 0.08 | 0.53 | 1.15M | 16.6k |
+| ground level | 0.85 ms | 0.17 | 0.11 | 0.09 | 0.47 | 0.82M | 9.0k |
 
-Shadow rays are most of the frame: without them the three cameras take 0.35, 0.33
-and 0.39 ms. Turning the compute rasterizer off costs 0.10 to 0.14 ms (raster time
+Measured after 100 frames of streaming. Fetching geometry through the page table costs
+2% to 6% against keeping everything resident, which drew the same triangles in 0.72,
+0.78 and 0.83 ms. Shadow rays are most of the frame: without them the three cameras
+take 0.38, 0.36 and 0.42 ms. Turning the compute rasterizer off costs 0.10 to 0.14 ms (raster time
 roughly doubles). Occlusion culling removes 39% of the triangles at ground level
 (1.34M to 0.82M) but saves little time here, where instances stand apart. With instances packed tighter
 (spacing 0.9, from inside the crowd), the culling and rasterizer changes together took
@@ -185,8 +216,12 @@ a frame from 1.37 ms to 0.47 ms; the commit messages have each step's numbers.
   triangles between neighbours, or a real graph partitioner, would fill them.
 * The simplifier's error is a mean over the quadric's planes, not a maximum, so it can
   understate the worst spot, and the 1 pixel bound is not strict.
-* Everything is resident in GPU memory: Lucy's hierarchy is 780 MB. Nanite streams
-  clusters from disk on demand; this does not yet.
+* Pages are read on the render thread, up to `--upload-mb` (64 MB) a frame; a
+  loader thread would keep a slow disk from showing in frame times. Pages store
+  positions as full floats, and shared vertices once per cluster; quantizing would
+  roughly halve them.
+* A refinement takes a round trip of two frames per level, so flying into a statue
+  from far away sharpens over a dozen or so frames.
 * Normals are interpolated per vertex, with no materials or textures.
 
 ## Models
