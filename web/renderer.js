@@ -125,7 +125,7 @@ export class Renderer {
     const clusters = new ArrayBuffer(totals.c * 112);
     const pageTable = new Uint32Array(totals.p);
     const pool = new Uint32Array(totals.w);
-    const meshes = new ArrayBuffer(models.length * 48);
+    const meshes = new ArrayBuffer(models.length * 64);
     let clusterBase = 0, pageBase = 0, wordBase = 0;
     models.forEach((m, k) => {
       const dst = new Uint32Array(clusters, clusterBase * 112, m.clusterCount * 28);
@@ -136,11 +136,12 @@ export class Renderer {
       }
       for (let p = 0; p < m.pageTable.length; p++) pageTable[pageBase + p] = m.pageTable[p] + wordBase;
       pool.set(m.data, wordBase);
-      const mu = new Uint32Array(meshes, k * 48, 4), mf = new Float32Array(meshes, k * 48 + 16, 8);
+      const mu = new Uint32Array(meshes, k * 64, 4), mf = new Float32Array(meshes, k * 64 + 16, 12);
       mu[0] = clusterBase;
       mu[1] = m.clusterCount;
       mf.set(m.bounds, 0);
       mf.set(m.lodBounds, 4);
+      mf.set(m.grid, 8);
       clusterBase += m.clusterCount;
       pageBase += m.pageTable.length;
       wordBase += m.data.length;

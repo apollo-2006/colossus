@@ -31,7 +31,7 @@ struct gpu_cluster {
     uint32_t level;
     uint32_t group;    // The group it was simplified in (UINT32_MAX for a root)
     uint32_t creator;  // The group whose simplification made it (UINT32_MAX for a leaf)
-    uint32_t pad0, pad1, pad2;
+    uint32_t origin[3];  // Paged: the cluster's corner on the model's grid (paged_file.hpp)
 };
 static_assert(sizeof(gpu_cluster) == 112, "gpu_cluster must match the shaders");
 

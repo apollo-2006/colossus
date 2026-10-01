@@ -221,7 +221,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   let inst = instances[v.x];
   let c = clusters[v.y];
   if (lane < c.vertex_count) {
-    let clip = frame.view_proj * vec4f(to_world(inst, cluster_position(c, lane)), 1.0);
+    let clip = frame.view_proj * vec4f(to_world(inst, cluster_position(c, meshes[inst.mesh].grid, lane)), 1.0);
     let ndc = clip.xy / clip.w;
     // Pixels run down; clip space runs up.
     let px = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(f32(frame.width), f32(frame.height));
@@ -380,9 +380,10 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let i0 = packed & 255u;
     let i1 = (packed >> 8u) & 255u;
     let i2 = (packed >> 16u) & 255u;
-    let p0 = to_world(inst, cluster_position(c, i0));
-    let p1 = to_world(inst, cluster_position(c, i1));
-    let p2 = to_world(inst, cluster_position(c, i2));
+    let grid = meshes[inst.mesh].grid;
+    let p0 = to_world(inst, cluster_position(c, grid, i0));
+    let p1 = to_world(inst, cluster_position(c, grid, i1));
+    let p2 = to_world(inst, cluster_position(c, grid, i2));
     // The ray against the triangle's plane, for exact barycentrics.
     let e1 = p1 - p0;
     let e2 = p2 - p0;

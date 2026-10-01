@@ -42,9 +42,11 @@ struct Cluster {
   level: u32,
   group: u32,
   creator: u32,
-  pad0: u32,
-  pad1: u32,
-  pad2: u32,
+  // Its corner on the model's grid. Three u32, not a vec3u: that would
+  // align to 16 bytes and make the struct 128 bytes, not the file's 112.
+  origin_x: u32,
+  origin_y: u32,
+  origin_z: u32,
 }
 
 struct Mesh {
@@ -54,6 +56,7 @@ struct Mesh {
   pad1: u32,
   bounds: vec4f,
   lod_bounds: vec4f,
+  grid: vec4f,  // Where positions snap: xyz grid point 0, w the step
 }
 
 struct Instance {
@@ -86,15 +89,19 @@ fn to_world_dir(inst: Instance, v: vec3f) -> vec3f {
   return vec3f(dot(inst.rows[0].xyz, v), dot(inst.rows[1].xyz, v), dot(inst.rows[2].xyz, v));
 }
 
-fn cluster_position(c: Cluster, k: u32) -> vec3f {
-  let at = page_table[c.group] + c.vertex_offset + 4u * k;
-  return vec3f(bitcast<f32>(pool[at]), bitcast<f32>(pool[at + 1u]), bitcast<f32>(pool[at + 2u]));
+// A vertex is two words: 14-bit offsets from the cluster's corner on the
+// model's grid, and an 11 + 11 bit octahedral normal (include/paged_file.hpp).
+fn cluster_position(c: Cluster, grid: vec4f, k: u32) -> vec3f {
+  let at = page_table[c.group] + c.vertex_offset + 2u * k;
+  let w0 = pool[at];
+  let w1 = pool[at + 1u];
+  let d = vec3u(w0 & 0x3fffu, (w0 >> 14u) & 0x3fffu, (w0 >> 28u) | ((w1 & 0x3ffu) << 4u));
+  return grid.xyz + grid.w * vec3f(vec3u(c.origin_x, c.origin_y, c.origin_z) + d);
 }
 
-// Octahedral, two snorm16.
 fn cluster_normal(c: Cluster, k: u32) -> vec3f {
-  let packed = pool[page_table[c.group] + c.vertex_offset + 4u * k + 3u];
-  let e = vec2f(f32((i32(packed) << 16u) >> 16u), f32(i32(packed) >> 16u)) / 32767.0;
+  let w1 = pool[page_table[c.group] + c.vertex_offset + 2u * k + 1u];
+  let e = vec2f(f32((w1 >> 10u) & 2047u), f32(w1 >> 21u)) / 2047.0 * 2.0 - 1.0;
   var n = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
   if (n.z < 0.0) {
     n = vec3f((1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0), (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0), n.z);

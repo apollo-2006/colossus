@@ -4,17 +4,27 @@
 // group, loaded as needed.
 //
 // A page holds everything its clusters draw from: for each cluster, its
-// vertices (position, and normal packed octahedrally into 16 + 16 bits:
-// four words each) and then its triangles (three bytes in a word). The
-// vertices a cluster shares with its neighbours are stored again, which
-// costs space but leaves a cluster nothing to look up but its own page.
+// vertices and then its triangles (three bytes in a word). The vertices a
+// cluster shares with its neighbours are stored again, which costs space
+// but leaves a cluster nothing to look up but its own page.
+//
+// A vertex is two words. Its position is snapped to a grid over the model,
+// one step a 16382nd of the largest cluster's side, and stored as three
+// 14-bit offsets from the cluster's corner on that grid; its normal is
+// octahedral, 11 + 11 bits:
+//
+//   word 0: x (14) | y (14) << 14 | low 4 bits of z << 28
+//   word 1: high 10 bits of z | u (11) << 10 | v (11) << 21
+//
+// A vertex shared by several clusters snaps to the same grid point in each,
+// so the clusters still meet exactly, and quantizing opens no cracks.
 //
 // A page is the unit of streaming. Page 0 holds the roots and is always
 // resident. A page is the members of one group; the clusters its group was
 // simplified into (the coarser copy of the same surface) are in other
 // pages, its dependencies, and a page may only be resident while those
 // are. Then a cluster can always be drawn in place of finer clusters that
-// are missing, and the cut stays whole: see viewer/residency.hpp.
+// are missing, and the cut stays whole: see viewer/streamer.hpp.
 #include "geometry_file.hpp"
 
 #include <cstdint>
@@ -34,6 +44,8 @@ constexpr uint32_t no_page = UINT32_MAX;
 
 struct paged_geometry {
     sphere bounds, lod_bounds;
+    vec3 grid_min;      // Position of grid point (0, 0, 0)
+    float grid_step = 0;
     // In order of parent error, like geometry's. Here `group` is the page a
     // cluster lives in and `creator` the page of the finer clusters it
     // stands for (no_page for a leaf); vertex_offset and triangle_offset
@@ -56,10 +68,6 @@ void save_paged(const paged_geometry& p, const std::string& path);
 // Reads a .cgeo file; the page data only if with_data.
 paged_geometry load_paged(const std::string& path, bool with_data);
 
-// A vertex as stored in a page.
-struct page_vertex {
-    float x, y, z;
-    uint32_t normal;  // Octahedral, two snorm16
-};
-uint32_t encode_normal(vec3 n);
-vec3 decode_normal(uint32_t packed);
+// A vertex of a cluster, from its two words.
+vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* vertex);
+vec3 decode_normal(const uint32_t* vertex);

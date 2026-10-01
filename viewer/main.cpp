@@ -80,6 +80,7 @@ struct gpu_mesh {
     uint32_t pad1;
     float bounds[4];
     float lod_bounds[4];
+    float grid[4];  // Grid point 0 and the step: see paged_file.hpp
 };
 struct gpu_instance {
     float rows[3][4];
@@ -244,9 +245,8 @@ float shadow_cut(const paged_geometry& g, int fd, std::vector<float>& positions,
         }
         const uint32_t first = static_cast<uint32_t>(positions.size() / 3);
         for (uint32_t k = 0; k < c.vertex_count; ++k) {
-            float xyz[3];
-            std::memcpy(xyz, &words[c.vertex_offset + 4 * k], 12);
-            positions.insert(positions.end(), xyz, xyz + 3);
+            const vec3 p = decode_position(g, c, &words[c.vertex_offset + 2 * k]);
+            positions.insert(positions.end(), {p.x, p.y, p.z});
         }
         for (uint32_t t = 0; t < c.triangle_count; ++t) {
             const uint32_t w = words[c.triangle_offset + t];
@@ -299,6 +299,7 @@ void make_scene(const options& opt, scene& s) {
         m.bounds[3] = g.bounds.radius;
         m.lod_bounds[0] = g.lod_bounds.center.x; m.lod_bounds[1] = g.lod_bounds.center.y;
         m.lod_bounds[2] = g.lod_bounds.center.z; m.lod_bounds[3] = g.lod_bounds.radius;
+        m.grid[0] = g.grid_min.x; m.grid[1] = g.grid_min.y; m.grid[2] = g.grid_min.z; m.grid[3] = g.grid_step;
         s.meshes.push_back(m);
         for (gpu_cluster c : g.clusters) {
             c.group += page_base;

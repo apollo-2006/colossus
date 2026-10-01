@@ -9,7 +9,9 @@
 
 namespace {
 
-constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '4'};
+constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '5'};
+constexpr uint32_t grid_bits = 14;
+constexpr uint32_t grid_max = (1u << grid_bits) - 2;  // A step of rounding to spare
 
 template <class T>
 void write_vec(std::ofstream& f, const std::vector<T>& v) {
@@ -32,8 +34,11 @@ float sign_not_zero(float v) { return v >= 0 ? 1.0f : -1.0f; }
 
 }  // namespace
 
+namespace {
+
+// Octahedral: onto |x| + |y| + |z| = 1, the lower half folded over, then
+// each of u and v from [-1, 1] to 11 bits.
 uint32_t encode_normal(vec3 n) {
-    // Onto the octahedron |x| + |y| + |z| = 1, the lower half folded over.
     const float l1 = std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
     float u = l1 > 0 ? n.x / l1 : 0, v = l1 > 0 ? n.y / l1 : 0;
     if (n.z < 0) {
@@ -41,19 +46,27 @@ uint32_t encode_normal(vec3 n) {
         u = fu;
         v = fv;
     }
-    auto snorm = [](float x) { return static_cast<uint32_t>(static_cast<int32_t>(std::lround(std::clamp(x, -1.0f, 1.0f) * 32767)) & 0xffff); };
-    return snorm(u) | (snorm(v) << 16);
+    auto bits = [](float x) { return static_cast<uint32_t>(std::lround((std::clamp(x, -1.0f, 1.0f) * 0.5f + 0.5f) * 2047)); };
+    return bits(u) | (bits(v) << 11);
 }
 
-vec3 decode_normal(uint32_t packed) {
-    const float u = static_cast<int16_t>(packed & 0xffff) / 32767.0f, v = static_cast<int16_t>(packed >> 16) / 32767.0f;
+}  // namespace
+
+vec3 decode_normal(const uint32_t* vertex) {
+    const float u = float((vertex[1] >> 10) & 2047) / 2047 * 2 - 1, v = float(vertex[1] >> 21) / 2047 * 2 - 1;
     vec3 n(u, v, 1 - std::abs(u) - std::abs(v));
     if (n.z < 0) {
-        const float fu = (1 - std::abs(v)) * sign_not_zero(u), fv = (1 - std::abs(u)) * sign_not_zero(v);
-        n.x = fu;
-        n.y = fv;
+        n.x = (1 - std::abs(v)) * sign_not_zero(u);
+        n.y = (1 - std::abs(u)) * sign_not_zero(v);
     }
     return normalize(n);
+}
+
+vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* vertex) {
+    const uint32_t x = vertex[0] & 0x3fff, y = (vertex[0] >> 14) & 0x3fff, z = (vertex[0] >> 28) | ((vertex[1] & 0x3ff) << 4);
+    // As the shaders compute it: integer grid point, then one multiply-add.
+    return {g.grid_min.x + g.grid_step * float(c.origin[0] + x), g.grid_min.y + g.grid_step * float(c.origin[1] + y),
+            g.grid_min.z + g.grid_step * float(c.origin[2] + z)};
 }
 
 size_t paged_geometry::leaf_triangles() const {
@@ -83,6 +96,26 @@ paged_geometry page(const geometry& g) {
         members[pg].push_back(i);
     }
 
+    // The grid: fine enough that the largest cluster spans grid_max steps.
+    vec3 lo(INFINITY, INFINITY, INFINITY);
+    float largest = 0;
+    for (const gpu_cluster& c : g.clusters) {
+        vec3 clo(INFINITY, INFINITY, INFINITY), chi(-INFINITY, -INFINITY, -INFINITY);
+        for (uint32_t k = 0; k < c.vertex_count; ++k) {
+            const size_t v = g.cluster_vertices[c.vertex_offset + k];
+            const vec3 q(g.positions[3 * v], g.positions[3 * v + 1], g.positions[3 * v + 2]);
+            clo = min(clo, q);
+            chi = max(chi, q);
+        }
+        lo = min(lo, clo);
+        largest = std::max({largest, chi.x - clo.x, chi.y - clo.y, chi.z - clo.z});
+    }
+    p.grid_min = lo;
+    p.grid_step = std::max(largest, 1e-12f) / grid_max;
+    auto snap = [&](size_t v, int axis) {
+        return static_cast<uint32_t>(std::lround((g.positions[3 * v + axis] - lo[axis]) / p.grid_step));
+    };
+
     p.clusters = g.clusters;
     std::vector<std::vector<uint32_t>> deps(members.size());
     for (gpu_cluster& c : p.clusters) {
@@ -103,13 +136,21 @@ paged_geometry page(const geometry& g) {
             const gpu_cluster& src = g.clusters[i];
             gpu_cluster& dst = p.clusters[i];
             dst.vertex_offset = static_cast<uint32_t>(words.size());
+            for (int axis = 0; axis < 3; ++axis) {
+                dst.origin[axis] = UINT32_MAX;
+                for (uint32_t k = 0; k < src.vertex_count; ++k)
+                    dst.origin[axis] = std::min(dst.origin[axis], snap(g.cluster_vertices[src.vertex_offset + k], axis));
+            }
             for (uint32_t k = 0; k < src.vertex_count; ++k) {
                 const size_t v = g.cluster_vertices[src.vertex_offset + k];
-                const vec3 n(g.normals[3 * v], g.normals[3 * v + 1], g.normals[3 * v + 2]);
-                uint32_t w[4];
-                std::memcpy(w, &g.positions[3 * v], 12);
-                w[3] = encode_normal(n);
-                words.insert(words.end(), w, w + 4);
+                uint32_t d[3];
+                for (int axis = 0; axis < 3; ++axis) {
+                    d[axis] = snap(v, axis) - dst.origin[axis];
+                    if (d[axis] > (1u << grid_bits) - 1) throw std::logic_error("cluster wider than the grid allows");
+                }
+                const uint32_t n = encode_normal({g.normals[3 * v], g.normals[3 * v + 1], g.normals[3 * v + 2]});
+                words.push_back(d[0] | (d[1] << 14) | (d[2] << 28));
+                words.push_back((d[2] >> 4) | (n << 10));
             }
             dst.triangle_offset = static_cast<uint32_t>(words.size());
             words.insert(words.end(), g.cluster_triangles.begin() + src.triangle_offset,
@@ -135,8 +176,9 @@ void save_paged(const paged_geometry& p, const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + path);
     f.write(magic, sizeof magic);
-    const float b[8] = {p.bounds.center.x,     p.bounds.center.y,     p.bounds.center.z,     p.bounds.radius,
-                        p.lod_bounds.center.x, p.lod_bounds.center.y, p.lod_bounds.center.z, p.lod_bounds.radius};
+    const float b[12] = {p.bounds.center.x,     p.bounds.center.y,     p.bounds.center.z,     p.bounds.radius,
+                         p.lod_bounds.center.x, p.lod_bounds.center.y, p.lod_bounds.center.z, p.lod_bounds.radius,
+                         p.grid_min.x,          p.grid_min.y,          p.grid_min.z,          p.grid_step};
     f.write(reinterpret_cast<const char*>(b), sizeof b);
     write_vec(f, p.clusters);
     write_vec(f, p.pages);
@@ -159,10 +201,12 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
     if (!f || std::memcmp(m, magic, sizeof magic) != 0)
         throw std::runtime_error(path + " is not a geometry file (or an old one: rebuild it)");
     paged_geometry p;
-    float b[8];
+    float b[12];
     f.read(reinterpret_cast<char*>(b), sizeof b);
     p.bounds = {{b[0], b[1], b[2]}, b[3]};
     p.lod_bounds = {{b[4], b[5], b[6]}, b[7]};
+    p.grid_min = {b[8], b[9], b[10]};
+    p.grid_step = b[11];
     read_vec(f, p.clusters);
     read_vec(f, p.pages);
     read_vec(f, p.deps);
@@ -182,7 +226,7 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
             c.vertex_count > cluster_max_vertices || c.triangle_count > cluster_max_triangles)
             throw std::runtime_error(path + ": cluster out of range");
         const uint32_t words = p.pages[c.group].size / 4;
-        if (uint64_t(c.vertex_offset) + 4 * c.vertex_count > words || uint64_t(c.triangle_offset) + c.triangle_count > words)
+        if (uint64_t(c.vertex_offset) + 2 * c.vertex_count > words || uint64_t(c.triangle_offset) + c.triangle_count > words)
             throw std::runtime_error(path + ": cluster outside its page");
     }
     if (with_data) {

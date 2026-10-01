@@ -230,25 +230,35 @@ void test_hierarchy(const char* name, const mesh& input) {
     save_paged(paged, path);
     const paged_geometry back = load_paged(path, true);
     CHECK(back.clusters.size() == g.clusters.size() && back.pages.size() == paged.pages.size());
-    size_t wrong = 0;
-    float worst_normal = 1;
+    // Positions come back within half a grid step, normals within a fraction
+    // of a degree, and a vertex shared by clusters comes back bit for bit
+    // the same from each: quantizing must open no cracks.
+    size_t wrong = 0, mismatched = 0;
+    float worst_normal = 1, worst_position = 0;
+    std::map<uint32_t, vec3> seen;
     for (size_t i = 0; i < g.clusters.size(); ++i) {
         const gpu_cluster& c = g.clusters[i];
         const gpu_cluster& pc = back.clusters[i];
         const uint32_t* base = &back.data[back.pages[pc.group].offset / 4];
         for (uint32_t k = 0; k < c.vertex_count; ++k) {
             const uint32_t v = g.cluster_vertices[c.vertex_offset + k];
-            float xyz[3];
-            std::memcpy(xyz, base + pc.vertex_offset + 4 * k, 12);
-            wrong += xyz[0] != g.positions[3 * v] || xyz[1] != g.positions[3 * v + 1] || xyz[2] != g.positions[3 * v + 2];
-            const vec3 n = decode_normal(base[pc.vertex_offset + 4 * k + 3]);
+            const uint32_t* w = base + pc.vertex_offset + 2 * k;
+            const vec3 p = decode_position(back, pc, w);
+            const vec3 original(g.positions[3 * v], g.positions[3 * v + 1], g.positions[3 * v + 2]);
+            worst_position = std::max(worst_position, length(p - original));
+            auto [it, added] = seen.emplace(v, p);
+            if (!added) mismatched += std::memcmp(&it->second, &p, sizeof p) != 0;
+            const vec3 n = decode_normal(w);
             worst_normal = std::min(worst_normal, dot(n, vec3(g.normals[3 * v], g.normals[3 * v + 1], g.normals[3 * v + 2])));
         }
         for (uint32_t t = 0; t < c.triangle_count; ++t) wrong += base[pc.triangle_offset + t] != g.cluster_triangles[c.triangle_offset + t];
     }
-    std::printf("  %zu pages; normals within %.4f degrees\n", back.pages.size(), std::acos(std::min(1.0f, worst_normal)) * 57.2958f);
+    std::printf("  %zu pages, %.0f KB; positions within %.2f grid steps, normals within %.3f degrees\n", back.pages.size(),
+                back.data_size / 1024.0, worst_position / back.grid_step, std::acos(std::min(1.0f, worst_normal)) * 57.2958f);
     CHECK(wrong == 0);
-    CHECK(worst_normal > 0.99999f);
+    CHECK(mismatched == 0);
+    CHECK(worst_position <= 0.88f * back.grid_step);  // Half a step on each axis
+    CHECK(worst_normal > 0.9999f);
     size_t bad_deps = 0;
     for (const gpu_cluster& c : back.clusters)
         if (c.creator != no_page) {

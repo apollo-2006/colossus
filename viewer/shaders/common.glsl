@@ -24,7 +24,7 @@ struct Cluster {
     uint level;
     uint group;
     uint creator;
-    uint pad0, pad1, pad2;
+    uvec3 origin;  // Its corner on the model's grid
 };
 
 // One loaded model: its clusters are clusters[first_cluster, + cluster_count).
@@ -35,6 +35,7 @@ struct Mesh {
     uint pad1;
     vec4 bounds;      // xyz center, w radius
     vec4 lod_bounds;  // Contains every LOD sphere of the model
+    vec4 grid;        // Where positions snap: xyz grid point 0, w the step
 };
 
 // An instance: a model placed by a rotation, uniform scale and translation.
@@ -105,15 +106,19 @@ layout(set = 0, binding = 5, scalar) buffer Requests {
 };
 layout(set = 0, binding = 19, scalar) buffer RequestStamp { uint request_stamp[]; };
 
-// A cluster's vertices and triangles, from its page at `base`.
-vec3 cluster_position(uint base, Cluster c, uint k) {
-    const uint at = base + c.vertex_offset + 4u * k;
-    return vec3(uintBitsToFloat(pool[at]), uintBitsToFloat(pool[at + 1u]), uintBitsToFloat(pool[at + 2u]));
+// A cluster's vertices and triangles, from its page at `base`. A vertex
+// is two words: 14-bit offsets from the cluster's corner on the model's
+// grid, and an 11 + 11 bit octahedral normal (include/paged_file.hpp).
+vec3 cluster_position(uint base, Cluster c, vec4 grid, uint k) {
+    const uint at = base + c.vertex_offset + 2u * k;
+    const uint w0 = pool[at], w1 = pool[at + 1u];
+    const uvec3 d = uvec3(w0 & 0x3fffu, (w0 >> 14) & 0x3fffu, (w0 >> 28) | ((w1 & 0x3ffu) << 4));
+    return grid.xyz + grid.w * vec3(c.origin + d);
 }
 
 vec3 cluster_normal(uint base, Cluster c, uint k) {
-    const uint packed = pool[base + c.vertex_offset + 4u * k + 3u];
-    const vec2 e = vec2(float(int(packed << 16) >> 16), float(int(packed) >> 16)) / 32767.0;
+    const uint w1 = pool[base + c.vertex_offset + 2u * k + 1u];
+    const vec2 e = vec2(float((w1 >> 10) & 2047u), float(w1 >> 21)) / 2047.0 * 2.0 - 1.0;
     vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
     if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
     return normalize(n);

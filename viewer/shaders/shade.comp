@@ -108,8 +108,9 @@ void main() {
         const uint base = page_table[c.group];
         const uint packed = cluster_triangle(base, c, tri);
         const uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
-        const vec3 p0 = to_world(inst, cluster_position(base, c, i0)), p1 = to_world(inst, cluster_position(base, c, i1)),
-                   p2 = to_world(inst, cluster_position(base, c, i2));
+        const vec4 grid = meshes[inst.mesh].grid;
+        const vec3 p0 = to_world(inst, cluster_position(base, c, grid, i0)), p1 = to_world(inst, cluster_position(base, c, grid, i1)),
+                   p2 = to_world(inst, cluster_position(base, c, grid, i2));
 
         // The ray against the triangle's plane (Moller-Trumbore, without
         // the bounds checks: the rasterizer already said it hits).

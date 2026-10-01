@@ -3,7 +3,7 @@
 // does not stream: every page is loaded, and the page table is where each
 // one starts in the data.
 
-const MAGIC = 'CGEOv004';
+const MAGIC = 'CGEOv005';
 
 // Streams a URL, reporting progress as (bytes so far, total or 0), and
 // gunzips it if its name ends in .gz.
@@ -29,8 +29,8 @@ export function parseModel(buffer) {
   if (magic !== MAGIC) throw new Error(`not a geometry file (or an old one): ${magic}`);
   const view = new DataView(buffer);
   let at = 8;
-  const header = new Float32Array(buffer.slice(at, at + 32));
-  at += 32;
+  const header = new Float32Array(buffer.slice(at, at + 48));
+  at += 48;
   // Each array: a 64-bit element count, then the elements.
   const array = (elementBytes) => {
     const n = Number(view.getBigUint64(at, true));
@@ -57,5 +57,8 @@ export function parseModel(buffer) {
   const words = new Uint32Array(clusters);
   let leafTriangles = 0;
   for (let c = 0; c < clusterCount; c++) if (words[28 * c + 22] === 0) leafTriangles += words[28 * c + 21];
-  return { bounds: header.slice(0, 4), lodBounds: header.slice(4, 8), clusters, clusterCount, pageTable, data, leafTriangles };
+  return {
+    bounds: header.slice(0, 4), lodBounds: header.slice(4, 8), grid: header.slice(8, 12),
+    clusters, clusterCount, pageTable, data, leafTriangles,
+  };
 }
