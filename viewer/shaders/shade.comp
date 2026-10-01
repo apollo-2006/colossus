@@ -118,14 +118,23 @@ void main() {
         const float det = dot(e1, pv);
         const vec3 tv = origin - p0;
         const float inv = abs(det) > 1e-20 ? 1.0 / det : 0.0;
-        const float bu = dot(tv, pv) * inv;
         const vec3 qv = cross(tv, e1);
-        const float bv = dot(dir, qv) * inv;
-        const float t = dot(e2, qv) * inv;
+        // Clamped: at a silhouette the triangle under a pixel center can be
+        // nearly edge-on, and the ray meets its plane far outside it.
+        const float bu = clamp(dot(tv, pv) * inv, 0.0, 1.0);
+        const float bv = clamp(dot(dir, qv) * inv, 0.0, 1.0 - bu);
+        // The distance from depth, which is exact, not from that plane.
+        const vec4 center = frame.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
+        const vec3 forward = normalize(center.xyz / center.w - origin);
+        const float t = frame.near_z / uintBitsToFloat(uint(v >> 32)) / dot(dir, forward);
         const vec3 hit = origin + dir * t;
 
         vec3 n = normalize(to_world_dir(inst, normals[i0] * (1.0 - bu - bv) + normals[i1] * bu + normals[i2] * bv));
-        if (dot(n, dir) > 0.0) n = -n;  // Seen from behind, through a hole in a scan
+        // Seen from behind (the inside of a fold, or through a hole in the
+        // scan): light the side we see, and leave the rim light off, which
+        // would outline every such sliver.
+        const bool behind = dot(n, dir) > 0.0;
+        if (behind) n = -n;
 
         vec3 albedo = vec3(0.56, 0.52, 0.47);
         if (frame.debug_mode == 1u) albedo = hash_color(vc.y * 7919u + vc.x * 104729u);
@@ -144,7 +153,7 @@ void main() {
             diffuse *= sunlight(hit, n, bias);
         }
         const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42;
-        const float rim = pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25;
+        const float rim = behind ? 0.0 : pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25;
         color = albedo * (sun_color * diffuse + ambient) + rim * sky(n);
 
         if ((frame.flags & flag_wireframe) != 0u) {
