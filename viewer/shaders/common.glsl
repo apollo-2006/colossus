@@ -66,7 +66,7 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     mat4 prev_view;
     float p00, p11;  // Projection scale in x and y
     uint hzb_width, hzb_height, hzb_levels;
-    uint pad2;
+    float sw_max_pixels;  // Clusters smaller than this on screen go to the software rasterizer
 } frame;
 
 const uint flag_cone_culling = 1u;
@@ -74,6 +74,7 @@ const uint flag_frustum_culling = 2u;
 const uint flag_wireframe = 4u;
 const uint flag_occlusion = 8u;
 const uint flag_prev_valid = 16u;  // Last frame's pyramid fits this frame
+const uint flag_software_raster = 32u;
 
 // Which pass this is (0 or 1), and for the pyramid builder, which level.
 layout(push_constant, scalar) uniform Push {
@@ -112,12 +113,18 @@ layout(set = 0, binding = 15, scalar) buffer LateClusters { uvec2 late_clusters[
 layout(set = 0, binding = 16) uniform sampler2D hzb;
 
 // Every cluster drawn this frame, numbered: the visibility buffer stores
-// that number and a triangle.
+// that number and a triangle. Clusters for the hardware rasterizer fill it
+// from the front, those for the software rasterizer from the back.
 layout(set = 0, binding = 9, scalar) buffer Visible {
     uint visible_count;
-    uint pad3, pad4, pad5;
+    uint sw_count;
+    uint pad3, pad4;
     uvec2 visible[];  // (instance, cluster)
 };
+
+uint sw_slot(uint k) {
+    return frame.max_visible - 1u - k;
+}
 
 // Per pixel: depth (reversed, as float bits) above the visible cluster
 // number times 128 plus the triangle. An atomic max keeps the nearest, and
@@ -135,16 +142,19 @@ layout(set = 0, binding = 11, scalar) buffer Stats {
     uint instances_occluded;
     uint clusters_occluded;   // In pass 1; some come back in pass 2
     uint clusters_late;       // Drawn in pass 2
-    uint pad6;
+    uint clusters_software;   // Drawn by the software rasterizer
 } stats;
 
 // Indirect arguments for each pass, written by args.comp: the cluster
-// culling dispatch (x, y, z, and the number of work items), then the mesh
-// shader draw (x, y, z, and the first visible cluster it draws).
+// culling dispatch (x, y, z, and the number of work items), the mesh
+// shader draw (x, y, z, and the first visible cluster it draws), and the
+// software rasterizer's dispatch (x, y, z, and its first cluster).
 layout(set = 0, binding = 12, scalar) buffer DrawArgs {
     uvec4 cull_args[2];
     uvec4 draw_args[2];
-    uint pass_start[3];  // visible[pass_start[p], pass_start[p + 1]) is pass p's
+    uvec4 sw_args[2];
+    uint pass_start[3];     // visible[pass_start[p], pass_start[p + 1]) is pass p's
+    uint sw_pass_start[3];  // The same, counted from the back
 };
 
 vec3 to_world(Instance inst, vec3 p) {

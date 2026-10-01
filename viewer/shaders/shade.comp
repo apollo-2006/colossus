@@ -103,6 +103,7 @@ void main() {
         else if (frame.debug_mode == 4u) albedo = hash_color(c.group + vc.x * 104729u);
         else if (frame.debug_mode == 5u) albedo = hash_color(vc.x);
         else if (frame.debug_mode == 6u) albedo = vec3(0.3);
+        else if (frame.debug_mode == 7u) albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
 
         const float diffuse = max(dot(n, sun_dir), 0.0);
         const vec3 ambient = mix(vec3(0.22, 0.2, 0.18), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.5;

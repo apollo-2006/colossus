@@ -1,0 +1,115 @@
+#version 460
+// The software rasterizer: one workgroup per small cluster, one invocation
+// per vertex and then per triangle. Each invocation walks its triangle's
+// bounding box and writes depth and triangle into the visibility buffer
+// with the same 64-bit atomic max as the hardware path, so the two mix
+// freely and the nearest wins.
+//
+// Vertices are snapped to 1/256 pixel, as the hardware does (8 subpixel
+// bits), and edges follow a top-left rule, so neighbouring triangles share
+// every pixel center exactly once. Edge functions are measured from the
+// triangle's own corner, which keeps them in 32 bits: clusters sent here
+// are under 64 pixels, so a coordinate is under 2^14 and a product under
+// 2^28. (RDNA has no 64-bit integer multiply; the first version, in 64
+// bits, was slower than the hardware rasterizer at every size.)
+//
+// Before its atomic, each pixel reads the buffer and skips the atomic if
+// something nearer is already there: the same job early depth testing does
+// for the hardware path. The read can be stale, but only ever farther than
+// the truth, so it never skips a write that should happen.
+#extension GL_EXT_shader_atomic_int64 : require
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+
+shared ivec2 screen[128];  // Snapped, in 1/256 pixel
+shared float depth[128];   // Reversed: near_z / w
+
+int edge(ivec2 a, ivec2 b, ivec2 p) {
+    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+}
+
+// Top-left rule, y down: an edge running up (or flat and running right, in
+// this winding) owns the pixels on it; the others leave them to their
+// neighbours.
+bool owns_edge(ivec2 a, ivec2 b) {
+    const ivec2 d = b - a;
+    return d.y < 0 || (d.y == 0 && d.x > 0);
+}
+
+void main() {
+    const uint pass = push.pass;
+    const uint k = sw_args[pass].w + gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (k >= sw_pass_start[pass + 1u]) return;
+    const uint vid = sw_slot(k);
+    const uvec2 v = visible[vid];
+    const Instance inst = instances[v.x];
+    const Cluster c = clusters[v.y];
+    const uint t = gl_LocalInvocationIndex;
+
+    if (t < c.vertex_count) {
+        const vec3 p = positions[cluster_vertices[c.vertex_offset + t]];
+        const vec4 clip = frame.view_proj * vec4(to_world(inst, p), 1.0);
+        const vec2 ndc = clip.xy / clip.w;
+        const vec2 px = (ndc * 0.5 + 0.5) * vec2(frame.width, frame.height);
+        screen[t] = ivec2(round(px * 256.0));
+        depth[t] = clip.z / clip.w;
+    }
+    barrier();
+    if (t >= c.triangle_count) return;
+
+    const uint packed = cluster_triangles[c.triangle_offset + t];
+    uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
+    ivec2 a = screen[i0], b = screen[i1], d = screen[i2];
+    float za = depth[i0], zb = depth[i1], zd = depth[i2];
+    // From here on, positions are relative to the box's corner pixel.
+    const ivec2 lo_abs = max((min(a, min(b, d)) - 128 + 255) >> 8, ivec2(0));
+    const ivec2 hi = min((max(a, max(b, d)) - 128) >> 8, ivec2(frame.width, frame.height) - 1) - lo_abs;
+    if (any(lessThan(hi, ivec2(0)))) return;
+    const ivec2 origin = lo_abs * 256;
+    a -= origin;
+    b -= origin;
+    d -= origin;
+    int area = edge(a, b, d);
+    if (area == 0) return;
+    // Both sides are drawn (scans have holes): put every triangle in one
+    // winding, so the edge functions are positive inside.
+    if (area < 0) {
+        const ivec2 tmp = b; b = d; d = tmp;
+        const float tz = zb; zb = zd; zd = tz;
+        area = -area;
+    }
+
+    // Edge functions at the first pixel center, and their steps. Pixels on
+    // an edge the triangle does not own are moved just outside by a bias.
+    const ivec2 p0 = ivec2(128);
+    const int bias0 = owns_edge(b, d) ? 0 : -1;
+    const int bias1 = owns_edge(d, a) ? 0 : -1;
+    const int bias2 = owns_edge(a, b) ? 0 : -1;
+    int row0 = edge(b, d, p0) + bias0, row1 = edge(d, a, p0) + bias1, row2 = edge(a, b, p0) + bias2;
+    const int dx0 = (d.y - b.y) * -256, dy0 = (d.x - b.x) * 256;
+    const int dx1 = (a.y - d.y) * -256, dy1 = (a.x - d.x) * 256;
+    const int dx2 = (b.y - a.y) * -256, dy2 = (b.x - a.x) * 256;
+    const float inv_area = 1.0 / float(area);
+    const uint64_t id = uint64_t((vid << 7) | t);
+
+    for (int y = 0; y <= hi.y; ++y) {
+        int w0 = row0, w1 = row1, w2 = row2;
+        const uint row = uint(lo_abs.y + y) * frame.width + uint(lo_abs.x);
+        for (int x = 0; x <= hi.x; ++x) {
+            if ((w0 | w1 | w2) >= 0) {
+                // The depth is affine in screen space: weight the corners by
+                // the edge functions (without their bias).
+                const float z = (float(w0 - bias0) * za + float(w1 - bias1) * zb + float(w2 - bias2) * zd) * inv_area;
+                const uint64_t value = (uint64_t(floatBitsToUint(z)) << 32) | id;
+                if (value > vis[row + uint(x)]) atomicMax(vis[row + uint(x)], value);
+            }
+            w0 += dx0;
+            w1 += dx1;
+            w2 += dx2;
+        }
+        row0 += dy0;
+        row1 += dy1;
+        row2 += dy2;
+    }
+}

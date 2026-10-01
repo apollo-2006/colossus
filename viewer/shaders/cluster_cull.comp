@@ -86,17 +86,45 @@ void main() {
         else atomicAdd(stats.clusters_late, drawn_n);
     }
 
-    // Survivors take consecutive slots: one atomic per subgroup.
-    const uint survivors = subgroupAdd(draw ? 1u : 0u);
-    uint base = 0u;
-    if (subgroupElect() && survivors > 0u) {
-        base = atomicAdd(visible_count, survivors);
-        atomicAdd(stats.clusters_drawn, survivors);
+    // Small clusters go to the software rasterizer: their triangles are a
+    // pixel or two, which the hardware rasterizer handles poorly. Clusters
+    // reaching the near plane always go to the hardware, which clips.
+    bool software = false;
+    if (draw && (frame.flags & flag_software_raster) != 0u) {
+        const Instance inst = instances[instance_id];
+        const Cluster c = clusters[cluster_id];
+        vec3 vc = (frame.view * vec4(to_world(inst, c.center), 1.0)).xyz;
+        vc.z = -vc.z;
+        vec4 aabb;
+        if (project_sphere(vc, c.radius * inst.scale, aabb)) {
+            const vec2 size = (aabb.zw - aabb.xy) * vec2(frame.width, frame.height);
+            software = max(size.x, size.y) < frame.sw_max_pixels;
+        }
     }
-    base = subgroupBroadcastFirst(base);
-    const uint slot = base + subgroupExclusiveAdd(draw ? 1u : 0u);
-    if (draw) {
+    const bool hw = draw && !software;
+
+    // Survivors take consecutive slots: one atomic per subgroup per list.
+    const uint hw_n = subgroupAdd(hw ? 1u : 0u);
+    const uint sw_n = subgroupAdd(software ? 1u : 0u);
+    uint hw_base = 0u, sw_base = 0u;
+    if (subgroupElect()) {
+        if (hw_n > 0u) hw_base = atomicAdd(visible_count, hw_n);
+        if (sw_n > 0u) sw_base = atomicAdd(sw_count, sw_n);
+        atomicAdd(stats.clusters_drawn, hw_n + sw_n);
+        atomicAdd(stats.clusters_software, sw_n);
+    }
+    hw_base = subgroupBroadcastFirst(hw_base);
+    sw_base = subgroupBroadcastFirst(sw_base);
+    const uint hw_rank = subgroupExclusiveAdd(hw ? 1u : 0u);
+    const uint sw_rank = subgroupExclusiveAdd(software ? 1u : 0u);
+    if (hw) {
+        const uint slot = hw_base + hw_rank;
         if (slot < frame.max_visible) visible[slot] = uvec2(instance_id, cluster_id);
+        else atomicAdd(stats.visible_overflow, 1u);
+    }
+    if (software) {
+        const uint k = sw_base + sw_rank;
+        if (k < frame.max_visible) visible[sw_slot(k)] = uvec2(instance_id, cluster_id);
         else atomicAdd(stats.visible_overflow, 1u);
     }
 }

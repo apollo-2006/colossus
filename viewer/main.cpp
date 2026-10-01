@@ -9,7 +9,9 @@
 //      frustum, the normal cone and occlusion. Survivors are appended to a
 //      visible list.
 //   3. draw.mesh draws each survivor; vis.frag writes depth and triangle
-//      into a 64-bit visibility buffer with an atomic max.
+//      into a 64-bit visibility buffer with an atomic max. Clusters small
+//      on screen go to sw_raster.comp instead, a compute rasterizer that
+//      writes the same buffer the same way.
 // Steps 1 to 3 run twice: first testing occlusion against last frame's
 // depth pyramid, then, after a pyramid is built from what that drew,
 // re-testing what the first pass found hidden.
@@ -51,6 +53,9 @@ const uint32_t vis_frag_spv[] = {
 const uint32_t shade_spv[] = {
 #include "shade.comp.inc"
 };
+const uint32_t sw_raster_spv[] = {
+#include "sw_raster.comp.inc"
+};
 const uint32_t hzb_spv[] = {
 #include "hzb.comp.inc"
 };
@@ -58,8 +63,8 @@ const uint32_t hzb_spv[] = {
 constexpr uint32_t frames_in_flight = 2;
 constexpr uint32_t max_work_items = 1u << 22;
 constexpr uint32_t max_visible = 1u << 22;  // Leaves 7 bits for the triangle in a 32-bit id... and 3 to spare
-constexpr const char* mode_names[] = {"shaded", "clusters", "triangles", "LOD level", "groups", "instances", "holes"};
-constexpr uint32_t mode_count = 7;
+constexpr const char* mode_names[] = {"shaded", "clusters", "triangles", "LOD level", "groups", "instances", "holes", "rasterizer"};
+constexpr uint32_t mode_count = 8;
 
 // Laid out as viewer/shaders/common.glsl declares them (scalar layout).
 struct gpu_mesh {
@@ -94,19 +99,19 @@ struct gpu_frame {
     float prev_view[16];
     float p00, p11;
     uint32_t hzb_width, hzb_height, hzb_levels;
-    uint32_t pad2;
+    float sw_max_pixels;
 };
 struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
     uint32_t work_overflow, visible_overflow;
-    uint32_t instances_occluded, clusters_occluded, clusters_late, pad;
+    uint32_t instances_occluded, clusters_occluded, clusters_late, clusters_software;
 };
 struct gpu_push {
     uint32_t pass, level;
 };
 
 constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
-                   flag_prev_valid = 16;
+                   flag_prev_valid = 16, flag_software_raster = 32;
 constexpr uint32_t max_hzb_levels = 16;
 
 struct options {
@@ -125,6 +130,7 @@ struct options {
     bool wireframe = false;
     uint32_t disable = 0;  // Flags turned off from the command line
     bool cull_only = false;
+    float sw_pixels = 32;
 };
 
 struct camera {
@@ -264,7 +270,8 @@ public:
         for (vk::buffer* b : {&clusters_, &cluster_vertices_, &cluster_triangles_, &positions_, &normals_, &meshes_,
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_})
             ctx_.destroy(*b);
-        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_}) vkDestroyPipeline(ctx_.device, p, nullptr);
+        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_})
+            vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
         vkDestroyPipelineLayout(ctx_.device, layout_, nullptr);
         vkDestroyDescriptorPool(ctx_.device, pool_, nullptr);
@@ -492,7 +499,7 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline instance_cull_ = VK_NULL_HANDLE, args_ = VK_NULL_HANDLE, shade_ = VK_NULL_HANDLE, raster_ = VK_NULL_HANDLE,
-               hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE;
+               hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE, sw_raster_ = VK_NULL_HANDLE;
     bool cull_only_ = false;
 
     void destroy_targets() {
@@ -629,9 +636,13 @@ private:
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, raster_);
         if (!cull_only_) ctx_.draw_mesh_tasks_indirect(cmd, draw_args_.handle, 32 + 16 * pass, 1, 16);
         vkCmdEndRendering(cmd);
+        if (!cull_only_) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw_raster_);
+            vkCmdDispatchIndirect(cmd, draw_args_.handle, 64 + 16 * pass);
+        }
         vk::barrier(cmd,
                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
-                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
@@ -650,7 +661,7 @@ private:
         instances_ = ctx_.upload(sc_.instances, ssbo);
         work_ = ctx_.make_buffer(16 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         visible_ = ctx_.make_buffer(16 + uint64_t(max_visible) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
-        draw_args_ = ctx_.make_buffer(80, ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
+        draw_args_ = ctx_.make_buffer(128, ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
         late_instances_ = ctx_.make_buffer(4 * sc_.instances.size(), ssbo, false);
         late_clusters_ = ctx_.make_buffer(uint64_t(max_visible) * 8, ssbo, false);
         VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -747,6 +758,7 @@ private:
         args_ = compute_pipeline(args_spv, sizeof args_spv);
         shade_ = compute_pipeline(shade_spv, sizeof shade_spv);
         cluster_cull_ = compute_pipeline(cluster_cull_spv, sizeof cluster_cull_spv);
+        sw_raster_ = compute_pipeline(sw_raster_spv, sizeof sw_raster_spv);
         hzb_ = compute_pipeline(hzb_spv, sizeof hzb_spv);
 
         VkShaderModule mesh = ctx_.shader(draw_mesh_spv, sizeof draw_mesh_spv);
@@ -879,7 +891,8 @@ struct view_state {
     bool frozen = false;
     float threshold = 1;
     uint32_t mode = 0;
-    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion;
+    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster;
+    float sw_max_pixels = 32;
     float speed = 1.5f;
     bool looking = false;
     double last_x = 0, last_y = 0;
@@ -908,6 +921,7 @@ gpu_frame frame_data(const view_state& v, uint32_t width, uint32_t height, float
     if (v.frozen) f.flags &= ~flag_occlusion;
     f.lod_scale = float(height) / (2 * std::tan(v.cam.fov / 2));
     f.lod_threshold = v.threshold;
+    f.sw_max_pixels = v.sw_max_pixels;
     f.near_z = v.cam.near_z;
     f.debug_mode = v.mode;
     f.time = time;
@@ -924,6 +938,7 @@ void on_key(GLFWwindow* w, int key, int, int action, int) {
     if (key == GLFW_KEY_C) v->flags ^= flag_cone_culling;
     if (key == GLFW_KEY_V) v->flags ^= flag_frustum_culling;
     if (key == GLFW_KEY_O) v->flags ^= flag_occlusion;
+    if (key == GLFW_KEY_R) v->flags ^= flag_software_raster;
     if (key == GLFW_KEY_T) v->flags ^= flag_wireframe;
     if (key == GLFW_KEY_P) v->print_camera = true;
     if (key == GLFW_KEY_F) {
@@ -963,12 +978,12 @@ void move_camera(GLFWwindow* w, view_state& v, float dt) {
 
 std::string stats_line(const renderer::frame_result& r, const view_state& v, size_t instances) {
     char b[400];
-    std::snprintf(b, sizeof b, "%.2f ms (cull %.2f, raster %.2f, pass 2 %.2f, shade %.2f) | %s tris, %s clusters (%s late) | %u/%zu instances | %.3gpx | %s%s%s%s%s",
+    std::snprintf(b, sizeof b, "%.2f ms (cull %.2f, raster %.2f, pass 2 %.2f, shade %.2f) | %s tris, %s clusters (%s software, %s late) | %u/%zu instances | %.3gpx | %s%s%s%s%s%s",
                   r.ms[4], r.ms[0], r.ms[1], r.ms[2], r.ms[3], human(r.stats.triangles_drawn).c_str(),
-                  human(r.stats.clusters_drawn).c_str(), human(r.stats.clusters_late).c_str(), r.stats.instances_visible,
+                  human(r.stats.clusters_drawn).c_str(), human(r.stats.clusters_software).c_str(), human(r.stats.clusters_late).c_str(), r.stats.instances_visible,
                   instances, v.threshold,
                   mode_names[v.mode], v.frozen ? " | FROZEN" : "", (v.flags & flag_cone_culling) ? "" : " | no cone",
-                  (v.flags & flag_occlusion) ? "" : " | no occlusion",
+                  (v.flags & flag_occlusion) ? "" : " | no occlusion", (v.flags & flag_software_raster) ? "" : " | no software raster",
                   (r.stats.work_overflow || r.stats.visible_overflow) ? " | OVERFLOW" : "");
     return b;
 }
@@ -996,6 +1011,8 @@ options parse(int argc, char** argv) {
         else if (a == "--wireframe") o.wireframe = true;
         else if (a == "--no-occlusion") o.disable |= flag_occlusion;
         else if (a == "--no-cone") o.disable |= flag_cone_culling;
+        else if (a == "--no-sw") o.disable |= flag_software_raster;
+        else if (a == "--sw-pixels") o.sw_pixels = std::clamp(std::stof(next()), 0.0f, 64.0f);  // sw_raster.comp's 32-bit math holds to 64
         else if (a == "--cull-only") o.cull_only = true;
         else if (a == "--camera") {
             float x, y, z, yaw, pitch;
@@ -1025,6 +1042,7 @@ int main(int argc, char** argv) {
         v.mode = opt.mode;
         if (opt.wireframe) v.flags |= flag_wireframe;
         v.flags &= ~opt.disable;
+        v.sw_max_pixels = opt.sw_pixels;
         const float extent = std::max(1.0f, opt.grid * opt.spacing);
         v.cam.eye = {0, 0.35f + 0.25f * extent, 0.5f + 0.75f * extent};
         v.cam.pitch = opt.grid > 1 ? -0.35f : -0.1f;
@@ -1079,8 +1097,9 @@ int main(int argc, char** argv) {
             swap.create(fw, fh);
             renderer r(ctx, sc, swap.extent.width, swap.extent.height);
             std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
-                        "      1-7 view (shaded, clusters, triangles, LOD level, groups, instances, holes)\n"
-                        "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling, T wireframe, P print camera\n");
+                        "      1-8 view (shaded, clusters, triangles, LOD level, groups, instances, holes, rasterizer)\n"
+                        "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling,\n"
+                        "      R software rasterizer, T wireframe, P print camera\n");
 
             auto last = std::chrono::steady_clock::now();
             const auto start = last;

@@ -2,8 +2,8 @@
 // Writes a pass's indirect arguments, in rows of up to 65535 workgroups,
 // the most one dimension may hold. Step 0 sizes the cluster culling
 // dispatch: one workgroup per work item, and in pass 2 also one per 64
-// clusters pass 1 found hidden. Step 1 sizes the mesh shader draw: one
-// workgroup per cluster the pass found visible.
+// clusters pass 1 found hidden. Step 1 sizes the mesh shader draw and the
+// software rasterizer: one workgroup per cluster the pass found visible.
 #include "common.glsl"
 
 layout(local_size_x = 1) in;
@@ -19,11 +19,18 @@ void main() {
         uint n = items;
         if (pass == 1u) n += (min(late_cluster_count, frame.max_visible) + 63u) / 64u;
         cull_args[pass] = uvec4(rows(n), items);
-        if (pass == 0u) pass_start[0] = 0u;
+        if (pass == 0u) {
+            pass_start[0] = 0u;
+            sw_pass_start[0] = 0u;
+        }
     } else {
-        const uint end = min(visible_count, frame.max_visible);
-        pass_start[pass + 1u] = end;
-        const uint n = end - pass_start[pass];
-        draw_args[pass] = uvec4(rows(n), pass_start[pass]);
+        // The two ends of the list must not cross: past the point where
+        // they meet, clusters are dropped (and counted as an overflow).
+        const uint hw_end = min(visible_count, frame.max_visible);
+        const uint sw_end = min(sw_count, frame.max_visible - hw_end);
+        pass_start[pass + 1u] = hw_end;
+        sw_pass_start[pass + 1u] = sw_end;
+        draw_args[pass] = uvec4(rows(hw_end - pass_start[pass]), pass_start[pass]);
+        sw_args[pass] = uvec4(rows(sw_end - min(sw_pass_start[pass], sw_end)), sw_pass_start[pass]);
     }
 }
