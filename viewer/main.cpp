@@ -231,6 +231,7 @@ scene make_scene(const options& opt) {
         leaf_triangles.push_back(g.leaf_triangles());
         float shadow_error = 0;
         const std::vector<uint32_t> shadow = shadow_cut(g, shadow_error);
+        std::printf("  shadow copy: %zu triangles, error %.3g\n", shadow.size() / 3, shadow_error);
         s.shadow_meshes.push_back({static_cast<uint32_t>(s.all.positions.size() / 3), static_cast<uint32_t>(g.positions.size() / 3),
                                    static_cast<uint32_t>(s.shadow_indices.size()), static_cast<uint32_t>(shadow.size())});
         s.shadow_indices.insert(s.shadow_indices.end(), shadow.begin(), shadow.end());
@@ -787,8 +788,8 @@ private:
 
     // What shadow rays are traced against: per model, a bottom level over
     // the finest cut of its hierarchy within the shadow budget (see
-    // shadow_cut()), and a top level over every instance. Two-sided, as
-    // scans are drawn.
+    // shadow_cut()), and a top level over every instance. Shadow rays skip
+    // back faces: see sunlight() in shade.comp.
     void build_shadow_scene() {
         const auto start = std::chrono::steady_clock::now();
         shadow_indices_ = ctx_.upload(sc_.shadow_indices, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
@@ -814,7 +815,7 @@ private:
             std::memcpy(ai.transform.matrix, sc_.instances[k].rows, sizeof ai.transform.matrix);
             ai.instanceCustomIndex = static_cast<uint32_t>(k);
             ai.mask = 0xFF;
-            ai.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            ai.flags = 0;
             ai.accelerationStructureReference = blas_[sc_.instances[k].mesh].address;
         }
         as_instances_ = ctx_.upload(instances, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);

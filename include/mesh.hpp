@@ -23,7 +23,8 @@ mesh load_mesh(const std::string& path);
 void weld(mesh& m);
 
 // Moves and scales the mesh to stand on y = 0, centered on the y axis, with
-// its largest side 1 long. up_z first turns a z-up scan to y-up.
+// its largest side 1 long. up_z first turns a z-up scan to y-up. Triangles
+// are rewound, if need be, to run counterclockwise seen from outside.
 void normalize_placement(mesh& m, bool up_z);
 
 // Area-weighted vertex normals.

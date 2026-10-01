@@ -304,6 +304,16 @@ void normalize_placement(mesh& m, bool up_z) {
     if (m.positions.empty()) return;
     if (up_z)
         for (vec3& p : m.positions) p = {p.x, p.z, -p.y};
+    // Wind triangles counterclockwise seen from outside: the viewer's
+    // shadow rays skip back faces, which needs to know which side is out.
+    // The signed volume says, even for a scan with holes.
+    double volume = 0;
+    for (size_t t = 0; t < m.triangle_count(); ++t) {
+        const vec3 a = m.positions[m.indices[3 * t]], b = m.positions[m.indices[3 * t + 1]], c = m.positions[m.indices[3 * t + 2]];
+        volume += dot(a, cross(b, c));
+    }
+    if (volume < 0)
+        for (size_t t = 0; t < m.triangle_count(); ++t) std::swap(m.indices[3 * t + 1], m.indices[3 * t + 2]);
     vec3 lo = m.positions[0], hi = lo;
     for (const vec3& p : m.positions) { lo = min(lo, p); hi = max(hi, p); }
     const vec3 size = hi - lo;

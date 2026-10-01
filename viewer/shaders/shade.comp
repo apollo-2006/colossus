@@ -49,12 +49,15 @@ vec2 to_pixel(vec3 world) {
 
 // 1 where the sun reaches p, 0 where something is in the way. The ray
 // starts `bias` above the surface: the shadow geometry is a coarser copy
-// and can stand that far above the surface drawn.
+// and can stand that far above the surface drawn. Back faces are skipped,
+// so where the drawn surface dips inside the copy, the ray leaves through
+// the copy's back and is not stopped (the builder winds every model
+// counterclockwise from outside).
 float sunlight(vec3 p, vec3 n, float bias) {
 #ifdef RAY_QUERY
     if ((frame.flags & flag_shadows) == 0u) return 1.0;
     rayQueryEXT q;
-    rayQueryInitializeEXT(q, shadow_scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFFu,
+    rayQueryInitializeEXT(q, shadow_scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsCullBackFacingTrianglesEXT, 0xFFu,
                           p + n * bias, 0.0, sun_dir, 1e4);
     while (rayQueryProceedEXT(q)) {
     }
