@@ -76,15 +76,45 @@ std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& pos
         std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return code[a] < code[b]; });
     }
 
+    // Each triangle's neighbours across its three edges.
+    std::vector<uint32_t> neighbour(3 * n, UINT32_MAX);
+    for (size_t i = 0; i < n; ++i)
+        for (int e = 0; e < 3; ++e) {
+            const uint32_t a = corner[3 * i + e], b = corner[3 * i + (e + 1) % 3];
+            for (uint32_t k = adj_start[a]; k < adj_start[a + 1]; ++k) {
+                const uint32_t u = adj[k];
+                if (u == i) continue;
+                const uint32_t* cu = &corner[3 * u];
+                if (cu[0] == b || cu[1] == b || cu[2] == b) {
+                    neighbour[3 * i + e] = u;
+                    break;
+                }
+            }
+        }
+
     std::vector<char> used(n, 0);
+    // Unused triangles across a triangle's edges. A triangle with none left
+    // is an island if this cluster does not take it, so the fewer it has,
+    // the sooner it is taken: clusters fill their notches, and the next
+    // cluster starts in the corner the last one left.
+    auto open_sides = [&](uint32_t t) {
+        uint32_t k = 0;
+        for (int e = 0; e < 3; ++e) k += neighbour[3 * t + e] != UINT32_MAX && !used[neighbour[3 * t + e]];
+        return k;
+    };
     std::vector<uint32_t> in_cluster(nv, UINT32_MAX);  // Cluster number a vertex was last added to
     std::vector<uint32_t> candidate_stamp(n, UINT32_MAX);
     std::vector<uint32_t> candidates;
     size_t seed_cursor = 0;
     uint32_t cluster_id = 0;
+    uint32_t next_seed = UINT32_MAX;
 
     for (size_t done = 0; done < n; ++cluster_id) {
-        while (used[order[seed_cursor]]) ++seed_cursor;
+        uint32_t seed = next_seed;
+        if (seed == UINT32_MAX || used[seed]) {
+            while (used[order[seed_cursor]]) ++seed_cursor;
+            seed = order[seed_cursor];
+        }
         std::vector<uint32_t> members;
         uint32_t vertex_count = 0;
         vec3 sum(0, 0, 0);
@@ -110,7 +140,7 @@ std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& pos
                 }
             }
         };
-        add(order[seed_cursor]);
+        add(seed);
 
         while (members.size() < cluster_max_triangles) {
             const vec3 center = sum * (1.0f / members.size());
@@ -126,7 +156,8 @@ std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& pos
                 uint32_t fresh = 0;
                 for (int c = 0; c < 3; ++c) fresh += in_cluster[corner[3 * t + c]] != cluster_id;
                 if (vertex_count + fresh <= cluster_max_vertices) {
-                    const float score = static_cast<float>(fresh) + 2 * length(centroid[t] - center) / expected_radius;
+                    const float score = static_cast<float>(fresh) + 2 * length(centroid[t] - center) / expected_radius +
+                                        0.75f * static_cast<float>(open_sides(t));
                     if (score < best_score) { best_score = score; best = k; }
                 }
                 ++k;
@@ -137,9 +168,20 @@ std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& pos
             candidates.pop_back();
             add(t);
         }
-        for (uint32_t& t : members) t = tris[t];
+        // The next cluster starts on this one's frontier, at its most
+        // hemmed-in triangle.
+        next_seed = UINT32_MAX;
+        uint32_t fewest = UINT32_MAX;
+        for (uint32_t t : candidates)
+            if (!used[t] && open_sides(t) < fewest) {
+                fewest = open_sides(t);
+                next_seed = t;
+            }
         out.push_back(std::move(members));
     }
+
+    for (auto& c : out)
+        for (uint32_t& t : c) t = tris[t];
     return out;
 }
 
