@@ -92,22 +92,32 @@ triangles reach the screen.
    (`--pool-mb`, 1 GB by default) as the GPU asks for it. A cluster that is drawn but
    would rather be its finer clusters, whose page is missing, requests that page,
    with its error on screen as the priority. Two frames later `viewer/streamer.hpp`
-   reads the requests, loads the most wanted pages, and evicts the least recently
-   used ones when the pool is full.
+   reads the requests and issues loads for the most wanted pages, evicting the least
+   recently used ones when the pool is full. Loader threads read the pages; the render
+   thread only issues loads and publishes the ones that have finished.
 
    What keeps a streamed cut whole: a cluster is drawn either when it is the right
    level, or when the finer clusters it stands for are not resident. That only works
    if those stand-ins are always there, so a page may only be resident while the
-   pages of the coarser clusters its group was simplified into are. Loads go coarsest
-   first, and a page is evicted only when no resident page depends on it. Then along
-   every path from leaf to root, exactly one cluster is drawn, whatever has been
-   loaded.
+   pages of the coarser clusters its group was simplified into are. Loads are issued
+   coarsest first and published in the order they were issued, however the reads
+   finish; a page counts as a dependent from the moment its load is issued, and is
+   evicted only when nothing resident or loading depends on it. Then along every path
+   from leaf to root, exactly one cluster is drawn, whatever has been loaded.
 
-   The 900 instance view at the top settles in 14 frames with 321 pages, 4 MB, of
-   the 1011 MB on disk resident, since every instance draws from the same pages; after
+   Pages are compact: a vertex is two words, its position snapped to a grid over the
+   model and stored as 14-bit offsets from its cluster's corner, its normal
+   octahedral at 11 + 11 bits. A vertex shared by clusters snaps to the same grid
+   point in each, so quantizing opens no cracks; Lucy's grid step is 3.3e-5 of her
+   height. Her pages are 509 MB.
+
+   The 900 instance view at the top settles in 21 frames with 321 pages, 2 MB, of
+   the 640 MB on disk resident, since every instance draws from the same pages; after
    that it draws the same 856k triangles as with everything resident. A 300 frame
-   flight through the crowd with a 16 MB pool evicts 3,219 pages and shows no holes at
-   any frame checked.
+   flight through the crowd with a 16 MB pool turns over thousands of pages and shows
+   no holes at any frame checked. From a cold file cache, the render thread's worst
+   frame in the streamer is 0.25 ms with loader threads, against 11.5 ms reading pages
+   itself (`--sync-loads`).
 
 ![Lucy, each cluster in its own color](docs/clusters.png)
 
@@ -138,7 +148,7 @@ no ray queries:
 * No shadows, no occlusion culling and no streaming yet.
 
 The models are trimmed to 400k triangles at their finest (`colossus_build --max-triangles`,
-which keeps the hierarchy above that cut intact), 10.5 MB each gzipped. Every page is
+which keeps the hierarchy above that cut intact), 7.5 MB each gzipped. Every page is
 loaded up front, so the page table is just each page's place in the file. 900 instances
 take 0.47 ms of GPU time at 1600x813 in Chrome on the RX 9070 XT. `web/build.sh` builds the
 models, and `node tests/web_screenshot.mjs` renders the page in a headless Chrome.
@@ -186,10 +196,12 @@ locks removed from the builder, the crack check reports 39,095 cracked edges on 
 closed sphere alone.
 
 `tests/streamer_test.cpp` runs the streamer for 3,000 frames of random requests into a
-pool a tenth the size of a model, checking after each that every resident page's
-dependencies are resident. It caught one way to break that (making room for a page
-could evict a page it was about to depend on), fixed before the streamer was
-committed. CI runs both and builds the viewer on every push.
+pool a tenth the size of a model, synchronously and with loader threads, checking
+after each frame that every resident page's dependencies are resident. It caught one
+way to break that (making room for a page could evict a page it was about to depend
+on), fixed before the streamer was committed. The builder's tests also check that
+every vertex shared by clusters decodes bit for bit the same from each. CI runs both
+and builds the viewer on every push.
 
 ## Performance
 
@@ -216,12 +228,10 @@ a frame from 1.37 ms to 0.47 ms; the commit messages have each step's numbers.
   triangles between neighbours, or a real graph partitioner, would fill them.
 * The simplifier's error is a mean over the quadric's planes, not a maximum, so it can
   understate the worst spot, and the 1 pixel bound is not strict.
-* Pages are read on the render thread, up to `--upload-mb` (64 MB) a frame; a
-  loader thread would keep a slow disk from showing in frame times. Pages store
-  positions as full floats, and shared vertices once per cluster; quantizing would
-  roughly halve them.
-* A refinement takes a round trip of two frames per level, so flying into a statue
-  from far away sharpens over a dozen or so frames.
+* Shared vertices are stored once per cluster, and triangles take a word each where
+  a byte stream would do; pages could be about half their size again.
+* A refinement takes a round trip of a few frames per level, so flying into a statue
+  from far away sharpens over twenty frames or so.
 * Normals are interpolated per vertex, with no materials or textures.
 
 ## Models
