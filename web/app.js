@@ -161,7 +161,7 @@ async function main() {
       $('shadow-pages').textContent = `${s.shadowPages} drawn this frame (${human(s.shadowClusters)} clusters)`;
       $('size').textContent = `${w} x ${h}`;
       const st = renderer.streamer.stats;
-      $('pages').textContent = `${st.resident} pages, ${(st.bytes / 1e6).toFixed(0)} MB fetched${st.inFlight ? ' (streaming)' : ''}`;
+      $('pages').textContent = `${st.resident} pages, ${(st.bytes / 1e6).toFixed(0)} MB fetched in ${st.reads} requests${st.inFlight ? ' (streaming)' : ''}`;
       shown = now;
       frames = 0;
       cpuMs = 0;

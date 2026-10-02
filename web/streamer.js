@@ -6,10 +6,11 @@
 //   * pages below a request prefetch while their error, halving a level, stays over
 //     the threshold.
 const NONE = 0xffffffff;
+const MAX_GAP = 64 << 10, MAX_RUN = 4 << 20;  // merging range requests: as viewer/streamer.hpp
 
 export class Streamer {
   // pages: [{url, offset, size, deps: [global page], children: [global page], pinned}]
-  constructor(pages, poolBytes, { maxInFlight = 48, uploadBytes = 16 << 20 } = {}) {
+  constructor(pages, poolBytes, { maxInFlight = 256, uploadBytes = 16 << 20 } = {}) {
     this.pages = pages;
     let largest = 16;
     for (const p of pages) largest = Math.max(largest, p.size);
@@ -28,7 +29,8 @@ export class Streamer {
     this.maxInFlight = maxInFlight;
     this.uploadBytes = uploadBytes;
     this.frame = 0;
-    this.stats = { resident: 0, loaded: 0, inFlight: 0, bytes: 0 };
+    this.stats = { resident: 0, loaded: 0, inFlight: 0, bytes: 0, reads: 0 };
+    this.batch = [];  // issued this frame, not yet fetched
     this.wholeFiles = new Map();  // url -> Promise<ArrayBuffer>, for servers ignoring ranges
   }
 
@@ -81,6 +83,7 @@ export class Streamer {
       for (const p of chain) if (this.issued.length >= this.maxInFlight || !this.issue(p)) break;
       if (this.issued.length >= this.maxInFlight) break;
     }
+    this.flush();
     this.stats.inFlight = this.issued.length;
     this.stats.resident = this.slotCount - this.free.length - this.issued.length;
     return uploads;
@@ -119,6 +122,62 @@ export class Streamer {
     return NONE;
   }
 
+  // this frame's issued pages, sorted by place in the file and merged into range requests:
+  // the file is laid out depth first, so a request and the pages prefetched below it are mostly
+  // neighbours. gaps up to MAX_GAP are fetched and dropped.
+  flush() {
+    const pages = this.pages;
+    this.batch.sort((a, b) => {
+      const x = pages[a.page], y = pages[b.page];
+      return x.url < y.url ? -1 : x.url > y.url ? 1 : x.offset - y.offset;
+    });
+    const runs = [];
+    for (const job of this.batch) {
+      const pg = pages[job.page];
+      const r = runs[runs.length - 1];
+      if (r && r.url === pg.url && pg.offset >= r.end && pg.offset - r.end <= MAX_GAP && pg.offset + pg.size - r.start <= MAX_RUN) {
+        r.end = pg.offset + pg.size;
+        r.jobs.push(job);
+      } else {
+        runs.push({ url: pg.url, start: pg.offset, end: pg.offset + pg.size, jobs: [job] });
+      }
+    }
+    this.batch = [];
+    this.stats.reads += runs.length;
+    for (const r of runs) {
+      this.fetchRange(r.url, r.start, r.end).then(
+        (data) => {
+          for (const job of r.jobs) {
+            const pg = pages[job.page];
+            job.data = data.slice(pg.offset - r.start, pg.offset - r.start + pg.size);
+          }
+        },
+        (e) => console.error(`pages ${r.jobs.map((j) => j.page).join(', ')}:`, e),
+      );
+    }
+  }
+
+  async fetchRange(url, start, end) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const whole = this.wholeFiles.get(url);
+        if (whole) return (await whole).slice(start, end);
+        const r = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` } });
+        if (r.status === 206) return r.arrayBuffer();
+        // a server ignoring ranges sends the whole file: keep it and take every page from it.
+        if (r.ok) {
+          const file = r.arrayBuffer();
+          this.wholeFiles.set(url, file);
+          return (await file).slice(start, end);
+        }
+        throw new Error(`HTTP ${r.status}`);
+      } catch (e) {
+        if (attempt >= 3) throw e;
+        await new Promise((res) => setTimeout(res, 200 * (attempt + 1)));
+      }
+    }
+  }
+
   issue(p) {
     const s = this.takeSlot();
     if (s === NONE) return false;
@@ -129,28 +188,7 @@ export class Streamer {
     for (const d of pg.deps) this.dependents[d]++;
     const job = { page: p, data: null };
     this.issued.push(job);
-    const read = async () => {
-      for (let attempt = 0; ; attempt++) {
-        try {
-          const whole = this.wholeFiles.get(pg.url);
-          if (whole) return (await whole).slice(pg.offset, pg.offset + pg.size);
-          const r = await fetch(pg.url, { headers: { Range: `bytes=${pg.offset}-${pg.offset + pg.size - 1}` } });
-          if (r.status === 206) return r.arrayBuffer();
-          // a server ignoring ranges sends the whole file: keep it and take every page
-          // from it.
-          if (r.ok) {
-            const file = r.arrayBuffer();
-            this.wholeFiles.set(pg.url, file);
-            return (await file).slice(pg.offset, pg.offset + pg.size);
-          }
-          throw new Error(`HTTP ${r.status}`);
-        } catch (e) {
-          if (attempt >= 3) throw e;
-          await new Promise((res) => setTimeout(res, 200 * (attempt + 1)));
-        }
-      }
-    };
-    read().then((data) => (job.data = data), (e) => console.error(`page ${p}:`, e));
+    this.batch.push(job);  // fetched by flush()
     return true;
   }
 }

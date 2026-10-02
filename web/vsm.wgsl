@@ -396,9 +396,13 @@ fn vsm_cluster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
 
 // --- rasterizing, as vsm_raster.comp: level texels snapped to 1/16, edges from
 // each triangle's corner, top-left rule, both sides, atomic max per texel in
-// its page.
+// its page. the walk is clipped to the level's rendered pages and skips pages
+// not rendering; a triangle over 32x32 texels after clipping is drawn by the
+// whole workgroup, a texel an invocation.
 var<workgroup> snapped: array<vec2i, 128>;
 var<workgroup> depth: array<f32, 128>;
+var<workgroup> together: array<u32, 128>;  // triangles for the whole workgroup
+var<workgroup> together_count: atomic<u32>;
 
 fn edge(a: vec2i, b: vec2i, p: vec2i) -> i32 {
   return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
@@ -407,6 +411,152 @@ fn edge(a: vec2i, b: vec2i, p: vec2i) -> i32 {
 fn owns_edge(a: vec2i, b: vec2i) -> bool {
   let d = b - a;
   return d.y < 0 || (d.y == 0 && d.x > 0);
+}
+
+// corners relative to lo_abs * 16, wound positive; the clipped box of texels, [start, hi] from lo_abs.
+struct Tri {
+  a: vec2i, b: vec2i, d: vec2i,
+  za: f32, zb: f32, zd: f32,
+  lo_abs: vec2i, start: vec2i, hi: vec2i,
+  area: i32, bias0: i32, bias1: i32, bias2: i32,
+  ok: bool,
+}
+
+fn setup(packed: u32, level: u32, layer: u32) -> Tri {
+  var tri: Tri;
+  tri.ok = false;
+  let i0 = packed & 255u;
+  let i1 = (packed >> 8u) & 255u;
+  let i2 = (packed >> 16u) & 255u;
+  tri.a = snapped[i0];
+  tri.b = snapped[i1];
+  tri.d = snapped[i2];
+  tri.za = depth[i0];
+  tri.zb = depth[i1];
+  tri.zd = depth[i2];
+  tri.lo_abs = (min(tri.a, min(tri.b, tri.d)) - 8 + 15) >> vec2u(4u);
+  let hi_abs = (max(tri.a, max(tri.b, tri.d)) - 8) >> vec2u(4u);
+  if (any(tri.lo_abs > hi_abs) || any(hi_abs - tri.lo_abs > vec2i(1023))) { return tri; }
+  let origin = tri.lo_abs * 16;
+  tri.a -= origin;
+  tri.b -= origin;
+  tri.d -= origin;
+  tri.area = edge(tri.a, tri.b, tri.d);
+  if (tri.area == 0) { return tri; }
+  if (tri.area < 0) {
+    let tb = tri.b; tri.b = tri.d; tri.d = tb;
+    let tz = tri.zb; tri.zb = tri.zd; tri.zd = tz;
+    tri.area = -tri.area;
+  }
+  let rect = rendered_rect(layer, level);
+  let page = i32(VSM_PAGE);
+  tri.start = max(tri.lo_abs, rect.xy * page) - tri.lo_abs;
+  tri.hi = min(hi_abs, rect.zw * page + page - 1) - tri.lo_abs;
+  if (any(tri.start > tri.hi)) { return tri; }
+  tri.bias0 = select(-1, 0, owns_edge(tri.b, tri.d));
+  tri.bias1 = select(-1, 0, owns_edge(tri.d, tri.a));
+  tri.bias2 = select(-1, 0, owns_edge(tri.a, tri.b));
+  tri.ok = true;
+  return tri;
+}
+
+// the page's physical page if it renders, else VSM_NONE.
+fn rendering(level: u32, layer: u32, page: vec2i) -> u32 {
+  if (!vsm_in_window(level, page)) { return VSM_NONE; }
+  let slot = vsm_slot(level, page);
+  if (!renders(layer, slot)) { return VSM_NONE; }
+  return atomicLoad(&entries[4u * slot + 1u]);
+}
+
+fn store(phys: u32, layer: u32, at: vec2i, z: f32) {
+  let index = vsm_atlas_index(phys, vec2u(at & vec2i(i32(VSM_PAGE) - 1)), layer);
+  let value = vsm_sortable(z);
+  if (value > atomicLoad(&atlas[index])) { atomicMax(&atlas[index], value); }
+}
+
+fn mark_moving(level: u32, layer: u32, page: vec2i) {
+  if (layer == VSM_MOVING) { atomicOr(&entries[4u * vsm_slot(level, page) + 3u], VSM_HAS_MOVING); }
+}
+
+fn depth_at(tri: Tri, w0: i32, w1: i32, w2: i32) -> f32 {
+  return (f32(w0 - tri.bias0) * tri.za + f32(w1 - tri.bias1) * tri.zb + f32(w2 - tri.bias2) * tri.zd) / f32(tri.area);
+}
+
+// one invocation: rows, a page's span at a time.
+fn walk(tri: Tri, level: u32, layer: u32) {
+  let p0 = tri.start * 16 + 8;
+  var row0 = edge(tri.b, tri.d, p0) + tri.bias0;
+  var row1 = edge(tri.d, tri.a, p0) + tri.bias1;
+  var row2 = edge(tri.a, tri.b, p0) + tri.bias2;
+  let dx0 = (tri.d.y - tri.b.y) * -16;
+  let dy0 = (tri.d.x - tri.b.x) * 16;
+  let dx1 = (tri.a.y - tri.d.y) * -16;
+  let dy1 = (tri.a.x - tri.d.x) * 16;
+  let dx2 = (tri.b.y - tri.a.y) * -16;
+  let dy2 = (tri.b.x - tri.a.x) * 16;
+  let page_size = i32(VSM_PAGE);
+  for (var y = tri.start.y; y <= tri.hi.y; y++) {
+    var w0 = row0;
+    var w1 = row1;
+    var w2 = row2;
+    var x = tri.start.x;
+    while (x <= tri.hi.x) {
+      let at0 = tri.lo_abs + vec2i(x, y);
+      let page = at0 >> vec2u(7u);
+      let span = min(tri.hi.x - x + 1, page_size - (at0.x & (page_size - 1)));
+      let phys = rendering(level, layer, page);
+      if (phys == VSM_NONE) {
+        w0 += dx0 * span;
+        w1 += dx1 * span;
+        w2 += dx2 * span;
+        x += span;
+        continue;
+      }
+      var drew = false;
+      let e = x + span;
+      for (; x < e; x++) {
+        if ((w0 | w1 | w2) >= 0) {
+          store(phys, layer, tri.lo_abs + vec2i(x, y), depth_at(tri, w0, w1, w2));
+          drew = true;
+        }
+        w0 += dx0;
+        w1 += dx1;
+        w2 += dx2;
+      }
+      if (drew) { mark_moving(level, layer, page); }
+    }
+    row0 += dy0;
+    row1 += dy1;
+    row2 += dy2;
+  }
+}
+
+// the whole workgroup: a page at a time, a texel an invocation.
+fn walk_together(tri: Tri, level: u32, layer: u32, t: u32) {
+  let page_size = i32(VSM_PAGE);
+  let page_lo = (tri.lo_abs + tri.start) >> vec2u(7u);
+  let page_hi = (tri.lo_abs + tri.hi) >> vec2u(7u);
+  for (var py = page_lo.y; py <= page_hi.y; py++) {
+    for (var px = page_lo.x; px <= page_hi.x; px++) {
+      let phys = rendering(level, layer, vec2i(px, py));
+      if (phys == VSM_NONE) { continue; }
+      let lo = max(vec2i(px, py) * page_size - tri.lo_abs, tri.start);
+      let hi = min(vec2i(px, py) * page_size + page_size - 1 - tri.lo_abs, tri.hi);
+      let size = hi - lo + 1;
+      var drew = false;
+      for (var i = t; i < u32(size.x * size.y); i += 128u) {
+        let q = lo + vec2i(i32(i) % size.x, i32(i) / size.x);
+        let p = q * 16 + 8;
+        let w0 = edge(tri.b, tri.d, p) + tri.bias0;
+        let w1 = edge(tri.d, tri.a, p) + tri.bias1;
+        let w2 = edge(tri.a, tri.b, p) + tri.bias2;
+        if ((w0 | w1 | w2) < 0) { continue; }
+        store(phys, layer, tri.lo_abs + q, depth_at(tri, w0, w1, w2));
+        drew = true;
+      }
+      if (drew) { mark_moving(level, layer, vec2i(px, py)); }
+    }
+  }
 }
 
 @compute @workgroup_size(128)
@@ -424,95 +574,27 @@ fn vsm_raster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
   let inst = load_instance(tagged & 0xffffffu);
   let c = clusters[cluster];
   let texel = vsm_texel(level);
+  if (t == 0u) { atomicStore(&together_count, 0u); }
   if (valid && t < c.vertex_count) {
     let p = vsm_light_space(to_world(inst, cluster_position(c, meshes[inst.mesh].grid, t)));
     snapped[t] = vec2i(round(p.xy / texel * 16.0));
     depth[t] = p.z;
   }
   workgroupBarrier();
-  if (!valid || t >= c.triangle_count) { return; }
-  let packed = cluster_triangle(c, t);
-  let i0 = packed & 255u;
-  let i1 = (packed >> 8u) & 255u;
-  let i2 = (packed >> 16u) & 255u;
-  var a = snapped[i0];
-  var b = snapped[i1];
-  var d = snapped[i2];
-  let za = depth[i0];
-  var zb = depth[i1];
-  var zd = depth[i2];
-  let lo_abs = (min(a, min(b, d)) - 8 + 15) >> vec2u(4u);
-  let hi_abs = (max(a, max(b, d)) - 8) >> vec2u(4u);
-  if (any(lo_abs > hi_abs) || any(hi_abs - lo_abs > vec2i(1023))) { return; }
-  let page_lo = lo_abs >> vec2u(7u);
-  let page_hi = hi_abs >> vec2u(7u);
-  var any_page = false;
-  for (var py = page_lo.y; py <= page_hi.y; py++) {
-    for (var px = page_lo.x; px <= page_hi.x; px++) {
-      if (vsm_in_window(level, vec2i(px, py)) && renders(layer, vsm_slot(level, vec2i(px, py)))) { any_page = true; }
-    }
-  }
-  if (!any_page) { return; }
-  let origin = lo_abs * 16;
-  a -= origin;
-  b -= origin;
-  d -= origin;
-  var area = edge(a, b, d);
-  if (area == 0) { return; }
-  if (area < 0) {
-    let tb = b; b = d; d = tb;
-    let tz = zb; zb = zd; zd = tz;
-    area = -area;
-  }
-  let p0 = vec2i(8);
-  let bias0 = select(-1, 0, owns_edge(b, d));
-  let bias1 = select(-1, 0, owns_edge(d, a));
-  let bias2 = select(-1, 0, owns_edge(a, b));
-  var row0 = edge(b, d, p0) + bias0;
-  var row1 = edge(d, a, p0) + bias1;
-  var row2 = edge(a, b, p0) + bias2;
-  let dx0 = (d.y - b.y) * -16;
-  let dy0 = (d.x - b.x) * 16;
-  let dx1 = (a.y - d.y) * -16;
-  let dy1 = (a.x - d.x) * 16;
-  let dx2 = (b.y - a.y) * -16;
-  let dy2 = (b.x - a.x) * 16;
-  let inv_area = 1.0 / f32(area);
-  let hi = hi_abs - lo_abs;
-  for (var y = 0; y <= hi.y; y++) {
-    var w0 = row0;
-    var w1 = row1;
-    var w2 = row2;
-    var phys = VSM_NONE;
-    var page_x = 0x7fffffff;
-    for (var x = 0; x <= hi.x; x++) {
-      if ((w0 | w1 | w2) >= 0) {
-        let at = lo_abs + vec2i(x, y);
-        let page = at >> vec2u(7u);
-        if (page.x != page_x) {
-          page_x = page.x;
-          phys = VSM_NONE;
-          if (vsm_in_window(level, page)) {
-            let slot = vsm_slot(level, page);
-            if (renders(layer, slot)) {
-              phys = atomicLoad(&entries[4u * slot + 1u]);
-              if (layer == VSM_MOVING) { atomicOr(&entries[4u * slot + 3u], VSM_HAS_MOVING); }
-            }
-          }
-        }
-        if (phys != VSM_NONE) {
-          let z = (f32(w0 - bias0) * za + f32(w1 - bias1) * zb + f32(w2 - bias2) * zd) * inv_area;
-          let index = vsm_atlas_index(phys, vec2u(at & vec2i(i32(VSM_PAGE) - 1)), layer);
-          let value = vsm_sortable(z);
-          if (value > atomicLoad(&atlas[index])) { atomicMax(&atlas[index], value); }
-        }
+  if (valid && t < c.triangle_count) {
+    let tri = setup(cluster_triangle(c, t), level, layer);
+    if (tri.ok) {
+      let size = tri.hi - tri.start + 1;
+      if (size.x * size.y > 1024) {
+        together[atomicAdd(&together_count, 1u)] = t;
+      } else {
+        walk(tri, level, layer);
       }
-      w0 += dx0;
-      w1 += dx1;
-      w2 += dx2;
     }
-    row0 += dy0;
-    row1 += dy1;
-    row2 += dy2;
+  }
+  workgroupBarrier();
+  let count = atomicLoad(&together_count);
+  for (var j = 0u; j < count; j++) {
+    walk_together(setup(cluster_triangle(c, together[j]), level, layer), level, layer, t);
   }
 }
