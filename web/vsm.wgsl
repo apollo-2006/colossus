@@ -338,12 +338,12 @@ fn vsm_expand(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
   for (var c = lane; c < count; c += 64u) { emit(base + c, tagged, first + 64u * c); }
 }
 
-fn request(c: Cluster, priority: f32) {
-  let stamp = arrayLength(&stamps) / 2u + c.creator;
+fn request(page: u32, priority: f32) {
+  let stamp = arrayLength(&stamps) / 2u + page;
   if (atomicExchange(&stamps[stamp], frame.frame_index) == frame.frame_index) { return; }
   let k = atomicAdd(&request_words[0], 1u);
   if (k < frame.max_requests) {
-    atomicStore(&request_words[4u + 2u * k], c.creator);
+    atomicStore(&request_words[4u + 2u * k], page);
     atomicStore(&request_words[4u + 2u * k + 1u], bitcast<u32>(priority));
   }
 }
@@ -384,9 +384,14 @@ fn vsm_cluster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
       }
     }
   }
-  if (!loaded) { return; }
+  // its stand-ins ask for its page, unless none touches a page it does (spheres
+  // are loose): then it would mark the page unfinished every frame. so it asks too.
+  if (!loaded) {
+    request(c.group, c.parent_error * inst.scale / texel);
+    return;
+  }
   atomicStore(&stamps[c.group], frame.frame_index);
-  if (wants_finer) { request(c, self_error); }
+  if (wants_finer) { request(c.creator, self_error); }
   let k = atomicAdd(&vwork[2], 1u);
   if (k < VSM_MAX_VISIBLE) {
     atomicStore(&vwork[VW_VISIBLE + 2u * k], tagged);

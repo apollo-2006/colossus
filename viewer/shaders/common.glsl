@@ -442,12 +442,15 @@ bool lod_test(Instance inst, Cluster c, out bool wants_finer, out float self_err
     return page_table[c.group] != NO_PAGE && coarse_enough && (self_error <= frame.lod_threshold || !finer_resident);
 }
 
-// asks for the finer clusters' page, once a frame.
-void request_finer(Cluster c, float priority) {
-    if (atomicExchange(request_stamp[c.creator], frame.frame_index) == frame.frame_index) return;
+// asks for a page, once a frame.
+void request_page(uint page, float priority) {
+    if (atomicExchange(request_stamp[page], frame.frame_index) == frame.frame_index) return;
     const uint k = atomicAdd(request_count, 1u);
-    if (k < frame.max_requests) requests[k] = uvec2(c.creator, floatBitsToUint(priority));
+    if (k < frame.max_requests) requests[k] = uvec2(page, floatBitsToUint(priority));
 }
+
+// asks for the finer clusters' page.
+void request_finer(Cluster c, float priority) { request_page(c.creator, priority); }
 
 const vec3 sun_dir = normalize(vec3(0.75, 0.5, 0.3));  // toward the sun
 const vec3 sun_color = vec3(1.0, 0.92, 0.82) * 1.7;

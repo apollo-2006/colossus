@@ -41,7 +41,12 @@ void main() {
             for (int x = lo.x; x <= hi.x; ++x)
                 if (vsm_in_window(level, ivec2(x, y))) atomicOr(vsm_entries[vsm_slot(level, ivec2(x, y))].flags, vsm_provisional);
     }
-    if (!loaded) return;
+    // its stand-ins ask for its page, unless none touches a page it does (spheres are loose):
+    // then it would mark the page unfinished every frame. so it asks too.
+    if (!loaded) {
+        request_page(c.group, c.parent_error * inst.scale / texel);
+        return;
+    }
     page_used[c.group] = frame.frame_index;
     if (wants_finer) request_finer(c, self_error);
     const uint k = atomicAdd(vsm_visible_count, 1u);
