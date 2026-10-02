@@ -101,6 +101,12 @@ export class Renderer {
         { binding: 13, visibility: C, texture: { sampleType: 'unfilterable-float' } },  // ambient occlusion
       ],
     });
+    // cell and instance culling's third group: the pyramid, and cells in place of the image
+    // group's buffers (16 storage buffers a stage).
+    this.cullLayout = d.createBindGroupLayout({
+      entries: [{ binding: 5, visibility: C, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 14, visibility: C, buffer: { type: 'read-only-storage' } }, rw(15)],
+    });
     this.hzbLayout = d.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
@@ -120,7 +126,10 @@ export class Renderer {
     });
     const constants = { VSM_SIDE: this.vsmSide };
     const compute = (entryPoint, layout) => d.createComputePipeline({ layout, compute: { module: this.computeModule, entryPoint, constants } });
-    this.instanceCull = compute('instance_cull', layout3);
+    const cullLayout = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.cullLayout] });
+    this.cellCull = compute('cell_cull', cullLayout);
+    this.argsCells = compute('args_cells', layout4);
+    this.instanceCull = compute('instance_cull', cullLayout);
     this.argsBig = compute('args_big', layout4);
     this.expand = compute('expand', layout3);
     this.argsCull = compute('args_cull', layout4);
@@ -202,7 +211,7 @@ export class Renderer {
     this.vsmWork = d.createBuffer({ size: 4 * VSM_WORK_WORDS, usage: S | CD | CS });
     this.vsmArgs = d.createBuffer({ size: 80, usage: S | GPUBufferUsage.INDIRECT });
     this.vsmArgsGroup = d.createBindGroup({ layout: this.vsmArgsLayout, entries: [{ binding: 0, resource: { buffer: this.vsmArgs } }] });
-    this.counters = d.createBuffer({ size: 96, usage: S | CD | CS });
+    this.counters = d.createBuffer({ size: 112, usage: S | CD | CS });
     // an entry per pass, then per pyramid level: (pass, level).
     this.passInfo = d.createBuffer({ size: PASS_STRIDE * (2 + MAX_HZB_LEVELS), usage: GPUBufferUsage.UNIFORM | CD });
     for (let k = 0; k < 2 + MAX_HZB_LEVELS; k++)
@@ -213,8 +222,9 @@ export class Renderer {
     this.hwVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
     this.swVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
     // [0, 8) culling per pass, [8, 16) hardware draws, [16, 24) software dispatches, [24,
-    // 28) pass 2 instance culling, [28, 36) expand per pass.
-    this.args = d.createBuffer({ size: 144, usage: S | GPUBufferUsage.INDIRECT });
+    // 28) pass 2 instance culling, [28, 36) expand per pass, [36, 40) pass 1 instance
+    // culling, [40, 44) pass 2 cell culling.
+    this.args = d.createBuffer({ size: 176, usage: S | GPUBufferUsage.INDIRECT });
     this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 96, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
     this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
     this.frameIndex = 0;
@@ -279,9 +289,46 @@ export class Renderer {
     this.width = this.height = 0;
   }
 
-  // placements: {model, matrix (3x4 rows), scale, material, anim}.
+  // placements: {model, matrix (3x4 rows), scale, material, anim, cell}. instances of a cell
+  // (at most 64) are consecutive; without cells, every 64 make one.
   setPlacements(placements) {
     const d = this.device;
+    // each cell's sphere holds its instances' spheres, a moving one's whole path (turns about
+    // its origin, drifts 0.2: animate() in common.wgsl).
+    const cells = [];
+    for (let i = 0; i < placements.length;) {
+      let j = i + 1;
+      while (j < placements.length && j - i < 64 && (placements[j].cell ?? Math.floor(j / 64)) === (placements[i].cell ?? Math.floor(i / 64))) j++;
+      const spheres = [];
+      for (let k = i; k < j; k++) {
+        const p = placements[k], b = this.models[p.model].bounds, m = p.matrix;
+        const origin = [m[3], m[7], m[11]];
+        let c = [0, 1, 2].map((r) => m[4 * r] * b[0] + m[4 * r + 1] * b[1] + m[4 * r + 2] * b[2] + origin[r]);
+        let radius = b[3] * p.scale;
+        if (p.anim) {
+          radius += Math.hypot(c[0] - origin[0], c[1] - origin[1], c[2] - origin[2]) + 0.2;
+          c = origin;
+        }
+        spheres.push([c, radius]);
+      }
+      const lo = [0, 1, 2].map((a) => Math.min(...spheres.map((s) => s[0][a])));
+      const hi = [0, 1, 2].map((a) => Math.max(...spheres.map((s) => s[0][a])));
+      const center = [0, 1, 2].map((a) => (lo[a] + hi[a]) / 2);
+      const radius = Math.max(...spheres.map(([c, r]) => Math.hypot(c[0] - center[0], c[1] - center[1], c[2] - center[2]) + r));
+      cells.push({ center, radius, first: i, count: j - i });
+      i = j;
+    }
+    const cellData = new ArrayBuffer(Math.max(1, cells.length) * 32);
+    cells.forEach((c, k) => {
+      new Float32Array(cellData, k * 32, 4).set([...c.center, c.radius]);
+      new Uint32Array(cellData, k * 32 + 16, 2).set([c.first, c.count]);
+    });
+    this.cellCount = cells.length;
+    this.cellBuffer?.destroy();
+    this.cellBuffer = d.createBuffer({ size: cellData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(this.cellBuffer, 0, cellData);
+    this.cellLists?.destroy();
+    this.cellLists = d.createBuffer({ size: 3 * Math.max(1, cells.length) * 4, usage: GPUBufferUsage.STORAGE });
     const instances = new ArrayBuffer(Math.max(1, placements.length) * 64);
     this.fullDetail = 0;
     placements.forEach((p, i) => {
@@ -391,6 +438,11 @@ export class Renderer {
         { binding: 13, resource: this.aoImage.createView() }],
     });
     this.argsGroup = d.createBindGroup({ layout: this.argsLayout, entries: [{ binding: 0, resource: { buffer: this.args } }] });
+    this.cullGroup = d.createBindGroup({
+      layout: this.cullLayout,
+      entries: [{ binding: 5, resource: this.hzb.createView() }, { binding: 14, resource: { buffer: this.cellBuffer } },
+        { binding: 15, resource: { buffer: this.cellLists } }],
+    });
     this.rasterGroup = d.createBindGroup({
       layout: this.rasterLayout,
       entries: [{ binding: 0, resource: { buffer: this.hwVisible } }, { binding: 2, resource: { buffer: this.passInfo, size: 16 } },
@@ -483,15 +535,23 @@ export class Renderer {
       const cp = enc.beginComputePass(timestamps);
       cp.setBindGroup(0, scene);
       cp.setBindGroup(1, this.workGroup, [p * PASS_STRIDE]);
-      cp.setBindGroup(2, this.imageGroup);
       cp.setBindGroup(3, this.argsGroup);
-      cp.setPipeline(this.instanceCull);
+      // cells, then their instances (sized by args_cells).
+      cp.setBindGroup(2, this.cullGroup);
+      cp.setPipeline(this.cellCull);
       if (p === 0) {
-        const groups = Math.ceil(this.instanceCount / 64);
+        const groups = Math.ceil(this.cellCount / 64);
         cp.dispatchWorkgroups(Math.min(groups, 65535), Math.ceil(groups / 65535));
       } else {
-        cp.dispatchWorkgroupsIndirect(this.args, 96);
+        cp.dispatchWorkgroupsIndirect(this.args, 160);
       }
+      cp.setBindGroup(2, this.imageGroup);
+      cp.setPipeline(this.argsCells);
+      cp.dispatchWorkgroups(1);
+      cp.setBindGroup(2, this.cullGroup);
+      cp.setPipeline(this.instanceCull);
+      cp.dispatchWorkgroupsIndirect(this.args, p === 0 ? 144 : 96);
+      cp.setBindGroup(2, this.imageGroup);
       cp.setPipeline(this.argsBig);
       cp.dispatchWorkgroups(1);
       cp.setPipeline(this.expand);

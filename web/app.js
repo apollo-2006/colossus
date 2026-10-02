@@ -42,7 +42,16 @@ export function crowd(n, models, spacing = 1.25) {
       const anim = n > 1 && middle && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
       out.push({ model: (z * n + x) % models, scale, material, anim, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
     }
-  return out;
+  // in cells of 8 x 8 neighbours, each cell's instances consecutive (the renderer culls cells
+  // first); drawn above in row order so the crowd is the same.
+  const tiled = [];
+  for (let tz = 0; tz < n; tz += 8)
+    for (let tx = 0; tx < n; tx += 8) {
+      const cell = (tz / 8) * Math.ceil(n / 8) + tx / 8;
+      for (let z = tz; z < Math.min(n, tz + 8); z++)
+        for (let x = tx; x < Math.min(n, tx + 8); x++) tiled.push({ ...out[z * n + x], cell });
+    }
+  return tiled;
 }
 
 export const camera = {

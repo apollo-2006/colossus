@@ -25,6 +25,8 @@ struct Counters {
   // items [6, 8). written by the args passes, read by the rasterizers.
   pass_start: array<u32, 8>,
   big: array<atomic<u32>, 2>,  // per pass: instances for expand
+  visible_cells: array<atomic<u32>, 2>,  // per pass (cell_cull)
+  late_cells: atomic<u32>,               // hidden in pass 1, for pass 2
 }
 
 // pass (0 or 1), and the pyramid builder's level: a uniform bound at an offset
@@ -192,18 +194,67 @@ fn request_finer(c: Cluster, priority: f32) {
 
 // indirect arguments: [0, 8) cluster culling per pass, [8, 16) hardware draws,
 // [16, 24) software dispatches, [24, 28) pass 2 instance culling, [28, 36)
-// expand per pass. bound only for the passes writing them: a dispatch may not
-// read its arguments from a buffer bound for writing.
+// expand per pass, [36, 40) pass 1 instance culling, [40, 44) pass 2 cell
+// culling. bound only for the passes writing them: a dispatch may not read its
+// arguments from a buffer bound for writing.
+
+// cells of up to 64 neighbouring instances, culled before their instances are
+// read (as cell_cull.comp). bound only for cell and instance culling, in place
+// of the image group, so 16 storage buffers still suffice.
+struct Cell {
+  center: vec3f,
+  radius: f32,
+  first: u32,
+  count: u32,
+  pad0: u32,
+  pad1: u32,
+}
+@group(2) @binding(14) var<storage, read> cells: array<Cell>;
+// cells pass 1 hid [0, n), then the visible cells of each pass from n and 2n
+// (n cells).
+@group(2) @binding(15) var<storage, read_write> cell_list: array<u32>;
 @group(3) @binding(0) var<storage, read_write> args: array<u32>;
 
 
-// an invocation per instance (as instance_cull.comp): the workgroup writes its
-// instances' work items after a prefix sum of their counts. instances over
-// BIG_PIECES (near ones, neighbours in the list) go to expand, a workgroup
-// each.
+// an invocation per cell: pass 1 tests frustum and last frame's depth and lists
+// hidden cells; pass 2 tests those against pass 1's depth. visible cells go to
+// instance_cull.
+@compute @workgroup_size(64)
+fn cell_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) lane: u32) {
+  let pass_index = pass_info.pass_index;
+  let total = arrayLength(&cells);
+  let n = select(atomicLoad(&counters.late_cells), total, pass_index == 0u);
+  let k = (wid.y * 65535u + wid.x) * 64u + lane;
+  if (k >= n) { return; }
+  let c = select(cell_list[k], k, pass_index == 0u);
+  let cell = cells[c];
+  if (pass_index == 0u && (frame.flags & FLAG_FRUSTUM) != 0u && !sphere_in_frustum(cell.center, cell.radius)) { return; }
+  // the sphere holds moving instances wherever they go, last frame included.
+  if (occluded(cell.center, cell.radius)) {
+    if (pass_index == 0u) { cell_list[atomicAdd(&counters.late_cells, 1u)] = c; }
+    return;
+  }
+  cell_list[total * (1u + pass_index) + atomicAdd(&counters.visible_cells[pass_index], 1u)] = c;
+}
+
+// instance culling's dispatch: a workgroup per visible cell, and in pass 2 first
+// one per 64 instances pass 1 hid. pass 1 also sizes pass 2's cell culling.
+@compute @workgroup_size(1)
+fn args_cells() {
+  let pass_index = pass_info.pass_index;
+  var groups = atomicLoad(&counters.visible_cells[pass_index]);
+  if (pass_index == 1u) { groups += (atomicLoad(&counters.late_instances) + 63u) / 64u; }
+  rows(groups, select(36u, 24u, pass_index == 1u));
+  if (pass_index == 0u) { rows((atomicLoad(&counters.late_cells) + 63u) / 64u, 40u); }
+}
+
+// a workgroup per visible cell, an invocation per instance (as
+// instance_cull.comp): the workgroup writes its instances' work items after a
+// prefix sum of their counts. instances over BIG_PIECES (near ones, neighbours
+// in the list) go to expand, a workgroup each.
 //
-// pass 1 runs every instance against last frame's depth and lists what it
-// hides; pass 2 runs only that list (sized by args_big) against pass 1's depth.
+// pass 1 tests against last frame's depth and lists what it hides; pass 2 runs
+// that list, then the cells pass 2 found visible again, against pass 1's depth.
 const BIG_PIECES = 16u;
 
 var<workgroup> wg_ends: array<u32, 64>;
@@ -220,18 +271,32 @@ fn big_slot(pass_index: u32, k: u32) -> u32 {
 @compute @workgroup_size(64)
 fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) lane: u32) {
   let pass_index = pass_info.pass_index;
-  let count = select(atomicLoad(&counters.late_instances), frame.instance_count, pass_index == 0u);
-  let slot = (wid.y * 65535u + wid.x) * 64u + lane;
-  var chunks = 0u;
+  let group = wid.y * 65535u + wid.x;
+  // which instance: a visible cell's, or in pass 2 first those pass 1 hid (inside the
+  // frustum already).
+  let late_count = atomicLoad(&counters.late_instances);
+  let late_groups = select(0u, (late_count + 63u) / 64u, pass_index == 1u);
+  var valid = false;
+  var hidden_before = false;
   var i = 0u;
+  if (group < late_groups) {
+    let slot = group * 64u + lane;
+    valid = slot < late_count;
+    if (valid) { i = late[frame.max_visible + slot].x; }
+    hidden_before = true;
+  } else {
+    let cell = cells[cell_list[arrayLength(&cells) * (1u + pass_index) + group - late_groups]];
+    valid = lane < cell.count;
+    i = cell.first + lane;
+  }
+  var chunks = 0u;
   var first = 0u;
-  if (slot < count) {
-    i = select(late[frame.max_visible + slot].x, slot, pass_index == 0u);
+  if (valid) {
     let inst = load_instance(i);
     let m = meshes[inst.mesh];
     let center = to_world(inst, m.bounds.xyz);
     let radius = m.bounds.w * inst.scale;
-    var keep = pass_index != 0u || (frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, radius);
+    var keep = hidden_before || (frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, radius);
     // pass 1: was it hidden last frame, where it was last frame.
     var then = center;
     if (pass_index == 0u && inst.anim != 0u) { then = to_world(load_prev_instance(i), m.bounds.xyz); }
@@ -331,13 +396,11 @@ fn rows(n: u32, at: u32) {
   args[at + 2u] = 1u;
 }
 
-// after instance culling: the expand dispatch, and after pass 1 the pass 2
-// instance dispatch over what it hid.
+// after instance culling: the expand dispatch.
 @compute @workgroup_size(1)
 fn args_big() {
   let pass_index = pass_info.pass_index;
   rows(atomicLoad(&counters.big[pass_index]), 28u + pass_index * 4u);
-  if (pass_index == 0u) { rows((atomicLoad(&counters.late_instances) + 63u) / 64u, 24u); }
 }
 
 // cluster culling dispatch: a workgroup per work item, plus in pass 2 one per
