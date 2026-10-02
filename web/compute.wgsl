@@ -91,8 +91,10 @@ fn occluded(center: vec3f, radius: f32) -> bool {
   var aabb: vec4f;
   if (!project_sphere(c, radius, &aabb)) { return false; }
   let screen = vec2f(f32(frame.width), f32(frame.height));
-  let lo = clamp(aabb.xy, vec2f(0.0), vec2f(1.0)) * screen;
-  let hi = clamp(aabb.zw, vec2f(0.0), vec2f(1.0)) * screen - 0.5;
+  // A pixel's margin: frames are drawn with a sub-pixel offset (taa below),
+  // which the projection above leaves out.
+  let lo = max(clamp(aabb.xy, vec2f(0.0), vec2f(1.0)) * screen - 1.0, vec2f(0.0));
+  let hi = min(clamp(aabb.zw, vec2f(0.0), vec2f(1.0)) * screen + 0.5, screen - 0.5);
   // The finest level at which the rectangle spans at most 2 x 2 texels.
   var level = 0u;
   var t0: vec2i;
@@ -723,4 +725,96 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     color = mix(color, sky(dir), 1.0 - exp(-t * 0.012));
   }
   textureStore(out_image, px, vec4f(srgb(aces(color)), 1.0));
+}
+
+// Temporal antialiasing, as in the viewer's taa.comp: every frame is drawn
+// with the projection nudged by a different sub-pixel offset, and each
+// pixel is blended with last frame's image (10% new), found by projecting
+// the surface under the pixel with last frame's camera. Last frame's color
+// is held to the range of this frame's 3 x 3 neighbourhood so that what
+// was hidden before cannot bleed in. The history is kept at 16 bits, as
+// 10% steps in 8 bits would stall short of the true value.
+@group(2) @binding(8) var shaded: texture_2d<f32>;
+@group(2) @binding(9) var history: texture_2d<f32>;
+@group(2) @binding(10) var history_sampler: sampler;
+@group(2) @binding(11) var history_out: texture_storage_2d<rgba16float, write>;
+@group(2) @binding(12) var display: texture_storage_2d<rgba8unorm, write>;
+
+fn to_ycocg(c: vec3f) -> vec3f {
+  return vec3f(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+fn from_ycocg(c: vec3f) -> vec3f {
+  return vec3f(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+// Last frame's image through a Catmull-Rom filter in five bilinear taps,
+// so a moving camera does not blur the history further every frame.
+fn history_at(uv: vec2f) -> vec3f {
+  let size = vec2f(f32(frame.width), f32(frame.height));
+  let p = uv * size;
+  let center = floor(p - 0.5) + 0.5;
+  let f = p - center;
+  let f2 = f * f;
+  let f3 = f2 * f;
+  let w0 = -0.5 * f3 + f2 - 0.5 * f;
+  let w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+  let w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+  let w3 = 0.5 * f3 - 0.5 * f2;
+  let w12 = w1 + w2;
+  let t0 = (center - 1.0) / size;
+  let t3 = (center + 2.0) / size;
+  let t12 = (center + w2 / w12) / size;
+  var c = textureSampleLevel(history, history_sampler, vec2f(t12.x, t0.y), 0.0).rgb * (w12.x * w0.y);
+  c += textureSampleLevel(history, history_sampler, vec2f(t0.x, t12.y), 0.0).rgb * (w0.x * w12.y);
+  c += textureSampleLevel(history, history_sampler, t12, 0.0).rgb * (w12.x * w12.y);
+  c += textureSampleLevel(history, history_sampler, vec2f(t3.x, t12.y), 0.0).rgb * (w3.x * w12.y);
+  c += textureSampleLevel(history, history_sampler, vec2f(t12.x, t3.y), 0.0).rgb * (w12.x * w3.y);
+  let w = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+  return max(c / w, vec3f(0.0));
+}
+
+@compute @workgroup_size(8, 8)
+fn taa(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= frame.width || gid.y >= frame.height) { return; }
+  let px = vec2i(gid.xy);
+  let c = textureLoad(shaded, px, 0).rgb;
+  var out = c;
+  if (frame.taa_valid != 0u && frame.debug_mode == 0u) {
+    var lo = to_ycocg(c);
+    var hi = lo;
+    for (var y = -1; y <= 1; y++) {
+      for (var x = -1; x <= 1; x++) {
+        let q = clamp(px + vec2i(x, y), vec2i(0), vec2i(i32(frame.width), i32(frame.height)) - 1);
+        let n = to_ycocg(textureLoad(shaded, q, 0).rgb);
+        lo = min(lo, n);
+        hi = max(hi, n);
+      }
+    }
+    let ndc = vec2f((f32(gid.x) + 0.5) / f32(frame.width) * 2.0 - 1.0, 1.0 - (f32(gid.y) + 0.5) / f32(frame.height) * 2.0);
+    let near_point = frame.inv_view_proj * vec4f(ndc, 1.0, 1.0);
+    let origin = frame.origin.xyz;
+    let dir = normalize(near_point.xyz / near_point.w - origin);
+    let z = max(textureLoad(hw_depth, px, 0), bitcast<f32>(atomicLoad(&sw_buf[gid.x + gid.y * frame.width])));
+    var prev: vec4f;
+    if (z > 0.0) {
+      let center = frame.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
+      let forward = normalize(center.xyz / center.w - origin);
+      prev = frame.prev_view_proj * vec4f(origin + dir * (frame.near_z / z / dot(dir, forward)), 1.0);
+    } else if (dir.y < 0.0) {
+      prev = frame.prev_view_proj * vec4f(origin + dir * (-origin.y / dir.y), 1.0);
+    } else {
+      prev = frame.prev_view_proj * vec4f(dir, 0.0);  // The sky: a direction, at infinity
+    }
+    // The surface was found along the nudged ray; taking the nudge back
+    // out means a still camera reads its history at the pixel's center.
+    let p = prev.xy / prev.w + frame.jitter;
+    let uv = vec2f(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    if (prev.w > 0.0 && all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0))) {
+      let h = from_ycocg(clamp(to_ycocg(history_at(uv)), lo, hi));
+      out = mix(h, c, 0.1);
+    }
+  }
+  textureStore(history_out, px, vec4f(out, 1.0));
+  textureStore(display, px, vec4f(out, 1.0));
 }

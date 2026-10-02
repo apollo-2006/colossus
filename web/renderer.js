@@ -9,7 +9,7 @@ import { Streamer } from './streamer.js';
 const MAX_WORK = 1 << 20;
 const MAX_VISIBLE = 1 << 20;
 const MAX_REQUESTS = 1 << 13;
-const FRAME_BYTES = 528;
+const FRAME_BYTES = 608;
 const PASS_STRIDE = 256;  // Dynamic uniform offsets must be multiples of this
 const MAX_HZB_LEVELS = 16;
 const STORAGE_BUFFERS_NEEDED = 14;
@@ -18,6 +18,7 @@ const SHADOW_HALF = 8;  // The shadow map covers 16 x 16 units in front of the c
 const SUN_DIR = [0.75, 0.5, 0.3].map((x) => x / Math.hypot(0.75, 0.5, 0.3));
 
 export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOW_PASS = 8, FLAG_SHADOWS = 16, FLAG_OCCLUSION = 32;
+export const FLAG_TAA = 128;  // Read on the CPU only
 const FLAG_PREV_VALID = 64;
 
 async function source(name) {
@@ -115,6 +116,18 @@ export class Renderer {
     this.swId = compute('sw_id_pass', layout3);
     this.shade = compute('shade', layout3);
     const hzbLayout = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.hzbLayout] });
+    this.taaLayout = d.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
+        { binding: 8, visibility: C, texture: { sampleType: 'float' } },
+        { binding: 9, visibility: C, texture: { sampleType: 'float' } },
+        { binding: 10, visibility: C, sampler: { type: 'filtering' } },
+        { binding: 11, visibility: C, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+        { binding: 12, visibility: C, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+      ],
+    });
+    this.taa = compute('taa', d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.taaLayout] }));
+    this.historySampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     this.hzbFirst = compute('hzb_first', hzbLayout);
     this.hzbDown = compute('hzb_down', hzbLayout);
 
@@ -257,13 +270,24 @@ export class Renderer {
     const d = this.device;
     this.width = width;
     this.height = height;
-    for (const x of [this.swBuffer, this.depthTexture, this.idTexture, this.image]) x?.destroy();
+    for (const x of [this.swBuffer, this.depthTexture, this.idTexture, this.image, this.shaded, ...(this.history ?? [])]) x?.destroy();
     // The software rasterizer's depth, then its triangle ids.
     this.swBuffer = d.createBuffer({ size: width * height * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const T = GPUTextureUsage;
     this.depthTexture = d.createTexture({ size: [width, height], format: 'depth32float', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
     this.idTexture = d.createTexture({ size: [width, height], format: 'r32uint', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
     this.image = d.createTexture({ size: [width, height], format: 'rgba8unorm', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING | T.COPY_SRC });
+    // Shading writes here; the antialiasing pass blends it into the history
+    // and writes the result to image, for the canvas.
+    this.shaded = d.createTexture({ size: [width, height], format: 'rgba8unorm', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING });
+    this.history = [0, 1].map(() => d.createTexture({ size: [width, height], format: 'rgba16float', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING }));
+    this.taaGroups = [0, 1].map((k) => d.createBindGroup({
+      layout: this.taaLayout,
+      entries: [{ binding: 0, resource: this.depthTexture.createView() }, { binding: 8, resource: this.shaded.createView() },
+        { binding: 9, resource: this.history[1 - k].createView() }, { binding: 10, resource: this.historySampler },
+        { binding: 11, resource: this.history[k].createView() }, { binding: 12, resource: this.image.createView() }],
+    }));
+    this.historyValid = false;
     this.workGroup = d.createBindGroup({
       layout: this.workLayout,
       entries: [
@@ -291,7 +315,7 @@ export class Renderer {
     this.imageGroup = d.createBindGroup({
       layout: this.imageLayout,
       entries: [{ binding: 0, resource: this.depthTexture.createView() }, { binding: 1, resource: this.idTexture.createView() },
-        { binding: 2, resource: this.image.createView() }, { binding: 3, resource: this.shadowMap.createView() },
+        { binding: 2, resource: this.shaded.createView() }, { binding: 3, resource: this.shadowMap.createView() },
         { binding: 4, resource: this.shadowSampler }, { binding: 5, resource: this.hzb.createView() }],
     });
     this.argsGroup = d.createBindGroup({ layout: this.argsLayout, entries: [{ binding: 0, resource: { buffer: this.args } }] });
@@ -310,7 +334,21 @@ export class Renderer {
     const { width, height } = this;
     const aspect = width / height;
     const proj = perspectiveReverseZ(camera.fov, aspect, camera.near);
-    const viewProj = mul(proj, lookTo(camera.eye, camera.forward, [0, 1, 0]));
+    const unjittered = mul(proj, lookTo(camera.eye, camera.forward, [0, 1, 0]));
+    // Temporal antialiasing: nudge the projection by a sub-pixel offset,
+    // the Halton (2, 3) sequence over eight frames; clip.xy += offset * w.
+    const taa = (settings.flags & FLAG_TAA) !== 0 && settings.mode === 0;
+    const viewProj = new Float32Array(unjittered);
+    let jitter = [0, 0];
+    if (taa) {
+      const halton = (i, base) => { let f = 1, r = 0; for (; i > 0; i = Math.floor(i / base)) { f /= base; r += f * (i % base); } return r; };
+      const k = (this.frameIndex % 8) + 1;
+      jitter = [(halton(k, 2) - 0.5) * 2 / width, (halton(k, 3) - 0.5) * 2 / height];
+      for (let c = 0; c < 4; c++) {
+        viewProj[c * 4] += jitter[0] * viewProj[c * 4 + 3];
+        viewProj[c * 4 + 1] += jitter[1] * viewProj[c * 4 + 3];
+      }
+    }
     const cullViewProj = mul(perspectiveReverseZ(cull.fov, aspect, cull.near), lookTo(cull.eye, cull.forward, [0, 1, 0]));
     // The sun's camera: orthographic, over a square of the ground in front
     // of the camera, looking down the sun's direction.
@@ -350,6 +388,11 @@ export class Renderer {
     ff[129] = proj[5];
     fu[130] = this.hzbLevels;
     this.prevView = view;
+    ff.set(this.historyValid && this.prevViewProj ? this.prevViewProj : unjittered, 132);
+    ff[148] = jitter[0]; ff[149] = jitter[1];
+    fu[150] = taa && this.historyValid ? 1 : 0;
+    this.prevViewProj = unjittered;
+    this.historyValid = taa;
     ff.set(viewProj, 0);
     ff.set(invert(viewProj), 16);
     frustumPlanes(cullViewProj).forEach((p, k) => ff.set(p, 32 + 4 * k));
@@ -460,6 +503,9 @@ export class Renderer {
     pass.setBindGroup(1, this.workGroup, [0]);
     pass.setBindGroup(2, this.imageGroup);
     pass.setPipeline(this.shade);
+    pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+    pass.setBindGroup(2, this.taaGroups[this.frameIndex & 1]);
+    pass.setPipeline(this.taa);
     pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
     pass.end();
 

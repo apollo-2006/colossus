@@ -40,6 +40,13 @@ struct Frame {
   p11: f32,
   hzb_levels: u32,
   pad4: u32,
+  // Temporal antialiasing: last frame's camera without its sub-pixel
+  // offset, this frame's offset (clip space), and whether last frame's
+  // image fits this one.
+  prev_view_proj: mat4x4f,
+  jitter: vec2f,
+  taa_valid: u32,
+  pad5: u32,
 }
 
 // include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
