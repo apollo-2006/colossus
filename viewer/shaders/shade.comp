@@ -1,25 +1,34 @@
 #version 460
-// Shades every pixel from the visibility buffer: the triangle it holds is
-// fetched again, the camera ray through the pixel center intersected with
-// it for exact barycentrics, and the vertex normals interpolated. Pixels
-// with nothing drawn get the ground or the sky. Debug modes color by
-// cluster, triangle, LOD level, group or instance instead.
+// Shades every pixel from the visibility buffer (see surface.glsl for how
+// the surface under a pixel is found). Pixels with nothing drawn get the
+// ground or the sky. Debug modes color by cluster, triangle, LOD level,
+// group, instance or rasterizer instead.
 //
-// Built twice: with RAY_QUERY defined, sunlight is tested with a shadow ray
-// against acceleration structures over a coarser cut of each model (see
-// build_shadow_scene() in main.cpp).
+// Built twice: with RAY_QUERY defined, sunlight is tested against
+// acceleration structures over a coarser cut of each model (see
+// build_shadow_scene() in main.cpp). shadow.comp traces those rays at half
+// resolution; each pixel borrows the answer where its neighbours agree and
+// traces its own ray where they do not (see sunlight()).
 #include "common.glsl"
+#include "surface.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D out_image;
 
-#ifdef RAY_QUERY
-#extension GL_EXT_ray_query : require
-layout(set = 0, binding = 18) uniform accelerationStructureEXT shadow_scene;
-#endif
-
-const vec3 sun_dir = normalize(vec3(0.75, 0.5, 0.3));
-const vec3 sun_color = vec3(1.0, 0.92, 0.82) * 1.7;
+// Instances carry one of these (Instance::material): albedo, roughness,
+// metalness.
+struct Material {
+    vec3 albedo;
+    float roughness;
+    float metallic;
+};
+const Material materials[6] = Material[](
+    Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0),   // Plaster: the plain look
+    Material(vec3(0.66, 0.64, 0.6), 0.3, 0.0),    // Polished marble
+    Material(vec3(0.62, 0.5, 0.38), 0.85, 0.0),   // Sandstone
+    Material(vec3(0.58, 0.38, 0.22), 0.35, 1.0),  // Bronze
+    Material(vec3(0.95, 0.74, 0.36), 0.28, 1.0),  // Gold
+    Material(vec3(0.2, 0.2, 0.22), 0.45, 0.0));   // Dark granite
 
 vec3 sky(vec3 dir) {
     const float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
@@ -48,24 +57,53 @@ vec2 to_pixel(vec3 world) {
     return (clip.xy / clip.w * 0.5 + 0.5) * vec2(frame.width, frame.height);
 }
 
-// 1 where the sun reaches p, 0 where something is in the way. The ray
-// starts `bias` above the surface: the shadow geometry is a coarser copy
-// and can stand that far above the surface drawn. Back faces are skipped,
-// so where the drawn surface dips inside the copy, the ray leaves through
-// the copy's back and is not stopped (the builder winds every model
-// counterclockwise from outside).
-float sunlight(vec3 p, vec3 n, float bias) {
+// Sunlight at a pixel's surface. Borrowed from the half resolution
+// shadows when every neighbour whose surface is at this pixel's distance
+// agrees; traced here along shadow edges, where they do not, and wherever
+// no neighbour is at this distance (silhouettes). So shadow edges keep
+// full resolution, and only they cost a ray.
+float sunlight(uvec2 px, Surface s) {
 #ifdef RAY_QUERY
     if ((frame.flags & flag_shadows) == 0u) return 1.0;
-    rayQueryEXT q;
-    rayQueryInitializeEXT(q, shadow_scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsCullBackFacingTrianglesEXT, 0xFFu,
-                          p + n * bias, 0.0, sun_dir, 1e4);
-    while (rayQueryProceedEXT(q)) {
+    if ((frame.flags & flag_full_res_shadows) != 0u) return trace_surface(s);
+    const uvec2 size = shadow_size();
+    const uvec2 base = px / 2u;
+    float lo = 2.0, hi = -1.0;
+    for (uint k = 0u; k < 4u; ++k) {
+        const uvec2 q = min(base + uvec2(k & 1u, k >> 1), size - 1u);
+        const vec2 m = shadow_mask[q.x + q.y * size.x];
+        if (m.y > 0.0 && abs(m.y - s.t) < 0.01 * s.t) {
+            lo = min(lo, m.x);
+            hi = max(hi, m.x);
+        }
     }
-    return rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+    return hi >= 0.0 && lo == hi ? lo : trace_surface(s);
 #else
     return 1.0;
 #endif
+}
+
+// Sunlight off a surface: Lambert, plus GGX specular with Schlick's
+// Fresnel and a Smith shadowing term.
+vec3 shade_material(Material m, vec3 n, vec3 v, float lit) {
+    const vec3 f0 = mix(vec3(0.04), m.albedo, m.metallic);
+    const float nl = max(dot(n, sun_dir), 0.0), nv = max(dot(n, v), 1e-4);
+    const vec3 h = normalize(sun_dir + v);
+    const float nh = max(dot(n, h), 0.0), vh = max(dot(v, h), 0.0);
+    const float a = m.roughness * m.roughness, a2 = a * a;
+    const float d = a2 / (3.14159 * pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
+    const float k = (m.roughness + 1.0) * (m.roughness + 1.0) / 8.0;
+    const float g = nl / (nl * (1.0 - k) + k) * nv / (nv * (1.0 - k) + k);
+    const vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+    // Scaled by pi, as the diffuse term leaves out its 1 / pi.
+    const vec3 specular = 3.14159 * d * g * fresnel / max(4.0 * nl * nv, 1e-4);
+    const vec3 diffuse = m.albedo * (1.0 - m.metallic) * (1.0 - fresnel);
+    const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42;
+    // Sky seen in the reflection, fading with roughness.
+    const vec3 env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
+    const vec3 env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8;
+    return (diffuse + specular) * sun_color * nl * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
+           m.albedo * m.metallic * ambient * 0.5;
 }
 
 float edge_distance(vec2 p, vec2 a, vec2 b) {
@@ -76,95 +114,44 @@ float edge_distance(vec2 p, vec2 a, vec2 b) {
 void main() {
     const uvec2 px = gl_GlobalInvocationID.xy;
     if (px.x >= frame.width || px.y >= frame.height) return;
-    const vec2 ndc = (vec2(px) + 0.5) / vec2(frame.width, frame.height) * 2.0 - 1.0;
-    const vec4 near_point = frame.inv_view_proj * vec4(ndc, 1.0, 1.0);
-    const vec3 origin = frame.origin.xyz;
-    const vec3 dir = normalize(near_point.xyz / near_point.w - origin);
-
-    const uint64_t v = vis[px.x + px.y * frame.width];
-    vec3 color;
-    if (v == 0ul && frame.debug_mode == 6u) {
+    const Surface s = surface_at(px);
+    vec3 color = sky(s.dir);
+    if (s.kind != surface_object && frame.debug_mode == 6u) {
         color = vec3(1.0, 0.0, 1.0);  // Holes: anything not drawn
-    } else if (v == 0ul) {
-        color = sky(dir);
-        if (dir.y < 0.0) {
-            // The ground: a plane at y = 0 with a faint grid, fading into
-            // the sky with distance.
-            const float t = -origin.y / dir.y;
-            const vec3 hit = origin + dir * t;
-            const vec2 cell = abs(fract(hit.xz * 0.5) - 0.5);
-            const float line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
-            const float lit = t < 200.0 ? sunlight(hit, vec3(0, 1, 0), 1e-3 + t * 1e-5) : 1.0;
-            const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) *
-                                (sun_color * max(sun_dir.y, 0.0) * 0.6 * lit + sky(vec3(0, 1, 0)) * 0.45);
-            color = mix(ground, color, 1.0 - exp(-t * 0.012));
-        }
-    } else {
-        const uint id = uint(v & 0xffffffffu);
-        const uint vid = id >> 7, tri = id & 127u;
-        const uvec2 vc = visible[vid];
-        const Instance inst = instances[vc.x];
-        const Cluster c = clusters[vc.y];
-        const uint base = page_table[c.group];
-        const uint packed = cluster_triangle(base, c, tri);
-        const uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
-        const vec4 grid = meshes[inst.mesh].grid;
-        const vec3 p0 = to_world(inst, cluster_position(base, c, grid, i0)), p1 = to_world(inst, cluster_position(base, c, grid, i1)),
-                   p2 = to_world(inst, cluster_position(base, c, grid, i2));
+    } else if (s.kind == surface_ground) {
+        // The ground: a plane at y = 0 with a faint grid, fading into the
+        // sky with distance.
+        const vec2 cell = abs(fract(s.hit.xz * 0.5) - 0.5);
+        const float line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
+        const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) *
+                            (sun_color * max(sun_dir.y, 0.0) * 0.6 * sunlight(px, s) + sky(vec3(0, 1, 0)) * 0.45);
+        color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
+    } else if (s.kind == surface_object) {
+        const Instance inst = instances[s.vc.x];
+        const Cluster c = clusters[s.vc.y];
+        const uint vid = s.id >> 7;
+        Material m = materials[min(inst.material, 5u)];
+        if (frame.debug_mode != 0u) m = Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0);
+        if (frame.debug_mode == 1u) m.albedo = hash_color(s.vc.y * 7919u + s.vc.x * 104729u);
+        else if (frame.debug_mode == 2u) m.albedo = hash_color(s.id * 2654435761u + s.vc.x);
+        else if (frame.debug_mode == 3u) m.albedo = level_color(c.level);
+        else if (frame.debug_mode == 4u) m.albedo = hash_color(c.group + s.vc.x * 104729u);
+        else if (frame.debug_mode == 5u) m.albedo = hash_color(s.vc.x);
+        else if (frame.debug_mode == 6u) m.albedo = vec3(0.3);
+        else if (frame.debug_mode == 7u) m.albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
 
-        // The ray against the triangle's plane (Moller-Trumbore, without
-        // the bounds checks: the rasterizer already said it hits).
-        const vec3 e1 = p1 - p0, e2 = p2 - p0;
-        const vec3 pv = cross(dir, e2);
-        const float det = dot(e1, pv);
-        const vec3 tv = origin - p0;
-        const float inv = abs(det) > 1e-20 ? 1.0 / det : 0.0;
-        const vec3 qv = cross(tv, e1);
-        // Clamped: at a silhouette the triangle under a pixel center can be
-        // nearly edge-on, and the ray meets its plane far outside it.
-        const float bu = clamp(dot(tv, pv) * inv, 0.0, 1.0);
-        const float bv = clamp(dot(dir, qv) * inv, 0.0, 1.0 - bu);
-        // The distance from depth, which is exact, not from that plane.
-        const vec4 center = frame.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
-        const vec3 forward = normalize(center.xyz / center.w - origin);
-        const float t = frame.near_z / uintBitsToFloat(uint(v >> 32)) / dot(dir, forward);
-        const vec3 hit = origin + dir * t;
-
-        vec3 n = normalize(to_world_dir(inst, cluster_normal(base, c, i0) * (1.0 - bu - bv) + cluster_normal(base, c, i1) * bu +
-                                                  cluster_normal(base, c, i2) * bv));
-        // Seen from behind (the inside of a fold, or through a hole in the
-        // scan): light the side we see, and leave the rim light off, which
-        // would outline every such sliver.
-        const bool behind = dot(n, dir) > 0.0;
-        if (behind) n = -n;
-
-        vec3 albedo = vec3(0.56, 0.52, 0.47);
-        if (frame.debug_mode == 1u) albedo = hash_color(vc.y * 7919u + vc.x * 104729u);
-        else if (frame.debug_mode == 2u) albedo = hash_color(id * 2654435761u + vc.x);
-        else if (frame.debug_mode == 3u) albedo = level_color(c.level);
-        else if (frame.debug_mode == 4u) albedo = hash_color(c.group + vc.x * 104729u);
-        else if (frame.debug_mode == 5u) albedo = hash_color(vc.x);
-        else if (frame.debug_mode == 6u) albedo = vec3(0.3);
-        else if (frame.debug_mode == 7u) albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
-
-        float diffuse = max(dot(n, sun_dir), 0.0);
-        if (diffuse > 0.0) {
-            // The shadow copy strays up to its own error from the original,
-            // and the drawn cut up to this cluster's: clear both.
-            const float bias = (meshes[inst.mesh].shadow_error + c.lod_error) * inst.scale * 1.5 + 1e-4 + t * 2e-5;
-            diffuse *= sunlight(hit, n, bias);
-        }
-        const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42;
-        const float rim = behind ? 0.0 : pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25;
-        color = albedo * (sun_color * diffuse + ambient) + rim * sky(n);
+        const float lit = dot(s.n, sun_dir) > 0.0 ? sunlight(px, s) : 0.0;
+        color = shade_material(m, s.n, -s.dir, lit);
+        // Seen from behind: no rim light, which would outline every sliver.
+        if (!s.behind) color += pow(1.0 - max(dot(s.n, -s.dir), 0.0), 4.0) * 0.25 * sky(s.n) * (1.0 - m.metallic);
 
         if ((frame.flags & flag_wireframe) != 0u) {
             const vec2 p = vec2(px) + 0.5;
-            const vec2 s0 = to_pixel(p0), s1 = to_pixel(p1), s2 = to_pixel(p2);
+            const vec2 s0 = to_pixel(s.p0), s1 = to_pixel(s.p1), s2 = to_pixel(s.p2);
             const float d = min(edge_distance(p, s0, s1), min(edge_distance(p, s1, s2), edge_distance(p, s2, s0)));
             color = mix(color * 0.25, color, smoothstep(0.0, 1.0, d));
         }
-        color = mix(color, sky(dir), 1.0 - exp(-t * 0.012));
+        color = mix(color, sky(s.dir), 1.0 - exp(-s.t * 0.012));
     }
     imageStore(out_image, ivec2(px), vec4(aces(color), 1.0));
 }

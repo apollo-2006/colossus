@@ -1,0 +1,19 @@
+#version 460
+#define RAY_QUERY  // Only built, and only run, where the GPU has ray queries
+// Sun shadows at half resolution: one ray for each two by two pixels, from
+// the surface under its top-left pixel, stored with that surface's
+// distance so shade.comp can tell which neighbours it may borrow from.
+// Built only with ray queries.
+#include "common.glsl"
+#include "surface.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    const uvec2 hp = gl_GlobalInvocationID.xy;
+    const uvec2 size = shadow_size();
+    if (hp.x >= size.x || hp.y >= size.y) return;
+    const uvec2 px = min(hp * 2u, uvec2(frame.width, frame.height) - 1u);
+    const Surface s = surface_at(px);
+    shadow_mask[hp.x + hp.y * size.x] = vec2(trace_surface(s), s.kind == surface_sky ? -1.0 : s.t);
+}

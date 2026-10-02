@@ -63,6 +63,9 @@ const uint32_t shade_rt_spv[] = {
 const uint32_t sw_raster_spv[] = {
 #include "sw_raster.comp.inc"
 };
+const uint32_t shadow_spv[] = {
+#include "shadow.comp.inc"
+};
 const uint32_t hzb_spv[] = {
 #include "hzb.comp.inc"
 };
@@ -86,7 +89,8 @@ struct gpu_instance {
     float rows[3][4];
     uint32_t mesh;
     float scale;
-    uint32_t pad0, pad1;
+    uint32_t material;  // Into shade.comp's materials
+    uint32_t pad1;
 };
 struct gpu_frame {
     float view_proj[16];
@@ -111,7 +115,9 @@ struct gpu_frame {
     uint32_t hzb_width, hzb_height, hzb_levels;
     float sw_max_pixels;
     uint32_t max_requests;
-    uint32_t pad10, pad11, pad12;
+    float scene_top;
+    uint32_t pad11, pad12;
+    float shadow_lod_error[4];
 };
 struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
@@ -123,10 +129,12 @@ struct gpu_push {
 };
 
 constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
-                   flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64;
-// Shadows are traced against a cut of each model with at most this many
-// triangles: the finest cut that fits.
-constexpr size_t shadow_triangle_budget = 1u << 18;
+                   flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64, flag_full_res_shadows = 128;
+// Shadows are traced against cuts of each model, the finest within each of
+// these budgets: rays from far surfaces use the coarser ones (see
+// trace_surface() in surface.glsl).
+constexpr size_t shadow_budgets[] = {1u << 18, 1u << 15, 1u << 12};
+constexpr uint32_t shadow_lods = 3;
 constexpr uint32_t max_hzb_levels = 16;
 constexpr uint32_t max_requests = 1u << 14;  // Pages the GPU may ask for in a frame
 
@@ -153,6 +161,8 @@ struct options {
     float fly = 0;             // Headless: move the camera this far forward each frame, turning slowly
     unsigned loader_threads = 2;  // 0: read pages on the render thread
     bool cold = false;         // Drop the models from the OS's file cache first, so pages come off the disk
+    bool mixed_materials = true;
+    bool full_res_shadows = false;
 };
 
 struct camera {
@@ -200,7 +210,8 @@ struct scene {
     std::vector<int> files;
     std::vector<gpu_mesh> meshes;
     std::vector<gpu_instance> instances;
-    std::vector<shadow_mesh> shadow_meshes;
+    std::vector<shadow_mesh> shadow_meshes;  // shadow_lods per model
+    float shadow_lod_error[4] = {};          // The largest error of each shadow copy over the models
     std::vector<float> shadow_positions;
     std::vector<uint32_t> shadow_indices;
     size_t instanced_triangles = 0;  // At full detail, over every instance
@@ -216,7 +227,7 @@ struct scene {
 // The finest cut of a model's hierarchy within the shadow budget, read
 // from its pages: positions (three floats a vertex, repeated per cluster)
 // and indices into them. Returns the cut's error.
-float shadow_cut(const paged_geometry& g, int fd, std::vector<float>& positions, std::vector<uint32_t>& indices) {
+float shadow_cut(const paged_geometry& g, int fd, size_t budget, std::vector<float>& positions, std::vector<uint32_t>& indices) {
     auto triangles_at = [&](float t) {
         size_t n = 0;
         for (const gpu_cluster& c : g.clusters)
@@ -230,7 +241,7 @@ float shadow_cut(const paged_geometry& g, int fd, std::vector<float>& positions,
     size_t lo = 0, hi = errors.size() - 1;  // The cut at the coarsest error is the roots: small enough
     while (lo < hi) {
         const size_t mid = (lo + hi) / 2;
-        if (triangles_at(errors[mid]) <= shadow_triangle_budget) hi = mid;
+        if (triangles_at(errors[mid]) <= budget) hi = mid;
         else lo = mid + 1;
     }
     const float error = errors[lo];
@@ -281,18 +292,23 @@ void make_scene(const options& opt, scene& s) {
             s.pages.push_back({fd, g.data_offset + pg.offset, pg.size, pg.dep_first + dep_base, pg.dep_count, p == 0});
         }
 
-        shadow_mesh sm{};
-        sm.first_vertex = static_cast<uint32_t>(s.shadow_positions.size() / 3);
-        sm.first_index = static_cast<uint32_t>(s.shadow_indices.size());
-        std::vector<float> positions;
-        std::vector<uint32_t> indices;
-        const float shadow_error = shadow_cut(g, fd, positions, indices);
-        sm.vertex_count = static_cast<uint32_t>(positions.size() / 3);
-        sm.index_count = static_cast<uint32_t>(indices.size());
-        s.shadow_positions.insert(s.shadow_positions.end(), positions.begin(), positions.end());
-        s.shadow_indices.insert(s.shadow_indices.end(), indices.begin(), indices.end());
-        s.shadow_meshes.push_back(sm);
-        std::printf("  shadow copy: %u triangles, error %.3g\n", sm.index_count / 3, shadow_error);
+        float shadow_error = 0;
+        for (uint32_t lod = 0; lod < shadow_lods; ++lod) {
+            shadow_mesh sm{};
+            sm.first_vertex = static_cast<uint32_t>(s.shadow_positions.size() / 3);
+            sm.first_index = static_cast<uint32_t>(s.shadow_indices.size());
+            std::vector<float> positions;
+            std::vector<uint32_t> indices;
+            const float error = shadow_cut(g, fd, shadow_budgets[lod], positions, indices);
+            if (lod == 0) shadow_error = error;
+            sm.vertex_count = static_cast<uint32_t>(positions.size() / 3);
+            sm.index_count = static_cast<uint32_t>(indices.size());
+            s.shadow_positions.insert(s.shadow_positions.end(), positions.begin(), positions.end());
+            s.shadow_indices.insert(s.shadow_indices.end(), indices.begin(), indices.end());
+            s.shadow_meshes.push_back(sm);
+            s.shadow_lod_error[lod] = std::max(s.shadow_lod_error[lod], error);
+            std::printf("  shadow copy %u: %u triangles, error %.3g\n", lod, sm.index_count / 3, error);
+        }
 
         gpu_mesh m{};
         m.shadow_error = shadow_error;
@@ -311,8 +327,11 @@ void make_scene(const options& opt, scene& s) {
         }
     }
 
-    std::mt19937 rng(7);
+    std::mt19937 rng(7), material_rng(11);
     std::uniform_real_distribution<float> turn(0, 6.2831853f), size(0.85f, 1.15f);
+    // Mostly marble, some sandstone, bronze, gold and granite: the
+    // materials table in shade.comp. One statue alone is marble.
+    const uint32_t mix[20] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5};
     const int n = std::max(1, opt.grid);
     for (int z = 0; z < n; ++z)
         for (int x = 0; x < n; ++x) {
@@ -326,6 +345,7 @@ void make_scene(const options& opt, scene& s) {
                 for (int c = 0; c < 4; ++c) inst.rows[r][c] = m.at(r, c);
             inst.mesh = mesh;
             inst.scale = scale;
+            inst.material = !opt.mixed_materials ? 0 : n == 1 ? 1 : mix[material_rng() % 20];
             s.instances.push_back(inst);
             s.instanced_triangles += leaf_triangles[mesh];
         }
@@ -380,7 +400,7 @@ public:
         for (vk::buffer* b : {&clusters_, &page_table_, &pool_buffer_, &page_used_, &requests_, &request_stamp_, &shadow_positions_, &meshes_,
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_})
             ctx_.destroy(*b);
-        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_})
+        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
         for (accel* a : {&tlas_}) {
@@ -405,6 +425,7 @@ public:
         width_ = width;
         height_ = height;
         vis_ = ctx_.make_buffer(uint64_t(width) * height * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+        shadow_mask_ = ctx_.make_buffer(uint64_t((width + 1) / 2) * ((height + 1) / 2) * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
         depth_ = ctx_.make_image(width, height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
         color_ = ctx_.make_image(width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
                                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -423,6 +444,14 @@ public:
             w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[1].pImageInfo = &image_info;
             vkUpdateDescriptorSets(ctx_.device, 2, w, 0, nullptr);
+            VkDescriptorBufferInfo mask_info{shadow_mask_.handle, 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet m{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            m.dstSet = f.set;
+            m.dstBinding = 20;
+            m.descriptorCount = 1;
+            m.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            m.pBufferInfo = &mask_info;
+            vkUpdateDescriptorSets(ctx_.device, 1, &m, 0, nullptr);
         }
         create_hzb();
         prev_valid_ = false;
@@ -486,6 +515,8 @@ public:
 
         gpu_frame fr = frame_in;
         fr.frame_index = frame_index;
+        fr.scene_top = scene_top_;
+        std::memcpy(fr.shadow_lod_error, sc_.shadow_lod_error, sizeof fr.shadow_lod_error);
         fr.max_requests = max_requests;
         fr.width = width_;
         fr.height = height_;
@@ -545,6 +576,12 @@ public:
         vk::transition(cmd, color_.handle, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                        VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+        if (shadow_ && (frame_in.flags & flag_shadows) && !(frame_in.flags & flag_full_res_shadows)) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadow_);
+            vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
+            vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+        }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shade_);
         vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 4);
@@ -660,14 +697,17 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline instance_cull_ = VK_NULL_HANDLE, args_ = VK_NULL_HANDLE, shade_ = VK_NULL_HANDLE, raster_ = VK_NULL_HANDLE,
-               hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE, sw_raster_ = VK_NULL_HANDLE;
+               hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE, sw_raster_ = VK_NULL_HANDLE, shadow_ = VK_NULL_HANDLE;
+    vk::buffer shadow_mask_;
     bool cull_only_ = false;
     uint64_t upload_bytes_;
     streamer streamer_;
     uint32_t frame_counter_ = 0;
+    float scene_top_ = 0;
 
     void destroy_targets() {
         ctx_.destroy(vis_);
+        ctx_.destroy(shadow_mask_);
         ctx_.destroy(depth_);
         ctx_.destroy(color_);
         for (VkImageView v : hzb_views_) vkDestroyImageView(ctx_.device, v, nullptr);
@@ -829,6 +869,12 @@ private:
             vkCmdFillBuffer(cmd, page_used_.handle, 0, VK_WHOLE_SIZE, 0);
             vkCmdFillBuffer(cmd, request_stamp_.handle, 0, VK_WHOLE_SIZE, 0);
         });
+        // The top of the scene: each instance's bounding sphere, placed.
+        for (const gpu_instance& inst : sc_.instances) {
+            const gpu_mesh& m = sc_.meshes[inst.mesh];
+            const float y = inst.rows[1][0] * m.bounds[0] + inst.rows[1][1] * m.bounds[1] + inst.rows[1][2] * m.bounds[2] + inst.rows[1][3];
+            scene_top_ = std::max(scene_top_, y + m.bounds[3] * inst.scale);
+        }
         if (ctx_.ray_query) {
             shadow_positions_ = ctx_.upload(sc_.shadow_positions, ssbo | as_input);
             build_shadow_scene();
@@ -922,15 +968,18 @@ private:
             blas_.push_back(build_accel(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geom, m.index_count / 3));
             triangles += m.index_count / 3;
         }
-        std::vector<VkAccelerationStructureInstanceKHR> instances(sc_.instances.size());
-        for (size_t k = 0; k < instances.size(); ++k) {
-            auto& ai = instances[k];
-            std::memcpy(ai.transform.matrix, sc_.instances[k].rows, sizeof ai.transform.matrix);
-            ai.instanceCustomIndex = static_cast<uint32_t>(k);
-            ai.mask = 0xFF;
-            ai.flags = 0;
-            ai.accelerationStructureReference = blas_[sc_.instances[k].mesh].address;
-        }
+        // Every instance three times, once per shadow copy, each copy
+        // under its own mask bit: a ray sees only the copy it asks for.
+        std::vector<VkAccelerationStructureInstanceKHR> instances(sc_.instances.size() * shadow_lods);
+        for (size_t k = 0; k < sc_.instances.size(); ++k)
+            for (uint32_t lod = 0; lod < shadow_lods; ++lod) {
+                auto& ai = instances[k * shadow_lods + lod];
+                std::memcpy(ai.transform.matrix, sc_.instances[k].rows, sizeof ai.transform.matrix);
+                ai.instanceCustomIndex = static_cast<uint32_t>(k);
+                ai.mask = 1u << lod;
+                ai.flags = 0;
+                ai.accelerationStructureReference = blas_[sc_.instances[k].mesh * shadow_lods + lod].address;
+            }
         as_instances_ = ctx_.upload(instances, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
         VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
         geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
@@ -944,7 +993,7 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 19; ++i) {
+        for (uint32_t i = 0; i <= 20; ++i) {
             if (i == 18 && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
@@ -963,7 +1012,7 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (1 + max_hzb_levels) * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, frames_in_flight}};
@@ -1038,6 +1087,7 @@ private:
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
         args_ = compute_pipeline(args_spv, sizeof args_spv);
         shade_ = ctx_.ray_query ? compute_pipeline(shade_rt_spv, sizeof shade_rt_spv) : compute_pipeline(shade_spv, sizeof shade_spv);
+        if (ctx_.ray_query) shadow_ = compute_pipeline(shadow_spv, sizeof shadow_spv);
         cluster_cull_ = compute_pipeline(cluster_cull_spv, sizeof cluster_cull_spv);
         sw_raster_ = compute_pipeline(sw_raster_spv, sizeof sw_raster_spv);
         hzb_ = compute_pipeline(hzb_spv, sizeof hzb_spv);
@@ -1298,6 +1348,8 @@ options parse(int argc, char** argv) {
         else if (a == "--no-cone") o.disable |= flag_cone_culling;
         else if (a == "--no-sw") o.disable |= flag_software_raster;
         else if (a == "--no-shadows") o.disable |= flag_shadows;
+        else if (a == "--full-res-shadows") o.full_res_shadows = true;
+        else if (a == "--materials") o.mixed_materials = next() != "plain";
         else if (a == "--pool-mb") o.pool_mb = std::clamp<uint64_t>(std::stoull(next()), 16, 4095);
         else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
         else if (a == "--warmup") o.warmup = std::stoi(next());
@@ -1335,6 +1387,7 @@ int main(int argc, char** argv) {
         v.threshold = opt.threshold;
         v.mode = opt.mode;
         if (opt.wireframe) v.flags |= flag_wireframe;
+        if (opt.full_res_shadows) v.flags |= flag_full_res_shadows;
         v.flags &= ~opt.disable;
         v.sw_max_pixels = opt.sw_pixels;
         const float extent = std::max(1.0f, opt.grid * opt.spacing);

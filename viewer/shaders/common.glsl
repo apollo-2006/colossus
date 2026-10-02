@@ -43,7 +43,8 @@ struct Instance {
     vec4 rows[3];  // The 3x4 to-world transform, by rows
     uint mesh;
     float scale;
-    uint pad0, pad1;
+    uint material;  // Into shade.comp's materials
+    uint pad1;
 };
 
 layout(set = 0, binding = 0, scalar) uniform Frame {
@@ -74,7 +75,9 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     uint hzb_width, hzb_height, hzb_levels;
     float sw_max_pixels;  // Clusters smaller than this on screen go to the software rasterizer
     uint max_requests;
-    uint pad10, pad11, pad12;
+    float scene_top;  // The highest point of any instance: no shadow ray need climb above it
+    uint pad11, pad12;
+    vec4 shadow_lod_error;  // Each shadow copy's largest error over the models
 } frame;
 
 const uint flag_cone_culling = 1u;
@@ -84,6 +87,7 @@ const uint flag_occlusion = 8u;
 const uint flag_prev_valid = 16u;  // Last frame's pyramid fits this frame
 const uint flag_software_raster = 32u;
 const uint flag_shadows = 64u;
+const uint flag_full_res_shadows = 128u;  // Every pixel traces its own ray
 
 // Which pass this is (0 or 1), and for the pyramid builder, which level.
 layout(push_constant, scalar) uniform Push {
