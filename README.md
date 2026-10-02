@@ -19,7 +19,7 @@ threshold and the crowd size there to play with.
 900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
 billion triangles at full detail, drawn at 1920x1080 in 0.92 ms on an rx 9070 xt, soft
 shadows, ambient occlusion and antialiasing included. about 3 million triangles reach
-the screen, from 23 mb of the 579 mb on disk. a million instances (17.6 trillion
+the screen, from 7 mb of the 427 mb on disk. a million instances (17.6 trillion
 triangles) take about 1.3 ms, and instances can move.
 
 ## how it works
@@ -124,14 +124,19 @@ triangles) take about 1.3 ms, and instances can move.
    request while they'd still be too coarse. from a cold start a lucy close-up settles in
    17 frames instead of 45, the crowd above in 32 instead of 45.
 
-   a vertex is two words: 14-bit offsets on a grid over the model plus an 11 + 11 bit
-   octahedral normal; a triangle is three bytes. shared vertices snap to the same grid
-   point in each cluster, so quantizing opens no cracks. lucy's pages are 460 mb.
+   pages are bit-packed per cluster. positions snap to a grid over the model and store
+   their offset from the cluster's corner in just the bits its extent needs per axis,
+   normals are 11 + 11 bit octahedral, and triangle indices take the bits the vertex
+   count needs; the widths ride in the cluster's level word. shared vertices snap to the
+   same grid point in each cluster, so quantizing opens no cracks. lucy's pages went
+   from 460 mb to 337, the dragon's from 119 to 90.
 
-   the crowd above reads 23 mb and holds at most 2,577 pages. a 300 frame flight with a
-   16 mb pool evicts 24,085 pages and shows exactly the same empty pixels as a 1 gb pool.
-   from a cold file cache the render thread's worst frame in the streamer is 2.0 ms with
-   loader threads, 44 ms without (`--sync-loads`).
+   the crowd above reads 7 mb and holds under a thousand pages. a 300 frame flight with a
+   16 mb pool evicts 14,065 pages and reads 107 mb (with the old two-word vertices it
+   evicted 26,900 and read 244, the pool holding a quarter fewer pages), and at frames
+   100, 200 and 300 shows exactly the same empty pixels as a 1 gb pool. from a cold file
+   cache the render thread's worst frame in the streamer is 0.48 ms with loader threads,
+   7 ms without (`--sync-loads`).
 
 ### motion and scale
 
@@ -191,7 +196,7 @@ or push constants:
 * a quarter of the middle 30x30 instances move, and the crowd slider goes to a million.
 
 the models are trimmed to 4 million triangles at their finest (`--max-triangles`): about
-4 mb of gzipped metadata each, up front, and 71 mb of pages, streamed. in chrome on the
+4 mb of gzipped metadata each, up front, and about 55 mb of pages, streamed. in chrome on the
 rx 9070 xt at 1600x813, 900 instances take 1.07 ms of gpu time once streaming settles,
 1.45 ms with the middle moving, and a million 2.32 ms. it needs 16 storage buffers per
 shader stage, which desktop gpus allow. `web/build.sh` builds the models;
@@ -273,10 +278,12 @@ refuse levels that strayed several pixels. the commit messages have every step's
   shadow maps (half the crowd: 0.62 ms).
 * shadow pages draw from streamed geometry too, so shadows sharpen with everything else,
   and a page that finds the pool full falls back a level.
+* where a fold turns nearly edge-on to the sun, its shadow edge shows texel-sized steps.
+  an offset growing with the slope smooths them but leaks light through thin parts, so
+  for now the steps stay.
 * materials are a few parameters per instance, with no textures.
-* the browser has no instance cells, its shadow pages wait on http streaming (about 40
-  seconds headless for a still view to settle), and its pages are only compressed as
-  far as the server does.
+* the browser has no instance cells, and its shadow pages wait on http streaming (about
+  40 seconds headless for a still view to settle).
 
 ## models
 
