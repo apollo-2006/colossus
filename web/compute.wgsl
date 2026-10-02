@@ -33,6 +33,8 @@ struct Counters {
 @group(2) @binding(0) var hw_depth: texture_depth_2d;
 @group(2) @binding(1) var hw_id: texture_2d<u32>;
 @group(2) @binding(2) var out_image: texture_storage_2d<rgba8unorm, write>;
+@group(2) @binding(3) var shadow_map: texture_depth_2d;
+@group(2) @binding(4) var shadow_sampler: sampler_comparison;
 // Streaming: the frame each page was last drawn from, the pages asked for
 // this frame (page, priority as float bits), and when each was last asked.
 struct Requests {
@@ -102,7 +104,10 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
       atomicAdd(&counters.instances_visible, 1u);
       let lc = to_world(inst, m.lod_bounds.xyz);
       let d = max(length(lc - frame.cull_origin.xyz) - m.lod_bounds.w * inst.scale, frame.near_z);
-      let limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
+      // Orthographic (the shadow pass): an error's size does not depend on
+      // distance.
+      var limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
+      if (frame.ortho_scale > 0.0) { limit = frame.lod_threshold / (inst.scale * frame.ortho_scale); }
       var lo = 0u;
       var hi = m.cluster_count;
       while (lo < hi) {
@@ -186,11 +191,13 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       if (draw) {
         atomicAdd(&wg_triangles, c.triangle_count);
         page_used[c.group] = frame.frame_index;
-        if (lod.wants_finer) { request_finer(c, lod.self_error); }
+        // Pages are asked for by the view, not the shadow map: shadows
+        // draw from whatever the view has loaded.
+        if (lod.wants_finer && (frame.flags & FLAG_SHADOW_PASS) == 0u) { request_finer(c, lod.self_error); }
         // The sphere's size on screen, roughly; clusters reaching the
         // near plane always go to the hardware, which clips.
         let d = length(center - frame.origin.xyz) - r;
-        software = (frame.flags & FLAG_SOFTWARE) != 0u && d > frame.near_z * 2.0 &&
+        software = (frame.flags & FLAG_SOFTWARE) != 0u && (frame.flags & FLAG_SHADOW_PASS) == 0u && d > frame.near_z * 2.0 &&
                    2.0 * r * frame.lod_scale / d < frame.sw_max_pixels;
       }
     }
@@ -360,6 +367,70 @@ fn level_color(level: u32) -> vec3f {
   return mix(vec3f(1.0), clamp(k - 1.0, vec3f(0.0), vec3f(1.0)), 0.75) * 0.85;
 }
 
+// Instances carry one of these (Instance::pad0 here, material natively),
+// as viewer/shaders/shade.comp's.
+struct Material {
+  albedo: vec3f,
+  roughness: f32,
+  metallic: f32,
+}
+
+fn material(index: u32) -> Material {
+  switch (index) {
+    case 1u: { return Material(vec3f(0.66, 0.64, 0.6), 0.3, 0.0); }    // Polished marble
+    case 2u: { return Material(vec3f(0.62, 0.5, 0.38), 0.85, 0.0); }   // Sandstone
+    case 3u: { return Material(vec3f(0.58, 0.38, 0.22), 0.35, 1.0); }  // Bronze
+    case 4u: { return Material(vec3f(0.95, 0.74, 0.36), 0.28, 1.0); }  // Gold
+    case 5u: { return Material(vec3f(0.2, 0.2, 0.22), 0.45, 0.0); }    // Dark granite
+    default: { return Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }   // Plaster
+  }
+}
+
+// Sunlight off a surface: Lambert, plus GGX specular with Schlick's
+// Fresnel and a Smith shadowing term, and the sky in the reflection.
+fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32) -> vec3f {
+  let f0 = mix(vec3f(0.04), m.albedo, m.metallic);
+  let nl = max(dot(n, SUN_DIR), 0.0);
+  let nv = max(dot(n, v), 1e-4);
+  let h = normalize(SUN_DIR + v);
+  let nh = max(dot(n, h), 0.0);
+  let vh = max(dot(v, h), 0.0);
+  let a = m.roughness * m.roughness;
+  let a2 = a * a;
+  let dd = nh * nh * (a2 - 1.0) + 1.0;
+  let d = a2 / (3.14159 * dd * dd);
+  let k = (m.roughness + 1.0) * (m.roughness + 1.0) / 8.0;
+  let g = nl / (nl * (1.0 - k) + k) * nv / (nv * (1.0 - k) + k);
+  let fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+  let specular = 3.14159 * d * g * fresnel / max(4.0 * nl * nv, 1e-4);
+  let diffuse = m.albedo * (1.0 - m.metallic) * (1.0 - fresnel);
+  let ambient = mix(vec3f(0.24, 0.22, 0.2), sky(vec3f(0.0, 1.0, 0.0)), n.y * 0.5 + 0.5) * 0.42;
+  let env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
+  let env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8;
+  return (diffuse + specular) * SUN_COLOR * nl * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
+         m.albedo * m.metallic * ambient * 0.5;
+}
+
+// Sunlight at a point, from the shadow map: 3 x 3 comparisons, each
+// filtered over four texels. The point moves off the surface along its
+// normal by a texel and a half, and toward the sun by the drawn cluster's
+// error, so a surface does not shadow itself. Outside the map, lit.
+fn sunlight(p: vec3f, n: vec3f, error: f32) -> f32 {
+  if ((frame.flags & FLAG_SHADOWS) == 0u) { return 1.0; }
+  let q = p + n * frame.shadow_texel * 1.5 + SUN_DIR * error;
+  let clip = frame.shadow_view_proj * vec4f(q, 1.0);
+  let uv = vec2f(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
+  if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || clip.z > 1.0) { return 1.0; }
+  let texel = 1.0 / vec2f(textureDimensions(shadow_map));
+  var lit = 0.0;
+  for (var y = -1; y <= 1; y++) {
+    for (var x = -1; x <= 1; x++) {
+      lit += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f(f32(x), f32(y)) * texel, clip.z - 1e-4);
+    }
+  }
+  return lit / 9.0;
+}
+
 fn aces(x: vec3f) -> vec3f {
   return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
 }
@@ -410,7 +481,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       let cell = abs(fract(hit.xz * 0.5) - 0.5);
       let line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
       let ground = mix(vec3f(0.42, 0.4, 0.37), vec3f(0.33, 0.31, 0.29), line) *
-                   (SUN_COLOR * SUN_DIR.y * 0.6 + sky(vec3f(0.0, 1.0, 0.0)) * 0.45);
+                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0), 0.0) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45);
       color = mix(ground, color, 1.0 - exp(-t * 0.012));
     }
   } else {
@@ -450,21 +521,22 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let behind = dot(n, dir) > 0.0;
     if (behind) { n = -n; }
 
-    var albedo = vec3f(0.56, 0.52, 0.47);
+    var m = material(inst.pad0);
+    if (frame.debug_mode != 0u) { m = Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }
     switch (frame.debug_mode) {
-      case 1u: { albedo = hash_color(vc.y * 7919u + vc.x * 104729u); }
-      case 2u: { albedo = hash_color(id * 2654435761u + vc.x + select(0u, 0x9e3779b9u, software)); }
-      case 3u: { albedo = level_color(c.level); }
-      case 4u: { albedo = hash_color(c.group + vc.x * 104729u); }
-      case 5u: { albedo = hash_color(vc.x); }
-      case 6u: { albedo = select(vec3f(0.15, 0.45, 0.95), vec3f(0.95, 0.45, 0.1), software); }
-      case 7u: { albedo = vec3f(0.3); }
+      case 1u: { m.albedo = hash_color(vc.y * 7919u + vc.x * 104729u); }
+      case 2u: { m.albedo = hash_color(id * 2654435761u + vc.x + select(0u, 0x9e3779b9u, software)); }
+      case 3u: { m.albedo = level_color(c.level); }
+      case 4u: { m.albedo = hash_color(c.group + vc.x * 104729u); }
+      case 5u: { m.albedo = hash_color(vc.x); }
+      case 6u: { m.albedo = select(vec3f(0.15, 0.45, 0.95), vec3f(0.95, 0.45, 0.1), software); }
+      case 7u: { m.albedo = vec3f(0.3); }
       default: {}
     }
-    let diffuse = max(dot(n, SUN_DIR), 0.0);
-    let ambient = mix(vec3f(0.24, 0.22, 0.2), sky(vec3f(0.0, 1.0, 0.0)), n.y * 0.5 + 0.5) * 0.42;
-    let rim = select(pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25, 0.0, behind);
-    color = albedo * (SUN_COLOR * diffuse + ambient) + rim * sky(n);
+    let hit = origin + dir * t;
+    let lit = select(0.0, sunlight(hit, n, c.lod_error * inst.scale), dot(n, SUN_DIR) > 0.0);
+    color = shade_material(m, n, -dir, lit);
+    if (!behind) { color += pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic); }
     color = mix(color, sky(dir), 1.0 - exp(-t * 0.012));
   }
   textureStore(out_image, px, vec4f(srgb(aces(color)), 1.0));

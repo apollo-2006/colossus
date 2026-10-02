@@ -70,3 +70,9 @@ export function frustumPlanes(m) {
     return p.map((v) => v / l);
   });
 }
+
+// Orthographic projection of the box [-half, half] x [-half, half] x
+// [near, far] in view space (looking down -z), depth 0 at near and 1 at far.
+export function orthographic(half, near, far) {
+  return new Float32Array([1 / half, 0, 0, 0, 0, 1 / half, 0, 0, 0, 0, -1 / (far - near), 0, 0, 0, -near / (far - near), 1]);
+}

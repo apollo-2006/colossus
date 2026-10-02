@@ -24,6 +24,13 @@ struct Frame {
   max_requests: u32,
   pad0: u32,
   pad1: u32,
+  shadow_view_proj: mat4x4f,  // World to the shadow map's clip space
+  // Over 0 for the shadow pass: the sun's camera is orthographic, and an
+  // error covers error * ortho_scale shadow map texels wherever it is.
+  ortho_scale: f32,
+  shadow_texel: f32,  // A shadow map texel's size in world units
+  pad2: u32,
+  pad3: u32,
 }
 
 // include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
@@ -74,6 +81,8 @@ struct Instance {
 const FLAG_CONE = 1u;
 const FLAG_FRUSTUM = 2u;
 const FLAG_SOFTWARE = 4u;
+const FLAG_SHADOW_PASS = 8u;  // Culling and drawing for the shadow map
+const FLAG_SHADOWS = 16u;
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
@@ -136,6 +145,7 @@ fn sphere_in_frustum(c: vec3f, r: f32) -> bool {
 // point of a sphere. Clusters of one group compute this from identical
 // numbers, so they always agree.
 fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
+  if (frame.ortho_scale > 0.0) { return error * frame.ortho_scale; }
   let d = length(center - frame.cull_origin.xyz) - radius;
   return error * frame.lod_scale / max(d, frame.near_z);
 }

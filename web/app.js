@@ -1,7 +1,7 @@
 // The demo page: loads the models, places a crowd of them, and flies a
 // camera over it with the WebGPU renderer.
 import { fetchModel } from './geometry.js';
-import { FLAG_CONE, FLAG_FRUSTUM, FLAG_SOFTWARE, Renderer } from './renderer.js';
+import { FLAG_CONE, FLAG_FRUSTUM, FLAG_SHADOWS, FLAG_SOFTWARE, Renderer } from './renderer.js';
 
 const $ = (id) => document.getElementById(id);
 const MODELS = ['models/lucy', 'models/dragon'];
@@ -66,7 +66,7 @@ async function main() {
   $('loading').remove();
   renderer.loadModels(models, Math.min(POOL_BYTES, renderer.device.limits.maxStorageBufferBindingSize));
 
-  const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE, threshold: 1, mode: 0, swPixels: 32 };
+  const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS, threshold: 1, mode: 0, swPixels: 32 };
   let frozen = null;
   const build = () => {
     const n = Number($('grid').value);
@@ -84,6 +84,7 @@ async function main() {
   const toggle = (id, flag) => ($(id).onchange = () => (settings.flags ^= flag));
   toggle('software', FLAG_SOFTWARE);
   toggle('cone', FLAG_CONE);
+  toggle('shadows', FLAG_SHADOWS);
   $('freeze').onchange = () => {
     frozen = $('freeze').checked ? { eye: [...camera.eye], forward: camera.forward, fov: camera.fov, near: camera.near } : null;
   };

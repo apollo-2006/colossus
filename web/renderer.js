@@ -3,15 +3,18 @@
 //   instance_cull -> args_cull -> cluster_cull -> args_draw
 //   -> software raster (depth, then ids) and hardware raster
 //   -> shade -> blit to the canvas.
-import { frustumPlanes, invert, lookTo, mul, perspectiveReverseZ } from './math.js';
+import { frustumPlanes, invert, lookTo, mul, orthographic, perspectiveReverseZ } from './math.js';
 import { Streamer } from './streamer.js';
 
 const MAX_WORK = 1 << 20;
 const MAX_VISIBLE = 1 << 20;
 const MAX_REQUESTS = 1 << 13;
-const FRAME_BYTES = 304;
+const FRAME_BYTES = 384;
+const SHADOW_SIZE = 2048;
+const SHADOW_HALF = 8;  // The shadow map covers 16 x 16 units in front of the camera
+const SUN_DIR = [0.75, 0.5, 0.3].map((x) => x / Math.hypot(0.75, 0.5, 0.3));
 
-export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4;
+export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOW_PASS = 8, FLAG_SHADOWS = 16;
 
 async function source(name) {
   const r = await fetch(name);
@@ -68,6 +71,8 @@ export class Renderer {
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
         { binding: 1, visibility: C, texture: { sampleType: 'uint' } },
         { binding: 2, visibility: C, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+        { binding: 3, visibility: C, texture: { sampleType: 'depth' } },
+        { binding: 4, visibility: C, sampler: { type: 'comparison' } },
       ],
     });
     this.argsLayout = d.createBindGroupLayout({ entries: [rw(0)] });
@@ -96,6 +101,17 @@ export class Renderer {
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     });
+    // The shadow map: casters' depth from the sun, drawn from the same
+    // visible list, by a second run of the culling with the sun's camera.
+    this.shadowRaster = d.createRenderPipeline({
+      layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.rasterLayout] }),
+      vertex: { module: this.rasterModule, entryPoint: 'shadow_vs' },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+    this.shadowMap = d.createTexture({ size: [SHADOW_SIZE, SHADOW_SIZE], format: 'depth32float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.shadowSampler = d.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
     this.blit = d.createRenderPipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [d.createBindGroupLayout({ entries: [] }), this.blitLayout] }),
       vertex: { module: this.rasterModule, entryPoint: 'blit_vs' },
@@ -104,6 +120,7 @@ export class Renderer {
 
     const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
     this.frameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
+    this.shadowFrameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
     this.counters = d.createBuffer({ size: 32, usage: S | CD | CS });
     this.work = d.createBuffer({ size: MAX_WORK * 8, usage: S });
     this.hwVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
@@ -189,12 +206,14 @@ export class Renderer {
     this.instanceBuffer?.destroy();
     this.instanceBuffer = d.createBuffer({ size: instances.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     d.queue.writeBuffer(this.instanceBuffer, 0, instances);
-    this.sceneGroup = d.createBindGroup({
+    const sceneGroup = (frame) => d.createBindGroup({
       layout: this.sceneLayout,
-      entries: [{ binding: 0, resource: { buffer: this.frameBuffer } },
+      entries: [{ binding: 0, resource: { buffer: frame } },
         ...[[1, this.clusterBuffer], [2, this.pageTable], [3, this.pool], [6, this.meshBuffer], [7, this.instanceBuffer]]
           .map(([binding, buffer]) => ({ binding, resource: { buffer } }))],
     });
+    this.sceneGroup = sceneGroup(this.frameBuffer);
+    this.shadowSceneGroup = sceneGroup(this.shadowFrameBuffer);
   }
 
   resize(width, height) {
@@ -217,7 +236,8 @@ export class Renderer {
     this.imageGroup = d.createBindGroup({
       layout: this.imageLayout,
       entries: [{ binding: 0, resource: this.depthTexture.createView() }, { binding: 1, resource: this.idTexture.createView() },
-        { binding: 2, resource: this.image.createView() }],
+        { binding: 2, resource: this.image.createView() }, { binding: 3, resource: this.shadowMap.createView() },
+        { binding: 4, resource: this.shadowSampler }],
     });
     this.argsGroup = d.createBindGroup({ layout: this.argsLayout, entries: [{ binding: 0, resource: { buffer: this.args } }] });
     this.rasterGroup = d.createBindGroup({ layout: this.rasterLayout, entries: [{ binding: 0, resource: { buffer: this.hwVisible } }] });
@@ -233,8 +253,37 @@ export class Renderer {
     const proj = perspectiveReverseZ(camera.fov, aspect, camera.near);
     const viewProj = mul(proj, lookTo(camera.eye, camera.forward, [0, 1, 0]));
     const cullViewProj = mul(perspectiveReverseZ(cull.fov, aspect, cull.near), lookTo(cull.eye, cull.forward, [0, 1, 0]));
+    // The sun's camera: orthographic, over a square of the ground in front
+    // of the camera, looking down the sun's direction.
+    const ahead = [camera.eye[0] + camera.forward[0] * SHADOW_HALF * 0.7, 0, camera.eye[2] + camera.forward[2] * SHADOW_HALF * 0.7];
+    const reach = 40;
+    const sunEye = ahead.map((x, k) => x + SUN_DIR[k] * reach);
+    const sunViewProj = mul(orthographic(SHADOW_HALF, 0, 2 * reach), lookTo(sunEye, SUN_DIR.map((x) => -x), [0, 1, 0]));
+    const shadows = (settings.flags & FLAG_SHADOWS) !== 0;
+    this.frameIndex++;
+    if (shadows) {
+      const sf = new ArrayBuffer(FRAME_BYTES);
+      const sff = new Float32Array(sf), sfu = new Uint32Array(sf);
+      sff.set(sunViewProj, 0);
+      frustumPlanes(sunViewProj).forEach((p, k) => sff.set(p, 32 + 4 * k));
+      // Far behind the sun's camera, so the cone test sees parallel rays.
+      sff.set([...ahead.map((x, k) => x + SUN_DIR[k] * 1e4), 1], 52);
+      sff.set([...sunEye, 1], 56);
+      sfu[60] = SHADOW_SIZE; sfu[61] = SHADOW_SIZE; sfu[62] = this.instanceCount;
+      sfu[63] = FLAG_FRUSTUM | FLAG_CONE | FLAG_SHADOW_PASS;
+      // Error allowed, in shadow map texels: the lookup filters over three
+      // by three, and eight texels looks the same as one at a seventh of
+      // the cost (0.17 ms against 2.4 for 900 instances).
+      sff[64] = 1; sff[65] = 8; sff[66] = 1e-3;
+      sfu[68] = MAX_WORK; sfu[69] = MAX_VISIBLE;
+      sfu[72] = this.frameIndex; sfu[73] = MAX_REQUESTS;
+      sff[92] = SHADOW_SIZE / (2 * SHADOW_HALF);  // ortho_scale: texels per unit
+      d.queue.writeBuffer(this.shadowFrameBuffer, 0, sf);
+    }
     const f = new ArrayBuffer(FRAME_BYTES);
     const ff = new Float32Array(f), fu = new Uint32Array(f);
+    ff.set(sunViewProj, 76);
+    ff[93] = 2 * SHADOW_HALF / SHADOW_SIZE;  // shadow_texel
     ff.set(viewProj, 0);
     ff.set(invert(viewProj), 16);
     frustumPlanes(cullViewProj).forEach((p, k) => ff.set(p, 32 + 4 * k));
@@ -248,7 +297,7 @@ export class Renderer {
     fu[68] = MAX_WORK; fu[69] = MAX_VISIBLE;
     ff[70] = settings.swPixels;
     ff[71] = performance.now() / 1000;
-    fu[72] = ++this.frameIndex;
+    fu[72] = this.frameIndex;
     fu[73] = MAX_REQUESTS;
     d.queue.writeBuffer(this.frameBuffer, 0, f);
 
@@ -260,6 +309,34 @@ export class Renderer {
     d.queue.writeBuffer(this.pageTable, 0, this.streamer.table);
 
     const enc = d.createCommandEncoder();
+    if (shadows) {
+      // Cull with the sun's camera and draw the casters' depth, then the
+      // view starts over with the same lists.
+      enc.clearBuffer(this.counters);
+      let sp = enc.beginComputePass();
+      sp.setBindGroup(0, this.shadowSceneGroup);
+      sp.setBindGroup(1, this.workGroup);
+      sp.setBindGroup(2, this.imageGroup);
+      sp.setBindGroup(3, this.argsGroup);
+      sp.setPipeline(this.instanceCull);
+      sp.dispatchWorkgroups(Math.min(this.instanceCount, 65535), Math.ceil(this.instanceCount / 65535));
+      sp.setPipeline(this.argsCull);
+      sp.dispatchWorkgroups(1);
+      sp.setPipeline(this.clusterCull);
+      sp.dispatchWorkgroupsIndirect(this.args, 0);
+      sp.setPipeline(this.argsDraw);
+      sp.dispatchWorkgroups(1);
+      sp.end();
+      const rp = enc.beginRenderPass({
+        colorAttachments: [],
+        depthStencilAttachment: { view: this.shadowMap.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 },
+      });
+      rp.setPipeline(this.shadowRaster);
+      rp.setBindGroup(0, this.shadowSceneGroup);
+      rp.setBindGroup(1, this.rasterGroup);
+      rp.drawIndirect(this.args, 16);
+      rp.end();
+    }
     enc.clearBuffer(this.counters);
     enc.clearBuffer(this.requests, 0, 16);
     enc.clearBuffer(this.swDepthBuffer);
