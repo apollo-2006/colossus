@@ -267,7 +267,50 @@ void test_hierarchy(const char* name, const mesh& input) {
 
 }  // namespace
 
+// packed normal cones (packed_cluster) never cull what the exact cone keeps: the culling test
+// dot(v, axis) >= cutoff * |v| + r, for random cones and views.
+void test_packed_cones() {
+    std::printf("packed cones\n");
+    uint32_t seed = 1;
+    auto rand = [&] {
+        seed = seed * 1664525u + 1013904223u;
+        return float(seed >> 8) / float(1u << 24);
+    };
+    auto direction = [&] {
+        for (;;) {
+            const vec3 v(rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1);
+            if (length(v) > 0.1f && length(v) <= 1) return normalize(v);
+        }
+    };
+    const std::vector<page_bounds> shared = {{{0, 0, 0}, 1, 0}};
+    int wrong = 0, culled = 0;
+    for (int k = 0; k < 2000; ++k) {
+        gpu_cluster c{};
+        const vec3 axis = direction();
+        c.cone_axis[0] = axis.x;
+        c.cone_axis[1] = axis.y;
+        c.cone_axis[2] = axis.z;
+        c.cone_cutoff = rand() * 2 - 1;
+        c.creator = no_page;
+        c.vertex_count = c.triangle_count = 128;
+        const gpu_cluster u = unpack_cluster(pack_cluster(c), shared);
+        const vec3 packed_axis(u.cone_axis[0], u.cone_axis[1], u.cone_axis[2]);
+        for (int j = 0; j < 200; ++j) {
+            const vec3 v = direction() * (0.5f + rand() * 10);
+            const float r = rand() * 0.5f;
+            if (u.cone_cutoff < 1 && dot(v, packed_axis) >= u.cone_cutoff * length(v) + r) {
+                ++culled;
+                if (dot(v, axis) < c.cone_cutoff * length(v) + r) ++wrong;
+            }
+        }
+    }
+    std::printf("  %d views culled, %d of them wrongly\n", culled, wrong);
+    CHECK(culled > 0);
+    CHECK(wrong == 0);
+}
+
 int main() {
+    test_packed_cones();
     test_ply_and_obj();
     test_weld();
     test_clusters();
