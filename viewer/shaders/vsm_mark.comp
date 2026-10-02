@@ -28,10 +28,10 @@ void main() {
     }
     const uint level = vsm_level_for(t);
     const vec2 texel = vsm_light_space(origin + dir * t).xy / vsm_texel(level);
-    // the filter reads a texel either side and the lookup offsets a couple:
-    // mark three either way.
+    // the lookup offsets a couple of texels and searches vsm_max_penumbra around: mark that far.
+    const float reach = vsm_max_penumbra + 3.0;
     for (int k = 0; k < 4; ++k) {
-        const vec2 corner = texel + vec2(k & 1, k >> 1) * 6.0 - 3.0;
+        const vec2 corner = texel + vec2(k & 1, k >> 1) * (2.0 * reach) - reach;
         const ivec2 page = ivec2(floor(corner / float(vsm_page)));
         if (vsm_in_window(level, page)) vsm_entries[vsm_slot(level, page)].needed = frame.frame_index;
     }

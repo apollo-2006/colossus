@@ -68,7 +68,12 @@ vec2 to_pixel(vec3 world) {
 // silhouettes.
 float sunlight(uvec2 px, Surface s) {
     if ((frame.flags & flag_shadows) == 0u) return 1.0;
-    if ((frame.flags & flag_vsm) != 0u) return s.kind == surface_sky ? 1.0 : vsm_shadow(s.hit, s.n, s.t);
+    if ((frame.flags & flag_vsm) != 0u) {
+        // interleaved gradient noise, shifted per frame: taa averages the soft shadow taps.
+        const float noise = fract(52.9829189 * fract(dot(vec2(px) + float(frame.frame_index % 64u) * 5.588238,
+                                                         vec2(0.06711056, 0.00583715))));
+        return s.kind == surface_sky ? 1.0 : vsm_shadow(s.hit, s.n, s.t, noise);
+    }
 #ifdef RAY_QUERY
     if ((frame.flags & flag_full_res_shadows) != 0u) return trace_surface(s);
     const uvec2 size = shadow_size();
@@ -136,7 +141,7 @@ void main() {
         // shadow levels: each pixel's vsm level, dark in shadow; magenta where
         // no level had pages.
         uint used = vsm_levels;
-        const float lit = vsm_lookup(s.hit, s.n, s.t, used);
+        const float lit = vsm_lookup(s.hit, s.n, s.t, 0.0, used);
         color = used == vsm_levels ? vec3(1.0, 0.0, 1.0) : level_color(used * 2u) * (0.3 + 0.7 * lit);
     } else if (s.kind == surface_object) {
         const Instance inst = load_instance(s.vc.x);

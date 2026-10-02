@@ -175,38 +175,90 @@ bool vsm_touches(uint layer, uint level, vec2 center, float radius) {
     return false;
 }
 
-// sunlight at p (normal n, distance t) from the pages: 2x2 taps, bilinear
-// weights, at the pixel's level. offset along the normal and biased by a few
-// texels, covering both surfaces' lod error. a tap without a physical page
-// sends the lookup up a level.
-float vsm_lookup(vec3 p, vec3 n, float t, out uint used) {
+// soft shadows: contact hardening (pcss). the sun is drawn 1.5 degrees wide, wider than the real
+// 0.53, so penumbras show at statue scale.
+const float vsm_penumbra_per_unit = 0.0262;  // 2 tan(0.75 degrees): penumbra width per unit of gap
+const float vsm_max_penumbra = 12.0;         // texels, radius; marking covers it
+const uint vsm_search_taps = 6u, vsm_filter_taps = 8u;
+
+// stored depth at a texel (nearer layer), or false if its page has no physical page. taps mostly
+// share the centre's page: its physical page (cached_phys) skips the entry read.
+bool vsm_texel_depth(uint level, ivec2 at, ivec2 cached_page, uint cached_phys, out uint stored) {
+    const ivec2 page = at >> 7;
+    uint phys = cached_phys;
+    if (page != cached_page) {
+        if (!vsm_in_window(level, page)) return false;
+        const VsmEntry e = vsm_entries[vsm_slot(level, page)];
+        if (e.tag != vsm_tag(page)) return false;
+        phys = e.phys;
+    }
+    if (phys == vsm_none) return false;
+    const uvec2 in_page = uvec2(at & ivec2(int(vsm_page) - 1));
+    stored = vsm_atlas[vsm_atlas_index(phys, in_page, vsm_still)];
+    if ((frame.flags & flag_moving) != 0u) stored = max(stored, vsm_atlas[vsm_atlas_index(phys, in_page, vsm_moving)]);
+    return true;
+}
+
+// vogel disk point k of n, rotated by angle.
+vec2 vogel(uint k, uint n, float angle) {
+    const float r = sqrt((float(k) + 0.5) / float(n));
+    const float a = float(k) * 2.39996323 + angle;
+    return r * vec2(cos(a), sin(a));
+}
+
+// sunlight at p (normal n, distance t), 0 to 1, from the pages at the pixel's level. offset along
+// the normal and biased a couple of texels, covering both surfaces' lod error. a blocker search
+// sizes the penumbra from the gap to the average blocker; under a texel, 2x2 bilinear taps,
+// else vogel taps rotated by `noise` (taa averages them). a tap without a physical page sends
+// the lookup up a level.
+float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
     for (uint level = vsm_level_for(t); level < vsm_levels; ++level) {
         used = level;
         const float texel = vsm_texel(level);
         const vec3 lp = vsm_light_space(p + n * (2.0 * texel));
-        const vec2 f = lp.xy / texel - 0.5;
-        const ivec2 base = ivec2(floor(f));
-        const vec2 w = f - vec2(base);
-        float lit = 0.0;
+        const float receiver = lp.z + 1.5 * texel;
+        const vec2 centre = lp.xy / texel;
+        const float angle = noise * 6.2831853;
+        const ivec2 home = ivec2(floor(centre)) >> 7;
+        uint home_phys = vsm_none;
+        if (vsm_in_window(level, home)) {
+            const VsmEntry e = vsm_entries[vsm_slot(level, home)];
+            if (e.tag == vsm_tag(home)) home_phys = e.phys;
+        }
         bool complete = true;
-        for (int k = 0; k < 4 && complete; ++k) {
-            const ivec2 at = base + ivec2(k & 1, k >> 1);
-            const ivec2 page = at >> 7;
-            if (!vsm_in_window(level, page)) {
-                complete = false;
-                break;
+        float blockers = 0.0, count = 0.0;
+        const bool soft = (frame.flags & flag_soft_shadows) != 0u;
+        for (uint k = 0u; k < vsm_search_taps && complete && soft; ++k) {
+            uint stored;
+            complete = vsm_texel_depth(level, ivec2(floor(centre + vogel(k, vsm_search_taps, angle) * vsm_max_penumbra)), home, home_phys, stored);
+            if (complete && stored != 0u && vsm_unsortable(stored) > receiver) {
+                blockers += vsm_unsortable(stored);
+                count += 1.0;
             }
-            const VsmEntry e = vsm_entries[vsm_slot(level, page)];
-            if (e.phys == vsm_none || e.tag != vsm_tag(page)) {
-                complete = false;
-                break;
+        }
+        if (!complete) continue;
+        if (soft && count == 0.0) return 1.0;  // nothing nearby stands between it and the sun
+        const float penumbra = soft ? (blockers / count - lp.z) * vsm_penumbra_per_unit * 0.5 / texel : 0.0;
+        float lit = 0.0;
+        if (penumbra < 1.0) {
+            const vec2 f = centre - 0.5;
+            const ivec2 base = ivec2(floor(f));
+            const vec2 w = f - vec2(base);
+            for (int k = 0; k < 4 && complete; ++k) {
+                uint stored;
+                complete = vsm_texel_depth(level, base + ivec2(k & 1, k >> 1), home, home_phys, stored);
+                const bool open = stored == 0u || vsm_unsortable(stored) <= receiver;
+                const float weight = ((k & 1) != 0 ? w.x : 1.0 - w.x) * ((k >> 1) != 0 ? w.y : 1.0 - w.y);
+                lit += open ? weight : 0.0;
             }
-            const uvec2 in_page = uvec2(at & ivec2(int(vsm_page) - 1));
-            uint stored = vsm_atlas[vsm_atlas_index(e.phys, in_page, vsm_still)];
-            if ((frame.flags & flag_moving) != 0u) stored = max(stored, vsm_atlas[vsm_atlas_index(e.phys, in_page, vsm_moving)]);
-            const bool open = stored == 0u || vsm_unsortable(stored) <= lp.z + 1.5 * texel;
-            const float weight = ((k & 1) != 0 ? w.x : 1.0 - w.x) * ((k >> 1) != 0 ? w.y : 1.0 - w.y);
-            lit += open ? weight : 0.0;
+        } else {
+            const float radius = min(penumbra, vsm_max_penumbra);
+            for (uint k = 0u; k < vsm_filter_taps && complete; ++k) {
+                uint stored;
+                complete = vsm_texel_depth(level, ivec2(floor(centre + vogel(k, vsm_filter_taps, angle + 1.0) * radius)), home, home_phys, stored);
+                lit += stored == 0u || vsm_unsortable(stored) <= receiver ? 1.0 : 0.0;
+            }
+            lit /= float(vsm_filter_taps);
         }
         if (complete) return lit;
     }
@@ -214,7 +266,7 @@ float vsm_lookup(vec3 p, vec3 n, float t, out uint used) {
     return 1.0;
 }
 
-float vsm_shadow(vec3 p, vec3 n, float t) {
+float vsm_shadow(vec3 p, vec3 n, float t, float noise) {
     uint used;
-    return vsm_lookup(p, n, t, used);
+    return vsm_lookup(p, n, t, noise, used);
 }

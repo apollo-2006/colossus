@@ -198,7 +198,8 @@ constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wirefra
                    flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64, flag_full_res_shadows = 128, flag_taa = 256,
                    flag_moving = 512,  // some instances move: see animate() in common.glsl
                    flag_vsm = 1024,    // virtual shadow maps (vsm.glsl), not rays
-                   flag_ao = 2048;     // ambient occlusion (ao.comp)
+                   flag_ao = 2048,     // ambient occlusion (ao.comp)
+                   flag_soft_shadows = 4096;  // contact-hardening penumbras
 // ray traced shadows use the finest cut within each budget; far surfaces use coarser ones
 // (trace_surface() in surface.glsl).
 constexpr size_t shadow_budgets[] = {1u << 18, 1u << 15, 1u << 12};
@@ -1687,7 +1688,7 @@ struct view_state {
     bool frozen = false;
     float threshold = 1;
     uint32_t mode = 0;
-    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster | flag_shadows | flag_taa | flag_ao;
+    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster | flag_shadows | flag_taa | flag_ao | flag_soft_shadows;
     float sw_max_pixels = 32;
     float speed = 1.5f;
     bool looking = false;
@@ -1737,6 +1738,7 @@ void on_key(GLFWwindow* w, int key, int, int action, int) {
     if (key == GLFW_KEY_H) v->flags ^= flag_shadows;
     if (key == GLFW_KEY_X) v->flags ^= flag_taa;
     if (key == GLFW_KEY_G) v->flags ^= flag_ao;
+    if (key == GLFW_KEY_J) v->flags ^= flag_soft_shadows;
     if (key == GLFW_KEY_0) v->mode = 9;
     if (key == GLFW_KEY_T) v->flags ^= flag_wireframe;
     if (key == GLFW_KEY_P) v->print_camera = true;
@@ -1829,6 +1831,7 @@ options parse(int argc, char** argv) {
         } else if (a == "--vsm-pages") o.vsm_side = static_cast<uint32_t>(std::stoul(next()));
         else if (a == "--no-taa") o.disable |= flag_taa;
         else if (a == "--no-ao") o.disable |= flag_ao;
+        else if (a == "--hard-shadows") o.disable |= flag_soft_shadows;
         else if (a == "--full-res-shadows") o.full_res_shadows = true;
         else if (a == "--materials") o.mixed_materials = next() != "plain";
         else if (a == "--moving") o.moving = std::stof(next());
@@ -1964,8 +1967,8 @@ int main(int argc, char** argv) {
                         "      1-9, 0 view (shaded, clusters, triangles, lod level, groups, instances, holes, rasterizer,\n"
                         "      shadow levels, ambient occlusion)\n"
                         "      [ ] lod threshold, f freeze culling, c cone, v frustum, o occlusion culling,\n"
-                        "      r software rasterizer, h shadows, x antialiasing, g ambient occlusion, t wireframe,\n"
-                        "      p print camera\n");
+                        "      r software rasterizer, h shadows, j soft shadows, x antialiasing, g ambient occlusion,\n"
+                        "      t wireframe, p print camera\n");
 
             auto last = std::chrono::steady_clock::now();
             const auto start = last;
