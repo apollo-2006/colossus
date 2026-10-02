@@ -1509,7 +1509,7 @@ int main(int argc, char** argv) {
             renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch, opt.cull_only);
             std::vector<renderer::frame_result> results;
             const int total = opt.warmup + opt.frames;
-            int settled = -1;
+            int settled = 0;  // The frame after the last that asked for or waited on a page
             uint64_t streamed = 0;
             uint32_t evicted = 0, most_resident = 0;
             std::vector<double> service_ms;
@@ -1530,8 +1530,9 @@ int main(int argc, char** argv) {
                     std::printf("frame %d: requests %u, loaded %u (%.1f MB), waiting %u, resident %u, drawn %u clusters\n", i,
                                 res.streaming.requested, res.streaming.loaded, res.streaming.bytes_loaded / 1048576.0,
                                 res.streaming.waiting, res.streaming.resident, res.stats.clusters_drawn);
-                // Settled: nothing asked for or waiting.
-                if (settled < 0 && i > 2 && res.streaming.requested == 0 && res.streaming.waiting == 0) settled = i;
+                // Settled: nothing asked for or waiting from here on. (The first
+                // frames ask for nothing only because no requests are back yet.)
+                if (res.streaming.requested != 0 || res.streaming.waiting != 0) settled = i + 1;
                 if (res.valid && i >= opt.warmup + 2) results.push_back(res);
                 if (last && !opt.screenshot.empty()) {
                     png::write_rgb(opt.screenshot, opt.width, opt.height, r.read_pixels());
@@ -1541,7 +1542,7 @@ int main(int argc, char** argv) {
             vkDeviceWaitIdle(ctx.device);
             std::printf("streamed %.0f MB of %.0f MB on disk, evicted %u pages, at most %u resident; %s\n", streamed / 1048576.0,
                         sc.total_page_bytes / 1048576.0, evicted, most_resident,
-                        settled >= 0 ? ("settled after " + std::to_string(settled) + " frames").c_str() : "still streaming");
+                        settled < total ? ("settled after " + std::to_string(settled) + " frames").c_str() : "still streaming");
             std::sort(service_ms.begin(), service_ms.end());
             std::printf("render thread in the streamer: median %.3f ms, 99th percentile %.3f ms, worst %.3f ms (%s)\n",
                         service_ms[service_ms.size() / 2], service_ms[service_ms.size() * 99 / 100], service_ms.back(),
