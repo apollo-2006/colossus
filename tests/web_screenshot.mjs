@@ -26,11 +26,15 @@ for (let k = 0; k < args.length; k++) {
 }
 
 const types = { '.js': 'text/javascript', '.wgsl': 'text/plain', '.html': 'text/html', '.css': 'text/css', '.gz': 'application/gzip' };
+// files read once: a range request each read the whole 55 mb of pages again, a second of
+// queueing per page that github pages never shows.
+const files = new Map();
 const server = createServer((req, res) => {
   let path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
   if (path.endsWith('/')) path += 'index.html';
   try {
-    const body = readFileSync(join(root, path));
+    if (!files.has(path)) files.set(path, readFileSync(join(root, path)));
+    const body = files.get(path);
     const type = types[extname(path)] || 'application/octet-stream';
     // range requests, as github pages serves them: the demo streams pages.
     const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
