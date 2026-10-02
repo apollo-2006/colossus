@@ -23,6 +23,14 @@
 // for them are there to be drawn instead, and the GPU's test (lod_test()
 // in viewer/shaders/common.glsl) draws exactly one level along every path.
 // The roots (page 0 of each model) never leave.
+//
+// A request also says how far from good enough its cluster is: its error
+// on screen, against the threshold. Each level of the hierarchy roughly
+// halves the error, so a cluster at four times the threshold will need
+// two more levels; the streamer prefetches the finer pages below the one
+// asked for, at half the priority a level, while that stays over the
+// threshold, instead of waiting for each level to be drawn and ask in
+// turn.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -44,6 +52,7 @@ struct stream_page {
     uint32_t size;
     uint32_t dep_first, dep_count;  // Into the streamer's dependency list, global page numbers
     bool pinned;           // A root page: loaded first, never evicted
+    uint32_t child_first = 0, child_count = 0;  // Finer pages below it, in the streamer's child list
 };
 
 class streamer {
@@ -60,8 +69,9 @@ public:
 
     // loader_threads 0 reads pages on the calling thread, as they are
     // issued, and publishes them in the same frame.
-    streamer(std::vector<stream_page> pages, std::vector<uint32_t> deps, uint64_t pool_bytes, unsigned loader_threads = 2)
-        : pages_(std::move(pages)), deps_(std::move(deps)) {
+    streamer(std::vector<stream_page> pages, std::vector<uint32_t> deps, uint64_t pool_bytes, unsigned loader_threads = 2,
+             std::vector<uint32_t> children = {})
+        : pages_(std::move(pages)), deps_(std::move(deps)), children_(std::move(children)) {
         uint32_t largest = 16;
         for (const stream_page& p : pages_) largest = std::max(largest, p.size);
         slot_bytes_ = (largest + 4095) / 4096 * 4096;
@@ -108,7 +118,7 @@ public:
     // the pool to record before this frame's culling; table() is then this
     // frame's page table.
     std::vector<copy> service(uint32_t frame, std::vector<std::pair<uint32_t, float>> requests, uint8_t* staging,
-                              uint64_t staging_bytes) {
+                              uint64_t staging_bytes, float threshold = INFINITY) {
         frame_ = frame;
         stats_.loaded = stats_.evicted = 0;
         stats_.requested = static_cast<uint32_t>(requests.size());
@@ -117,6 +127,24 @@ public:
         uint64_t used = 0;
         publish(staging, staging_bytes, copies, used);
 
+        // Prefetch: the finer pages below each request, while their
+        // predicted error stays over the threshold.
+        if (!children_.empty()) {
+            for (size_t r = 0; r < requests.size() && requests.size() < 8 * max_prefetch; ++r) {
+                const auto [page, priority] = requests[r];
+                if (page >= pages_.size() || priority * 0.5f <= threshold) continue;
+                const stream_page& pg = pages_[page];
+                for (uint32_t k = 0; k < pg.child_count; ++k) requests.push_back({children_[pg.child_first + k], priority * 0.5f});
+            }
+            // Each page once, at its highest priority.
+            std::sort(requests.begin(), requests.end());
+            size_t w = 0;
+            for (size_t r = 0; r < requests.size(); ++r) {
+                if (w > 0 && requests[w - 1].first == requests[r].first) requests[w - 1].second = std::max(requests[w - 1].second, requests[r].second);
+                else requests[w++] = requests[r];
+            }
+            requests.resize(w);
+        }
         // Roots first, on the first frames.
         for (uint32_t p = 0; p < pages_.size(); ++p)
             if (pages_[p].pinned && slot_of_[p] == none) requests.push_back({p, INFINITY});
@@ -155,8 +183,9 @@ private:
         std::atomic<bool> done{false};
     };
 
+    static constexpr size_t max_prefetch = 4096;
     std::vector<stream_page> pages_;
-    std::vector<uint32_t> deps_;
+    std::vector<uint32_t> deps_, children_;
     uint64_t slot_bytes_ = 0;
     uint32_t slot_count_ = 0;
     std::vector<uint32_t> free_;

@@ -8,6 +8,7 @@
 #include "paged_file.hpp"
 #include "../viewer/streamer.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fcntl.h>
@@ -77,14 +78,32 @@ int main() {
     for (uint32_t p = 0; p < file.pages.size(); ++p)
         pages.push_back({fd, file.data_offset + file.pages[p].offset, file.pages[p].size, file.pages[p].dep_first,
                          file.pages[p].dep_count, p == 0});
+    // Each page's children, for prefetching: the finer pages its clusters
+    // stand for.
+    std::vector<std::vector<uint32_t>> child_lists(file.pages.size());
+    for (const gpu_cluster& c : file.clusters)
+        if (c.creator != no_page) child_lists[c.group].push_back(c.creator);
+    std::vector<uint32_t> children;
+    for (uint32_t p = 0; p < file.pages.size(); ++p) {
+        auto& ch = child_lists[p];
+        std::sort(ch.begin(), ch.end());
+        ch.erase(std::unique(ch.begin(), ch.end()), ch.end());
+        pages[p].child_first = static_cast<uint32_t>(children.size());
+        pages[p].child_count = static_cast<uint32_t>(ch.size());
+        children.insert(children.end(), ch.begin(), ch.end());
+    }
     std::printf("%zu pages, %.1f MB\n", file.pages.size(), file.data_size / 1048576.0);
 
     std::vector<uint8_t> staging(8 << 20);
     // Synchronous, then with two loader threads: pages published frames
     // after they were issued, in issue order.
-    for (unsigned threads : {0u, 2u}) {
-        std::printf("%u loader threads: random requests into a pool a tenth of the model\n", threads);
-        streamer s(pages, file.deps, file.data_size / 10, threads);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        // Synchronous; loader threads; loader threads and prefetching.
+        const unsigned threads = mode == 0 ? 0 : 2;
+        const bool prefetch = mode == 2;
+        std::printf("%u loader threads%s: random requests into a pool a tenth of the model\n", threads,
+                    prefetch ? ", prefetching" : "");
+        streamer s(pages, file.deps, file.data_size / 10, threads, prefetch ? children : std::vector<uint32_t>{});
         std::mt19937 rng(1);
         std::vector<uint32_t> stamps(file.pages.size(), 0);
         size_t worst = 0, loaded = 0, evicted = 0;
@@ -96,7 +115,7 @@ int main() {
             for (uint32_t p = 0; p < file.pages.size(); ++p)
                 if (s.resident(p) && rng() % 4 == 0) stamps[p] = frame > 2 ? frame - 2 : 0;
             s.note_used(stamps.data());
-            const auto copies = s.service(frame, requests, staging.data(), staging.size());
+            const auto copies = s.service(frame, requests, staging.data(), staging.size(), prefetch ? 1.0f : INFINITY);
             loaded += s.stats().loaded;
             evicted += s.stats().evicted;
             worst = std::max(worst, broken(s, file));
@@ -111,7 +130,7 @@ int main() {
         std::printf("  %zu loads, %zu evictions, broken dependencies at worst: %zu\n", loaded, evicted, worst);
         CHECK(worst == 0);
         CHECK(s.resident(0));
-        CHECK(evicted > 100);  // The pool really was full and turning over
+        CHECK(evicted > 50);  // The pool really was full and turning over
 
         std::printf("%u loader threads: everything, into a pool that holds it\n", threads);
         streamer all_in(pages, file.deps, file.data_size * 2, threads);

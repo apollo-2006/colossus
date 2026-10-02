@@ -163,6 +163,7 @@ struct options {
     bool cold = false;         // Drop the models from the OS's file cache first, so pages come off the disk
     bool mixed_materials = true;
     bool full_res_shadows = false;
+    bool prefetch = true;
 };
 
 struct camera {
@@ -207,6 +208,7 @@ struct scene {
     std::vector<gpu_cluster> clusters;  // Every model's, with page numbers made global
     std::vector<stream_page> pages;
     std::vector<uint32_t> deps;         // Global page numbers
+    std::vector<uint32_t> children;     // Global page numbers, for prefetching
     std::vector<int> files;
     std::vector<gpu_mesh> meshes;
     std::vector<gpu_instance> instances;
@@ -291,6 +293,19 @@ void make_scene(const options& opt, scene& s) {
             const page_info& pg = g.pages[p];
             s.pages.push_back({fd, g.data_offset + pg.offset, pg.size, pg.dep_first + dep_base, pg.dep_count, p == 0});
         }
+        // Each page's children: the finer pages its clusters stand for.
+        std::vector<std::vector<uint32_t>> children(g.pages.size());
+        for (const gpu_cluster& c : g.clusters)
+            if (c.creator != no_page) children[c.group].push_back(c.creator);
+        for (uint32_t p = 0; p < g.pages.size(); ++p) {
+            auto& ch = children[p];
+            std::sort(ch.begin(), ch.end());
+            ch.erase(std::unique(ch.begin(), ch.end()), ch.end());
+            stream_page& sp = s.pages[page_base + p];
+            sp.child_first = static_cast<uint32_t>(s.children.size());
+            sp.child_count = static_cast<uint32_t>(ch.size());
+            for (uint32_t c : ch) s.children.push_back(c + page_base);
+        }
 
         float shadow_error = 0;
         for (uint32_t lod = 0; lod < shadow_lods; ++lod) {
@@ -363,9 +378,9 @@ std::string human(double v) {
 class renderer {
 public:
     renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, uint64_t pool_bytes, uint64_t upload_bytes,
-             unsigned loader_threads, bool cull_only = false)
+             unsigned loader_threads, bool prefetch, bool cull_only = false)
         : ctx_(ctx), sc_(sc), cull_only_(cull_only), upload_bytes_(upload_bytes),
-          streamer_(sc.pages, sc.deps, pool_bytes, loader_threads) {
+          streamer_(sc.pages, sc.deps, pool_bytes, loader_threads, prefetch ? sc.children : std::vector<uint32_t>{}) {
         create_static_buffers();
         create_descriptors();
         create_pipelines();
@@ -506,7 +521,8 @@ public:
         const uint32_t frame_index = ++frame_counter_;
         const auto service_start = std::chrono::steady_clock::now();
         const std::vector<streamer::copy> uploads =
-            streamer_.service(frame_index, std::move(wanted), static_cast<uint8_t*>(f.staging.mapped), upload_bytes_);
+            streamer_.service(frame_index, std::move(wanted), static_cast<uint8_t*>(f.staging.mapped), upload_bytes_,
+                              frame_in.lod_threshold);
         result.streaming_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - service_start).count();
         const std::vector<uint32_t>& table = streamer_.table();
         std::memcpy(static_cast<uint8_t*>(f.staging.mapped) + upload_bytes_, table.data(), table.size() * 4);
@@ -1357,6 +1373,7 @@ options parse(int argc, char** argv) {
         else if (a == "--sync-loads") o.loader_threads = 0;
         else if (a == "--loader-threads") o.loader_threads = static_cast<unsigned>(std::stoul(next()));
         else if (a == "--cold") o.cold = true;
+        else if (a == "--no-prefetch") o.prefetch = false;
         else if (a == "--sw-pixels") o.sw_pixels = std::clamp(std::stof(next()), 0.0f, 64.0f);  // sw_raster.comp's 32-bit math holds to 64
         else if (a == "--cull-only") o.cull_only = true;
         else if (a == "--camera") {
@@ -1403,7 +1420,7 @@ int main(int argc, char** argv) {
         if (opt.headless) {
             vk::context ctx(nullptr, opt.validate);
             std::printf("GPU: %s\n", ctx.device_name.c_str());
-            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.cull_only);
+            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch, opt.cull_only);
             std::vector<renderer::frame_result> results;
             const int total = opt.warmup + opt.frames;
             int settled = -1;
@@ -1469,7 +1486,7 @@ int main(int argc, char** argv) {
             glfwGetFramebufferSize(window, &fw, &fh);
             swapchain swap(ctx, opt.vsync);
             swap.create(fw, fh);
-            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads);
+            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch);
             std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-8 view (shaded, clusters, triangles, LOD level, groups, instances, holes, rasterizer)\n"
                         "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling,\n"
