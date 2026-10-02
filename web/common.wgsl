@@ -152,19 +152,37 @@ fn to_world_dir(inst: Instance, v: vec3f) -> vec3f {
   return vec3f(dot(inst.rows[0].xyz, v), dot(inst.rows[1].xyz, v), dot(inst.rows[2].xyz, v));
 }
 
-// a vertex is two words: 14-bit offsets from the cluster's corner and an 11 +
-// 11 bit octahedral normal (include/paged_file.hpp).
+// a cluster's vertices and triangles, bit-packed (include/paged_file.hpp): a vertex is its offsets
+// from the cluster's corner in bx, by, bz bits and an 11 + 11 bit octahedral normal; a triangle
+// three ib-bit indices. the widths ride in the level word.
+fn cluster_level(c: Cluster) -> u32 { return c.level & 255u; }
+
+fn cluster_widths(c: Cluster) -> vec4u {  // bx, by, bz, ib
+  return (vec4u(c.level) >> vec4u(8u, 12u, 16u, 20u)) & vec4u(15u);
+}
+
+// `count` bits (at most 31) at a bit offset into the run starting at word `at`.
+fn read_bits(at: u32, bit: u32, count: u32) -> u32 {
+  let w = at + (bit >> 5u);
+  let s = bit & 31u;
+  var v = pool[w] >> s;
+  if (s + count > 32u) { v |= pool[w + 1u] << (32u - s); }
+  return v & ((1u << count) - 1u);
+}
+
 fn cluster_position(c: Cluster, grid: vec4f, k: u32) -> vec3f {
-  let at = page_table[c.group] + c.vertex_offset + 2u * k;
-  let w0 = pool[at];
-  let w1 = pool[at + 1u];
-  let d = vec3u(w0 & 0x3fffu, (w0 >> 14u) & 0x3fffu, (w0 >> 28u) | ((w1 & 0x3ffu) << 4u));
+  let b = cluster_widths(c);
+  let at = page_table[c.group] + c.vertex_offset;
+  let bit = k * (b.x + b.y + b.z + 22u);
+  let d = vec3u(read_bits(at, bit, b.x), read_bits(at, bit + b.x, b.y), read_bits(at, bit + b.x + b.y, b.z));
   return grid.xyz + grid.w * vec3f(vec3u(c.origin_x, c.origin_y, c.origin_z) + d);
 }
 
 fn cluster_normal(c: Cluster, k: u32) -> vec3f {
-  let w1 = pool[page_table[c.group] + c.vertex_offset + 2u * k + 1u];
-  let e = vec2f(f32((w1 >> 10u) & 2047u), f32(w1 >> 21u)) / 2047.0 * 2.0 - 1.0;
+  let b = cluster_widths(c);
+  let xyz = b.x + b.y + b.z;
+  let uv = read_bits(page_table[c.group] + c.vertex_offset, k * (xyz + 22u) + xyz, 22u);
+  let e = vec2f(f32(uv & 2047u), f32(uv >> 11u)) / 2047.0 * 2.0 - 1.0;
   var n = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
   if (n.z < 0.0) {
     n = vec3f((1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0), (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0), n.z);
@@ -172,14 +190,12 @@ fn cluster_normal(c: Cluster, k: u32) -> vec3f {
   return normalize(n);
 }
 
-// triangles: three packed bytes each.
+// triangle t as a | b << 8 | c << 16.
 fn cluster_triangle(c: Cluster, t: u32) -> u32 {
-  let byte = 3u * t;
-  let at = page_table[c.group] + c.triangle_offset + byte / 4u;
-  let shift = (byte % 4u) * 8u;
-  var v = pool[at] >> shift;
-  if (shift > 8u) { v |= pool[at + 1u] << (32u - shift); }
-  return v & 0xffffffu;
+  let ib = cluster_widths(c).w;
+  let mask = (1u << ib) - 1u;
+  let v = read_bits(page_table[c.group] + c.triangle_offset, t * 3u * ib, 3u * ib);
+  return (v & mask) | (((v >> ib) & mask) << 8u) | (((v >> (2u * ib)) & mask) << 16u);
 }
 
 fn sphere_in_frustum(c: vec3f, r: f32) -> bool {

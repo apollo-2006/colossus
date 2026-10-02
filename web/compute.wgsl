@@ -866,7 +866,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     switch (frame.debug_mode) {
       case 1u: { m.albedo = hash_color(vc.y * 7919u + vc.x * 104729u); }
       case 2u: { m.albedo = hash_color(id * 2654435761u + vc.x + select(0u, 0x9e3779b9u, software)); }
-      case 3u: { m.albedo = level_color(c.level); }
+      case 3u: { m.albedo = level_color(cluster_level(c)); }
       case 4u: { m.albedo = hash_color(c.group + vc.x * 104729u); }
       case 5u: { m.albedo = hash_color(vc.x); }
       case 6u: { m.albedo = select(vec3f(0.15, 0.45, 0.95), vec3f(0.95, 0.45, 0.1), software); }

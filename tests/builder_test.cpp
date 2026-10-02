@@ -238,13 +238,12 @@ void test_hierarchy(const char* name, const mesh& input) {
         const uint32_t* base = &back.data[back.pages[pc.group].offset / 4];
         for (uint32_t k = 0; k < c.vertex_count; ++k) {
             const uint32_t v = g.cluster_vertices[c.vertex_offset + k];
-            const uint32_t* w = base + pc.vertex_offset + 2 * k;
-            const vec3 p = decode_position(back, pc, w);
+            const vec3 p = decode_position(back, pc, base, k);
             const vec3 original(g.positions[3 * v], g.positions[3 * v + 1], g.positions[3 * v + 2]);
             worst_position = std::max(worst_position, length(p - original));
             auto [it, added] = seen.emplace(v, p);
             if (!added) mismatched += std::memcmp(&it->second, &p, sizeof p) != 0;
-            const vec3 n = decode_normal(w);
+            const vec3 n = decode_normal(pc, base, k);
             worst_normal = std::min(worst_normal, dot(n, vec3(g.normals[3 * v], g.normals[3 * v + 1], g.normals[3 * v + 2])));
         }
         for (uint32_t t = 0; t < c.triangle_count; ++t) wrong += decode_triangle(pc, base, t) != g.cluster_triangles[c.triangle_offset + t];

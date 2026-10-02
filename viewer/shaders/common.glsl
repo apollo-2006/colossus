@@ -120,31 +120,45 @@ layout(set = 0, binding = 5, scalar) buffer Requests {
 };
 layout(set = 0, binding = 19, scalar) buffer RequestStamp { uint request_stamp[]; };
 
-// a cluster's vertices and triangles from its page at `base`. a vertex is two
-// words: 14-bit offsets from the cluster's corner, and an 11 + 11 bit
-// octahedral normal (include/paged_file.hpp).
+// a cluster's vertices and triangles from its page at `base`, bit-packed (include/paged_file.hpp):
+// a vertex is its offsets from the cluster's corner in bx, by, bz bits and an 11 + 11 bit
+// octahedral normal; a triangle three ib-bit indices. the widths ride in the level word.
+uint cluster_level(Cluster c) { return c.level & 255u; }
+
+uvec4 cluster_widths(Cluster c) {  // bx, by, bz, ib
+    return (uvec4(c.level) >> uvec4(8, 12, 16, 20)) & 15u;
+}
+
+// `count` bits (at most 32) at a bit offset into the run starting at word `at`.
+uint read_bits(uint at, uint bit, uint count) {
+    const uint w = at + (bit >> 5), s = bit & 31u;
+    uint v = pool[w] >> s;
+    if (s + count > 32u) v |= pool[w + 1u] << (32u - s);
+    return count >= 32u ? v : v & ((1u << count) - 1u);
+}
+
 vec3 cluster_position(uint base, Cluster c, vec4 grid, uint k) {
-    const uint at = base + c.vertex_offset + 2u * k;
-    const uint w0 = pool[at], w1 = pool[at + 1u];
-    const uvec3 d = uvec3(w0 & 0x3fffu, (w0 >> 14) & 0x3fffu, (w0 >> 28) | ((w1 & 0x3ffu) << 4));
+    const uvec4 b = cluster_widths(c);
+    const uint at = base + c.vertex_offset, bit = k * (b.x + b.y + b.z + 22u);
+    const uvec3 d = uvec3(read_bits(at, bit, b.x), read_bits(at, bit + b.x, b.y), read_bits(at, bit + b.x + b.y, b.z));
     return grid.xyz + grid.w * vec3(c.origin + d);
 }
 
 vec3 cluster_normal(uint base, Cluster c, uint k) {
-    const uint w1 = pool[base + c.vertex_offset + 2u * k + 1u];
-    const vec2 e = vec2(float((w1 >> 10) & 2047u), float(w1 >> 21)) / 2047.0 * 2.0 - 1.0;
+    const uvec4 b = cluster_widths(c);
+    const uint xyz = b.x + b.y + b.z;
+    const uint uv = read_bits(base + c.vertex_offset, k * (xyz + 22u) + xyz, 22u);
+    const vec2 e = vec2(float(uv & 2047u), float(uv >> 11)) / 2047.0 * 2.0 - 1.0;
     vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
     if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
     return normalize(n);
 }
 
-// triangles are three packed bytes: the start word, and the next if it runs
-// over.
+// triangle t as a | b << 8 | c << 16.
 uint cluster_triangle(uint base, Cluster c, uint t) {
-    const uint byte = 3u * t, at = base + c.triangle_offset + byte / 4u, shift = (byte % 4u) * 8u;
-    uint v = pool[at] >> shift;
-    if (shift > 8u) v |= pool[at + 1u] << (32u - shift);
-    return v & 0xffffffu;
+    const uint ib = cluster_widths(c).w, mask = (1u << ib) - 1u;
+    const uint v = read_bits(base + c.triangle_offset, t * 3u * ib, 3u * ib);
+    return (v & mask) | ((v >> ib) & mask) << 8 | ((v >> (2u * ib)) & mask) << 16;
 }
 layout(set = 0, binding = 6, scalar) readonly buffer Meshes { Mesh meshes[]; };
 layout(set = 0, binding = 7, scalar) readonly buffer Instances { Instance instances[]; };

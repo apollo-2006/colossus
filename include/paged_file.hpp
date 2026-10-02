@@ -2,16 +2,18 @@
 // the hierarchy as shipped and streamed (.cgeo): clusters' bounds and errors
 // always resident, geometry in pages, one per group, loaded on demand.
 //
-// a page holds its clusters' vertices then triangles (three bytes each), packed
-// end to end, each cluster padded to a word. shared vertices are stored per
-// cluster: more space, but a cluster reads only its page.
+// a page holds its clusters' vertices then triangles, bit-packed, each cluster's
+// two runs starting on a word. shared vertices are stored per cluster: more
+// space, but a cluster reads only its page.
 //
-// a vertex is two words: position snapped to a grid over the model (step a
-// 16382nd of the largest cluster's side) as three 14-bit offsets from the
-// cluster's corner, and an octahedral normal, 11 + 11 bits:
+// positions snap to a grid over the model (step a 16382nd of the largest
+// cluster's side), stored as offsets from the cluster's corner in just the bits
+// its extent needs per axis (bx, by, bz, up to 14). normals are octahedral,
+// 11 + 11 bits. a vertex is x (bx) | y (by) | z (bz) | u (11) | v (11), lowest
+// bits first; a triangle three indices of ib bits, ib enough for the vertex
+// count. the widths ride in the cluster's level word (cluster_level()):
 //
-//   word 0: x (14) | y (14) << 14 | low 4 bits of z << 28
-//   word 1: high 10 bits of z | u (11) << 10 | v (11) << 21
+//   level (8) | bx (4) << 8 | by (4) << 12 | bz (4) << 16 | ib (4) << 20
 //
 // shared vertices snap to the same grid point in each cluster: no cracks.
 //
@@ -61,8 +63,10 @@ void save_paged(const paged_geometry& p, const std::string& path);
 // reads a .cgeo; page data only if with_data.
 paged_geometry load_paged(const std::string& path, bool with_data);
 
-// a cluster vertex from its two words.
-vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* vertex);
+// a paged cluster's level, its widths masked off.
+inline uint32_t cluster_level(const gpu_cluster& c) { return c.level & 0xff; }
+// vertex k of a cluster, from its page's words.
+vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* page, uint32_t k);
+vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k);
 // triangle t of a cluster (a | b << 8 | c << 16) from its page.
 uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t);
-vec3 decode_normal(const uint32_t* vertex);
