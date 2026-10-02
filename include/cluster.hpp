@@ -13,19 +13,18 @@ constexpr uint32_t cluster_max_vertices = 128;
 // at most cluster_max_triangles triangles using at most cluster_max_vertices
 // distinct vertices. Each cluster is a list of triangle numbers.
 //
-// Clusters grow greedily from a seed: the next triangle is the one touching
-// the cluster that adds the fewest new vertices, stays nearest the
-// cluster's center, and has the fewest unused neighbours (so notches that
-// would become islands are taken first). Taking triangles that close a gap
-// first keeps the outline short, which matters twice over: fewer shared
-// vertices per triangle, and fewer locked edges when the LOD builder
-// simplifies a group of clusters. Each new cluster starts on the last
-// one's frontier, at its most hemmed-in triangle. Large inputs are first
-// cut in half along their longest axis until each piece is small, and the
-// pieces are clustered in parallel.
+// Each piece of the mesh is cut in two, again and again, along its
+// triangle graph (triangles joined across edges): every triangle goes to
+// whichever of two far-apart seed triangles it is fewer steps from, the cut
+// falling at a whole number of clusters, and a few passes of swaps then
+// shorten the cut. So every cluster but one per piece is full, and both
+// halves of every cut are compact. Large inputs are first cut in half
+// along their longest axis until each piece is small, and the pieces are
+// clustered in parallel.
 //
-// On the XYZ RGB dragon this fills clusters to 108 triangles on average
-// (Morton-order seeds alone: 90). About 8% are still pockets of under 16
-// triangles walled in by full clusters; swapping triangles between
-// neighbours, or a real graph partitioner, would take those too.
+// This replaced greedy growth (each cluster taking the neighbouring
+// triangle that added the fewest vertices), which filled clusters to 108
+// triangles on average on the XYZ RGB dragon and left 8% of them as
+// pockets of a few triangles walled in by full ones. Bisection fills all
+// of them, 20% fewer clusters, and the hierarchy above ends in one root.
 std::vector<std::vector<uint32_t>> clusterize(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices);

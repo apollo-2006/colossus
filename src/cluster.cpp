@@ -9,24 +9,16 @@ namespace {
 
 constexpr size_t leaf_triangles = 8192;
 
-// Spreads the low 10 bits of v out to every third bit.
-uint32_t spread_bits(uint32_t v) {
-    v &= 1023;
-    v = (v | (v << 16)) & 0x030000FF;
-    v = (v | (v << 8)) & 0x0300F00F;
-    v = (v | (v << 4)) & 0x030C30C3;
-    v = (v | (v << 2)) & 0x09249249;
-    return v;
-}
-
-// Clusters one piece: tris are triangle numbers into indices.
-std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                                                    const std::vector<uint32_t>& tris) {
+// Recursive bisection of the piece's triangle graph (triangles joined
+// across edges): each split grows one half by breadth-first search from a
+// far-off triangle until it holds a whole number of clusters' worth, and
+// the rest is the other half. Halves grown that way are compact (balls in
+// the graph), and every cluster but one per piece comes out full.
+std::vector<std::vector<uint32_t>> bisect_piece(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
+                                                const std::vector<uint32_t>& tris) {
     const size_t n = tris.size();
     std::vector<std::vector<uint32_t>> out;
     if (n == 0) return out;
-
-    // Local vertex numbers, and for each vertex the triangles using it.
     std::vector<uint32_t> verts;
     verts.reserve(3 * n);
     for (uint32_t t : tris)
@@ -34,7 +26,7 @@ std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& pos
     std::sort(verts.begin(), verts.end());
     verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
     const size_t nv = verts.size();
-    std::vector<uint32_t> corner(3 * n);  // Local vertex of each corner
+    std::vector<uint32_t> corner(3 * n);
     for (size_t i = 0; i < n; ++i)
         for (int c = 0; c < 3; ++c)
             corner[3 * i + c] = static_cast<uint32_t>(std::lower_bound(verts.begin(), verts.end(), indices[3 * tris[i] + c]) - verts.begin());
@@ -45,38 +37,8 @@ std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& pos
         std::vector<uint32_t> fill(adj_start.begin(), adj_start.end() - 1);
         for (size_t i = 0; i < 3 * n; ++i) adj[fill[corner[i]]++] = static_cast<uint32_t>(i / 3);
     }
-
-    std::vector<vec3> centroid(n);
-    vec3 lo = positions[verts[0]], hi = lo;
-    double area = 0;
-    for (size_t i = 0; i < n; ++i) {
-        const vec3 a = positions[verts[corner[3 * i]]], b = positions[verts[corner[3 * i + 1]]], c = positions[verts[corner[3 * i + 2]]];
-        centroid[i] = (a + b + c) * (1.0f / 3);
-        lo = min(lo, centroid[i]);
-        hi = max(hi, centroid[i]);
-        area += 0.5 * length(cross(b - a, c - a));
-    }
-    // The radius a full cluster would have if it were a disc: the scale
-    // distances are measured against.
-    const float expected_radius = std::max(1e-12f, static_cast<float>(std::sqrt(area / n * cluster_max_triangles / M_PI)));
-
-    // Seeds are taken in Morton order, so each new cluster starts next to
-    // the last one and the leftover holes stay few.
-    std::vector<uint32_t> order(n);
-    {
-        std::vector<uint32_t> code(n);
-        const vec3 size = max(hi - lo, vec3(1e-30f, 1e-30f, 1e-30f));
-        for (size_t i = 0; i < n; ++i) {
-            const vec3 q = centroid[i] - lo;
-            code[i] = spread_bits(static_cast<uint32_t>(q.x / size.x * 1023)) |
-                      (spread_bits(static_cast<uint32_t>(q.y / size.y * 1023)) << 1) |
-                      (spread_bits(static_cast<uint32_t>(q.z / size.z * 1023)) << 2);
-        }
-        for (size_t i = 0; i < n; ++i) order[i] = static_cast<uint32_t>(i);
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return code[a] < code[b]; });
-    }
-
-    // Each triangle's neighbours across its three edges.
+    // Neighbours across edges, and across vertices as a fallback for
+    // pieces of surface that only touch at a point.
     std::vector<uint32_t> neighbour(3 * n, UINT32_MAX);
     for (size_t i = 0; i < n; ++i)
         for (int e = 0; e < 3; ++e) {
@@ -91,97 +53,183 @@ std::vector<std::vector<uint32_t>> clusterize_piece(const std::vector<vec3>& pos
                 }
             }
         }
+    std::vector<vec3> centroid(n);
+    for (size_t i = 0; i < n; ++i)
+        centroid[i] = (positions[verts[corner[3 * i]]] + positions[verts[corner[3 * i + 1]]] + positions[verts[corner[3 * i + 2]]]) *
+                      (1.0f / 3);
 
-    std::vector<char> used(n, 0);
-    // Unused triangles across a triangle's edges. A triangle with none left
-    // is an island if this cluster does not take it, so the fewer it has,
-    // the sooner it is taken: clusters fill their notches, and the next
-    // cluster starts in the corner the last one left.
-    auto open_sides = [&](uint32_t t) {
-        uint32_t k = 0;
-        for (int e = 0; e < 3; ++e) k += neighbour[3 * t + e] != UINT32_MAX && !used[neighbour[3 * t + e]];
-        return k;
-    };
-    std::vector<uint32_t> in_cluster(nv, UINT32_MAX);  // Cluster number a vertex was last added to
-    std::vector<uint32_t> candidate_stamp(n, UINT32_MAX);
-    std::vector<uint32_t> candidates;
-    size_t seed_cursor = 0;
-    uint32_t cluster_id = 0;
-    uint32_t next_seed = UINT32_MAX;
-
-    for (size_t done = 0; done < n; ++cluster_id) {
-        uint32_t seed = next_seed;
-        if (seed == UINT32_MAX || used[seed]) {
-            while (used[order[seed_cursor]]) ++seed_cursor;
-            seed = order[seed_cursor];
-        }
-        std::vector<uint32_t> members;
-        uint32_t vertex_count = 0;
-        vec3 sum(0, 0, 0);
-        candidates.clear();
-
-        auto add = [&](uint32_t t) {
-            used[t] = 1;
-            ++done;
-            members.push_back(t);
-            sum += centroid[t];
+    std::vector<uint32_t> member(n, UINT32_MAX), seen(n, UINT32_MAX), vertex_stamp(nv, UINT32_MAX);
+    uint32_t stamp = 0;
+    // Breadth-first order of `set` from `seed`; pieces the search cannot
+    // reach are taken up nearest the seed first.
+    auto bfs = [&](const std::vector<uint32_t>& set, uint32_t set_id, uint32_t seed, std::vector<uint32_t>& order) {
+        ++stamp;
+        order.clear();
+        size_t head = 0;
+        std::vector<uint32_t> rest;  // Unreached members, by distance, for when the search runs dry
+        bool rest_sorted = false;
+        size_t rest_next = 0;
+        auto push = [&](uint32_t t) {
+            if (member[t] == set_id && seen[t] != stamp) {
+                seen[t] = stamp;
+                order.push_back(t);
+            }
+        };
+        push(seed);
+        while (order.size() < set.size()) {
+            if (head == order.size()) {
+                if (!rest_sorted) {
+                    rest = set;
+                    const vec3 c = centroid[seed];
+                    std::sort(rest.begin(), rest.end(),
+                              [&](uint32_t a, uint32_t b) { return length(centroid[a] - c) < length(centroid[b] - c); });
+                    rest_sorted = true;
+                }
+                while (seen[rest[rest_next]] == stamp) ++rest_next;
+                push(rest[rest_next]);
+            }
+            const uint32_t t = order[head++];
+            for (int e = 0; e < 3; ++e)
+                if (neighbour[3 * t + e] != UINT32_MAX) push(neighbour[3 * t + e]);
             for (int c = 0; c < 3; ++c) {
                 const uint32_t v = corner[3 * t + c];
-                if (in_cluster[v] != cluster_id) {
-                    in_cluster[v] = cluster_id;
-                    ++vertex_count;
+                for (uint32_t k = adj_start[v]; k < adj_start[v + 1]; ++k) push(adj[k]);
+            }
+        }
+    };
+    auto vertex_count = [&](const std::vector<uint32_t>& set) {
+        ++stamp;
+        uint32_t count = 0;
+        for (uint32_t t : set)
+            for (int c = 0; c < 3; ++c)
+                if (vertex_stamp[corner[3 * t + c]] != stamp) {
+                    vertex_stamp[corner[3 * t + c]] = stamp;
+                    ++count;
                 }
-                for (uint32_t k = adj_start[v]; k < adj_start[v + 1]; ++k) {
-                    const uint32_t u = adj[k];
-                    if (!used[u] && candidate_stamp[u] != cluster_id) {
-                        candidate_stamp[u] = cluster_id;
-                        candidates.push_back(u);
+        return count;
+    };
+
+    uint32_t next_id = 0;
+    std::vector<uint32_t> order, far_order, level_a, level_b;
+    std::vector<std::vector<uint32_t>> stack(1);
+    for (uint32_t i = 0; i < n; ++i) stack[0].push_back(i);
+    while (!stack.empty()) {
+        std::vector<uint32_t> set = std::move(stack.back());
+        stack.pop_back();
+        if (set.size() <= cluster_max_triangles && vertex_count(set) <= cluster_max_vertices) {
+            for (uint32_t& t : set) t = tris[t];
+            out.push_back(std::move(set));
+            continue;
+        }
+        const uint32_t id = next_id++;
+        for (uint32_t t : set) member[t] = id;
+        // Two far-apart seeds: the last triangle a search from any member
+        // reaches, and the last one a search from there reaches. Each
+        // triangle leans to the seed it is fewer steps from; the halves are
+        // cut at a whole number of clusters along that lean, which keeps
+        // both of them compact. (Growing one half from one seed and taking
+        // the rest as the other half left the rest ragged, and its
+        // clusters simplified badly: coarse levels came out with ten times
+        // the error.)
+        bfs(set, id, set[0], far_order);
+        const uint32_t a = far_order.back();
+        bfs(set, id, a, order);
+        const uint32_t b = order.back();
+        // Steps from a seed: breadth-first, across edges, then across
+        // shared vertices, a level each; a triangle the search cannot
+        // reach is a level past the last one reached.
+        auto levels = [&](uint32_t seed, std::vector<uint32_t>& level) {
+            ++stamp;
+            std::vector<uint32_t> queue;
+            queue.reserve(set.size());
+            auto reach = [&](uint32_t t, uint32_t l) {
+                if (member[t] == id && seen[t] != stamp) {
+                    seen[t] = stamp;
+                    level[t] = l;
+                    queue.push_back(t);
+                }
+            };
+            reach(seed, 0);
+            size_t head = 0, unreached = 0;
+            std::vector<uint32_t> rest;
+            while (queue.size() < set.size()) {
+                if (head == queue.size()) {
+                    if (rest.empty()) {
+                        rest = set;
+                        const vec3 c = centroid[seed];
+                        std::sort(rest.begin(), rest.end(),
+                                  [&](uint32_t x, uint32_t y) { return length(centroid[x] - c) < length(centroid[y] - c); });
                     }
+                    while (seen[rest[unreached]] == stamp) ++unreached;
+                    reach(rest[unreached], level[queue.back()] + 1);
+                }
+                const uint32_t t = queue[head++];
+                for (int e = 0; e < 3; ++e)
+                    if (neighbour[3 * t + e] != UINT32_MAX) reach(neighbour[3 * t + e], level[t] + 1);
+                for (int c = 0; c < 3; ++c) {
+                    const uint32_t v = corner[3 * t + c];
+                    for (uint32_t k = adj_start[v]; k < adj_start[v + 1]; ++k) reach(adj[k], level[t] + 2);
                 }
             }
         };
-        add(seed);
-
-        while (members.size() < cluster_max_triangles) {
-            const vec3 center = sum * (1.0f / members.size());
-            float best_score = INFINITY;
-            size_t best = SIZE_MAX;
-            for (size_t k = 0; k < candidates.size();) {
-                const uint32_t t = candidates[k];
-                if (used[t]) {
-                    candidates[k] = candidates.back();
-                    candidates.pop_back();
-                    continue;
-                }
-                uint32_t fresh = 0;
-                for (int c = 0; c < 3; ++c) fresh += in_cluster[corner[3 * t + c]] != cluster_id;
-                if (vertex_count + fresh <= cluster_max_vertices) {
-                    const float score = static_cast<float>(fresh) + 2 * length(centroid[t] - center) / expected_radius +
-                                        0.75f * static_cast<float>(open_sides(t));
-                    if (score < best_score) { best_score = score; best = k; }
-                }
-                ++k;
-            }
-            if (best == SIZE_MAX) break;  // Nothing touches the cluster that still fits
-            const uint32_t t = candidates[best];
-            candidates[best] = candidates.back();
-            candidates.pop_back();
-            add(t);
+        if (level_a.size() < n) {
+            level_a.resize(n);
+            level_b.resize(n);
         }
-        // The next cluster starts on this one's frontier, at its most
-        // hemmed-in triangle.
-        next_seed = UINT32_MAX;
-        uint32_t fewest = UINT32_MAX;
-        for (uint32_t t : candidates)
-            if (!used[t] && open_sides(t) < fewest) {
-                fewest = open_sides(t);
-                next_seed = t;
+        levels(a, level_a);
+        levels(b, level_b);
+        const vec3 ca = centroid[a], cb = centroid[b];
+        auto lean = [&](uint32_t t) {
+            return float(int(level_a[t]) - int(level_b[t])) + 1e-3f * (length(centroid[t] - ca) - length(centroid[t] - cb));
+        };
+        order = set;
+        const size_t whole = (set.size() + cluster_max_triangles - 1) / cluster_max_triangles;
+        // Split so both halves hold whole clusters; a set that is one
+        // cluster too many vertices is halved.
+        const size_t left = whole >= 2 ? whole / 2 * cluster_max_triangles : set.size() / 2;
+        std::nth_element(order.begin(), order.begin() + left, order.end(), [&](uint32_t x, uint32_t y) { return lean(x) < lean(y); });
+        // Smooth the cut: a triangle with more edge neighbours on the other
+        // side changes sides, paired with one that wants to go the other
+        // way, so the sizes hold. A few passes shorten the outline, and a
+        // shorter outline locks fewer edges when groups are simplified.
+        {
+            const uint32_t left_id = next_id++;
+            for (size_t i = 0; i < left; ++i) member[order[i]] = left_id;
+            auto pull = [&](uint32_t t, uint32_t side) {  // Edge neighbours on `side` minus on the other
+                int d = 0;
+                for (int e = 0; e < 3; ++e) {
+                    const uint32_t u = neighbour[3 * t + e];
+                    if (u == UINT32_MAX) continue;
+                    if (member[u] == side) ++d;
+                    else if (member[u] == (side == left_id ? id : left_id)) --d;
+                }
+                return d;
+            };
+            for (int pass = 0; pass < 4; ++pass) {
+                std::vector<uint32_t> to_right, to_left;
+                for (size_t i = 0; i < order.size(); ++i) {
+                    const uint32_t t = order[i];
+                    if (member[t] == left_id && pull(t, id) > 0) to_right.push_back(t);
+                    else if (member[t] == id && pull(t, left_id) > 0) to_left.push_back(t);
+                }
+                const size_t swaps = std::min(to_right.size(), to_left.size());
+                if (swaps == 0) break;
+                for (size_t k = 0; k < swaps; ++k) {
+                    member[to_right[k]] = id;
+                    member[to_left[k]] = left_id;
+                }
             }
-        out.push_back(std::move(members));
+            size_t l = 0;
+            std::vector<uint32_t> right_part;
+            for (uint32_t t : order) {
+                if (member[t] == left_id) order[l++] = t;
+                else right_part.push_back(t);
+            }
+            std::copy(right_part.begin(), right_part.end(), order.begin() + l);
+        }
+        stack.emplace_back(order.begin() + left, order.end());
+        stack.emplace_back(order.begin(), order.begin() + left);
     }
-
-    for (auto& c : out)
-        for (uint32_t& t : c) t = tris[t];
     return out;
 }
 
@@ -220,7 +268,7 @@ std::vector<std::vector<uint32_t>> clusterize(const std::vector<vec3>& positions
     }
 
     std::vector<std::vector<std::vector<uint32_t>>> results(pieces.size());
-    parallel_for(pieces.size(), [&](size_t i) { results[i] = clusterize_piece(positions, indices, pieces[i]); });
+    parallel_for(pieces.size(), [&](size_t i) { results[i] = bisect_piece(positions, indices, pieces[i]); });
     std::vector<std::vector<uint32_t>> out;
     for (auto& r : results)
         for (auto& c : r) out.push_back(std::move(c));
