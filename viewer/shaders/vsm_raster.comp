@@ -4,9 +4,9 @@
 // triangle. texels of the cluster's level, snapped to 1/16, edges from each
 // triangle's corner; triangles over 1024 texels would overflow and are dropped
 // (none come near). the walk is clipped to the level's rendered pages and skips
-// pages not rendering. a triangle over 32x32 texels after clipping (coarse
-// stand-ins at fine levels) is drawn by the whole workgroup instead, a texel an
-// invocation. depth by atomic max, nearest the sun wins. both sides drawn.
+// pages not rendering. a triangle over 64 texels after clipping is drawn by the
+// whole workgroup instead, a texel an invocation. depth by atomic max, nearest
+// the sun wins. sun facing triangles only.
 #include "common.glsl"
 #include "vsm.glsl"
 
@@ -51,13 +51,11 @@ bool setup(uint packed, uint level, uint layer, out Tri tri) {
     tri.a -= origin;
     tri.b -= origin;
     tri.d -= origin;
+    // sun facing only (counterclockwise seen from the sun): a closed surface's far side is never
+    // nearer the sun, and shading leaves faces turned away dark anyway. through a scan's holes
+    // this lets a little light in.
     tri.area = edge(tri.a, tri.b, tri.d);
-    if (tri.area == 0) return false;
-    if (tri.area < 0) {
-        const ivec2 t = tri.b; tri.b = tri.d; tri.d = t;
-        const float z = tri.zb; tri.zb = tri.zd; tri.zd = z;
-        tri.area = -tri.area;
-    }
+    if (tri.area <= 0) return false;
     // the box, clipped to the pages rendering at this level.
     const ivec4 rect = vsm_rendered(layer, level);
     tri.start = max(tri.lo_abs, rect.xy * int(vsm_page)) - tri.lo_abs;
@@ -172,7 +170,7 @@ void main() {
     Tri tri;
     if (t < c.triangle_count && setup(cluster_triangle(page_table[c.group], c, t), level, layer, tri)) {
         const ivec2 size = tri.hi - tri.start + 1;
-        if (size.x * size.y > 1024) together[atomicAdd(together_count, 1u)] = t;
+        if (size.x * size.y > 64) together[atomicAdd(together_count, 1u)] = t;
         else walk(tri, level, layer);
     }
     barrier();
