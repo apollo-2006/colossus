@@ -670,19 +670,21 @@ const FILTER_TAPS = 6u;
 
 // stored depth at a texel (nearer layer); false without a physical page. taps mostly share the
 // centre's page, whose physical page (home_phys) skips the entry read.
-fn texel_depth(level: u32, at: vec2i, home: vec2i, home_phys: u32, stored: ptr<function, u32>) -> bool {
+fn texel_depth(level: u32, at: vec2i, home: vec2i, home_phys: u32, home_flags: u32, stored: ptr<function, u32>) -> bool {
   let page = at >> vec2u(7u);
   var phys = home_phys;
+  var flags = home_flags;
   if (any(page != home)) {
     if (!vsm_in_window(level, page)) { return false; }
     let slot = vsm_slot(level, page);
     if (vsm_entries[4u * slot] != vsm_tag(page)) { return false; }
     phys = vsm_entries[4u * slot + 1u];
+    flags = vsm_entries[4u * slot + 3u];
   }
   if (phys == VSM_NONE) { return false; }
   let in_page = vec2u(at & vec2i(i32(VSM_PAGE) - 1));
   var s = vsm_atlas[vsm_atlas_index(phys, in_page, VSM_STILL)];
-  if ((frame.flags & FLAG_MOVING) != 0u) { s = max(s, vsm_atlas[vsm_atlas_index(phys, in_page, VSM_MOVING)]); }
+  if ((flags & VSM_HAS_MOVING) != 0u) { s = max(s, vsm_atlas[vsm_atlas_index(phys, in_page, VSM_MOVING)]); }
   *stored = s;
   return true;
 }
@@ -713,9 +715,13 @@ fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
     let angle = noise * 6.2831853;
     let home = vec2i(floor(centre)) >> vec2u(7u);
     var home_phys = VSM_NONE;
+    var home_flags = 0u;
     if (vsm_in_window(level, home)) {
       let slot = vsm_slot(level, home);
-      if (vsm_entries[4u * slot] == vsm_tag(home)) { home_phys = vsm_entries[4u * slot + 1u]; }
+      if (vsm_entries[4u * slot] == vsm_tag(home)) {
+        home_phys = vsm_entries[4u * slot + 1u];
+        home_flags = vsm_entries[4u * slot + 3u];
+      }
     }
     var complete = true;
     var blockers = 0.0;
@@ -723,7 +729,7 @@ fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
     var stored = 0u;
     if (soft) {
       for (var k = 0u; k < SEARCH_TAPS; k++) {
-        if (!texel_depth(level, vec2i(floor(centre + vogel(k, SEARCH_TAPS, angle) * MAX_PENUMBRA)), home, home_phys, &stored)) {
+        if (!texel_depth(level, vec2i(floor(centre + vogel(k, SEARCH_TAPS, angle) * MAX_PENUMBRA)), home, home_phys, home_flags, &stored)) {
           complete = false;
           break;
         }
@@ -743,7 +749,7 @@ fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
       let base = vec2i(floor(f));
       let w = f - vec2f(base);
       for (var k = 0; k < 4; k++) {
-        if (!texel_depth(level, base + vec2i(k & 1, k >> 1u), home, home_phys, &stored)) {
+        if (!texel_depth(level, base + vec2i(k & 1, k >> 1u), home, home_phys, home_flags, &stored)) {
           complete = false;
           break;
         }
@@ -753,7 +759,7 @@ fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
     } else {
       let radius = min(penumbra, MAX_PENUMBRA);
       for (var k = 0u; k < FILTER_TAPS; k++) {
-        if (!texel_depth(level, vec2i(floor(centre + vogel(k, FILTER_TAPS, angle + 1.0) * radius)), home, home_phys, &stored)) {
+        if (!texel_depth(level, vec2i(floor(centre + vogel(k, FILTER_TAPS, angle + 1.0) * radius)), home, home_phys, home_flags, &stored)) {
           complete = false;
           break;
         }

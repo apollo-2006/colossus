@@ -154,7 +154,7 @@ fn vsm_alloc_slots(@builtin(global_invocation_id) gid: vec3u) {
   if (atomicLoad(&entries[4u * k + 2u]) != frame.frame_index) { return; }
   if (resident) {
     atomicStore(&entries[VSM_PHYS + 2u * phys + 1u], frame.frame_index);
-    let flags = atomicExchange(&entries[4u * k + 3u], 0u);
+    let flags = atomicAnd(&entries[4u * k + 3u], ~(VSM_DIRTY | VSM_PROVISIONAL));
     if ((flags & VSM_PROVISIONAL) != 0u) { render(k, VSM_STILL); }
     if ((flags & VSM_DIRTY) != 0u) { render(k, VSM_MOVING); }
   } else {
@@ -225,6 +225,8 @@ fn vsm_clear(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index)
   if (k >= atomicLoad(&lists[3])) { return; }
   let e = atomicLoad(&lists[VSM_RENDER + k]);
   let phys = atomicLoad(&entries[4u * (e & 0x7fffffffu) + 1u]);
+  // an empty moving layer is skipped by lookups until vsm_raster draws into it.
+  if ((e >> 31u) == VSM_MOVING && lane == 0u) { atomicAnd(&entries[4u * (e & 0x7fffffffu) + 3u], ~VSM_HAS_MOVING); }
   for (var t = lane; t < VSM_PAGE * VSM_PAGE; t += 256u) {
     atomicStore(&atlas[vsm_atlas_index(phys, vec2u(t % VSM_PAGE, t / VSM_PAGE), e >> 31u)], 0u);
   }
@@ -454,7 +456,10 @@ fn vsm_raster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
           phys = VSM_NONE;
           if (vsm_in_window(level, page)) {
             let slot = vsm_slot(level, page);
-            if (renders(layer, slot)) { phys = atomicLoad(&entries[4u * slot + 1u]); }
+            if (renders(layer, slot)) {
+              phys = atomicLoad(&entries[4u * slot + 1u]);
+              if (layer == VSM_MOVING) { atomicOr(&entries[4u * slot + 3u], VSM_HAS_MOVING); }
+            }
           }
         }
         if (phys != VSM_NONE) {

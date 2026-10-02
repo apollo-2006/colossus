@@ -83,8 +83,8 @@ void main() {
         if (e.needed != frame.frame_index) return;
         if (resident) {
             vsm_phys[e.phys].last_used = frame.frame_index;
-            if (e.flags != 0u) {
-                vsm_entries[k].flags = 0u;
+            if ((e.flags & (vsm_dirty | vsm_provisional)) != 0u) {
+                atomicAnd(vsm_entries[k].flags, ~(vsm_dirty | vsm_provisional));
                 if ((e.flags & vsm_provisional) != 0u) render(k, vsm_still);
                 if ((e.flags & vsm_dirty) != 0u) render(k, vsm_moving);
             }

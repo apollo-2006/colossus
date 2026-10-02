@@ -27,6 +27,7 @@ struct VsmEntry {
 };
 const uint vsm_dirty = 1u;        // something moved over it: redraw the moving layer
 const uint vsm_provisional = 2u;  // drawn before its geometry loaded: redraw the still layer
+const uint vsm_has_moving = 4u;   // its moving layer holds something; else lookups skip it
 const uint vsm_still = 0u, vsm_moving = 1u;  // layers
 
 // one per physical page.
@@ -183,19 +184,21 @@ const uint vsm_search_taps = 6u, vsm_filter_taps = 8u;
 
 // stored depth at a texel (nearer layer), or false if its page has no physical page. taps mostly
 // share the centre's page: its physical page (cached_phys) skips the entry read.
-bool vsm_texel_depth(uint level, ivec2 at, ivec2 cached_page, uint cached_phys, out uint stored) {
+bool vsm_texel_depth(uint level, ivec2 at, ivec2 cached_page, uint cached_phys, bool cached_moving, out uint stored) {
     const ivec2 page = at >> 7;
     uint phys = cached_phys;
+    bool moving = cached_moving;
     if (page != cached_page) {
         if (!vsm_in_window(level, page)) return false;
         const VsmEntry e = vsm_entries[vsm_slot(level, page)];
         if (e.tag != vsm_tag(page)) return false;
         phys = e.phys;
+        moving = (e.flags & vsm_has_moving) != 0u;
     }
     if (phys == vsm_none) return false;
     const uvec2 in_page = uvec2(at & ivec2(int(vsm_page) - 1));
     stored = vsm_atlas[vsm_atlas_index(phys, in_page, vsm_still)];
-    if ((frame.flags & flag_moving) != 0u) stored = max(stored, vsm_atlas[vsm_atlas_index(phys, in_page, vsm_moving)]);
+    if (moving) stored = max(stored, vsm_atlas[vsm_atlas_index(phys, in_page, vsm_moving)]);
     return true;
 }
 
@@ -221,16 +224,20 @@ float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
         const float angle = noise * 6.2831853;
         const ivec2 home = ivec2(floor(centre)) >> 7;
         uint home_phys = vsm_none;
+        bool home_moving = false;
         if (vsm_in_window(level, home)) {
             const VsmEntry e = vsm_entries[vsm_slot(level, home)];
-            if (e.tag == vsm_tag(home)) home_phys = e.phys;
+            if (e.tag == vsm_tag(home)) {
+                home_phys = e.phys;
+                home_moving = (e.flags & vsm_has_moving) != 0u;
+            }
         }
         bool complete = true;
         float blockers = 0.0, count = 0.0;
         const bool soft = (frame.flags & flag_soft_shadows) != 0u;
         for (uint k = 0u; k < vsm_search_taps && complete && soft; ++k) {
             uint stored;
-            complete = vsm_texel_depth(level, ivec2(floor(centre + vogel(k, vsm_search_taps, angle) * vsm_max_penumbra)), home, home_phys, stored);
+            complete = vsm_texel_depth(level, ivec2(floor(centre + vogel(k, vsm_search_taps, angle) * vsm_max_penumbra)), home, home_phys, home_moving, stored);
             if (complete && stored != 0u && vsm_unsortable(stored) > receiver) {
                 blockers += vsm_unsortable(stored);
                 count += 1.0;
@@ -246,7 +253,7 @@ float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
             const vec2 w = f - vec2(base);
             for (int k = 0; k < 4 && complete; ++k) {
                 uint stored;
-                complete = vsm_texel_depth(level, base + ivec2(k & 1, k >> 1), home, home_phys, stored);
+                complete = vsm_texel_depth(level, base + ivec2(k & 1, k >> 1), home, home_phys, home_moving, stored);
                 const bool open = stored == 0u || vsm_unsortable(stored) <= receiver;
                 const float weight = ((k & 1) != 0 ? w.x : 1.0 - w.x) * ((k >> 1) != 0 ? w.y : 1.0 - w.y);
                 lit += open ? weight : 0.0;
@@ -255,7 +262,7 @@ float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
             const float radius = min(penumbra, vsm_max_penumbra);
             for (uint k = 0u; k < vsm_filter_taps && complete; ++k) {
                 uint stored;
-                complete = vsm_texel_depth(level, ivec2(floor(centre + vogel(k, vsm_filter_taps, angle + 1.0) * radius)), home, home_phys, stored);
+                complete = vsm_texel_depth(level, ivec2(floor(centre + vogel(k, vsm_filter_taps, angle + 1.0) * radius)), home, home_phys, home_moving, stored);
                 lit += stored == 0u || vsm_unsortable(stored) <= receiver ? 1.0 : 0.0;
             }
             lit /= float(vsm_filter_taps);

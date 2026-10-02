@@ -10,6 +10,8 @@ void main() {
     if (k >= vsm_render_count) return;
     const uint entry = vsm_list[3u * vsm_slots + k];
     const uint phys = vsm_entries[entry & 0x7fffffffu].phys;
+    // an empty moving layer is skipped by lookups until vsm_raster.comp draws into it.
+    if ((entry >> 31) == vsm_moving && gl_LocalInvocationIndex == 0u) atomicAnd(vsm_entries[entry & 0x7fffffffu].flags, ~vsm_has_moving);
     for (uint t = gl_LocalInvocationIndex; t < vsm_page * vsm_page; t += 256u)
         vsm_atlas[vsm_atlas_index(phys, uvec2(t % vsm_page, t / vsm_page), entry >> 31)] = 0u;
 }

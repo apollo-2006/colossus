@@ -21,6 +21,7 @@ const VSM_SLOTS = 12288u;  // VSM_LEVELS * VSM_WINDOW * VSM_WINDOW
 const VSM_NONE = 0xffffffffu;
 const VSM_DIRTY = 1u;        // something moved over it: redraw the moving layer
 const VSM_PROVISIONAL = 2u;  // drawn before its geometry loaded: redraw the still layer
+const VSM_HAS_MOVING = 4u;   // its moving layer holds something; else lookups skip it
 const VSM_STILL = 0u;
 const VSM_MOVING = 1u;
 const VSM_PHYS = 49152u;     // 4 * VSM_SLOTS: physical page records start

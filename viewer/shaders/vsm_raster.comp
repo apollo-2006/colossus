@@ -90,7 +90,10 @@ void setup_and_small() {
                     phys = vsm_none;
                     if (vsm_in_window(level, page)) {
                         const uint slot = vsm_slot(level, page);
-                        if (vsm_renders(layer, slot)) phys = vsm_entries[slot].phys;
+                        if (vsm_renders(layer, slot)) {
+                            phys = vsm_entries[slot].phys;
+                            if (layer == vsm_moving) atomicOr(vsm_entries[slot].flags, vsm_has_moving);
+                        }
                     }
                 }
                 if (phys != vsm_none) {
