@@ -396,9 +396,9 @@ fn vsm_cluster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
 
 // --- rasterizing, as vsm_raster.comp: level texels snapped to 1/16, edges from
 // each triangle's corner, top-left rule, both sides, atomic max per texel in
-// its page. the walk is clipped to the level's rendered pages and skips pages
-// not rendering; a triangle over 32x32 texels after clipping is drawn by the
-// whole workgroup, a texel an invocation.
+// its page, sun facing triangles only. the walk is clipped to the level's
+// rendered pages and skips pages not rendering; a triangle over 64 texels after
+// clipping is drawn by the whole workgroup, a texel an invocation.
 var<workgroup> snapped: array<vec2i, 128>;
 var<workgroup> depth: array<f32, 128>;
 var<workgroup> together: array<u32, 128>;  // triangles for the whole workgroup
@@ -442,12 +442,8 @@ fn setup(packed: u32, level: u32, layer: u32) -> Tri {
   tri.b -= origin;
   tri.d -= origin;
   tri.area = edge(tri.a, tri.b, tri.d);
-  if (tri.area == 0) { return tri; }
-  if (tri.area < 0) {
-    let tb = tri.b; tri.b = tri.d; tri.d = tb;
-    let tz = tri.zb; tri.zb = tri.zd; tri.zd = tz;
-    tri.area = -tri.area;
-  }
+  // sun facing only, as vsm_raster.comp.
+  if (tri.area <= 0) { return tri; }
   let rect = rendered_rect(layer, level);
   let page = i32(VSM_PAGE);
   tri.start = max(tri.lo_abs, rect.xy * page) - tri.lo_abs;
@@ -585,7 +581,7 @@ fn vsm_raster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
     let tri = setup(cluster_triangle(c, t), level, layer);
     if (tri.ok) {
       let size = tri.hi - tri.start + 1;
-      if (size.x * size.y > 1024) {
+      if (size.x * size.y > 64) {
         together[atomicAdd(&together_count, 1u)] = t;
       } else {
         walk(tri, level, layer);

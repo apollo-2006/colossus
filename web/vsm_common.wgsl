@@ -10,7 +10,7 @@
 // then per physical page 2 (owner slot, frame last used).
 // lists: VSM_HEADER words cleared each frame (vsm.wgsl), then requests, free,
 // evictable (VSM_SLOTS each), render list (twice that), moving instances.
-// atlas: depths, two layers of VSM_SIDE x VSM_SIDE physical pages.
+// atlas: depths, two layers of VSM_SIDE x VSM_SIDE physical pages, page after page, tiled (vsm_atlas_index).
 
 const VSM_LEVELS = 14u;
 const VSM_WINDOW = 32u;
@@ -97,9 +97,12 @@ fn vsm_unsortable(u: u32) -> f32 {
   return bitcast<f32>(select(~u, u & 0x7fffffffu, (u & 0x80000000u) != 0u));
 }
 
+// page after page, each in 8x8 tiles of 256 bytes: a small triangle's texels share a tile or two.
 fn vsm_atlas_index(phys: u32, in_page: vec2u, layer: u32) -> u32 {
-  let at = vec2u(phys % VSM_SIDE, phys / VSM_SIDE) * VSM_PAGE + in_page;
-  return (layer * VSM_SIDE * VSM_PAGE + at.y) * VSM_SIDE * VSM_PAGE + at.x;
+  let page = layer * VSM_SIDE * VSM_SIDE + phys;
+  let tile = in_page / 8u;
+  let in_tile = in_page % 8u;
+  return page * (VSM_PAGE * VSM_PAGE) + (tile.y * (VSM_PAGE / 8u) + tile.x) * 64u + in_tile.y * 8u + in_tile.x;
 }
 
 fn vsm_mask_word(layer: u32, slot: u32) -> u32 {
