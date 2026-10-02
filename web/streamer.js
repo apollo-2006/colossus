@@ -31,6 +31,7 @@ export class Streamer {
     this.uploadBytes = uploadBytes;
     this.frame = 0;
     this.stats = { resident: 0, loaded: 0, inFlight: 0, bytes: 0 };
+    this.wholeFiles = new Map();  // url -> Promise<ArrayBuffer>, for servers that ignore ranges
   }
 
   resident(p) { return this.slotOf[p] !== NONE && !this.loading[p]; }
@@ -134,10 +135,17 @@ export class Streamer {
     const read = async () => {
       for (let attempt = 0; ; attempt++) {
         try {
+          const whole = this.wholeFiles.get(pg.url);
+          if (whole) return (await whole).slice(pg.offset, pg.offset + pg.size);
           const r = await fetch(pg.url, { headers: { Range: `bytes=${pg.offset}-${pg.offset + pg.size - 1}` } });
           if (r.status === 206) return r.arrayBuffer();
-          // A server that ignores ranges sends everything: take the slice.
-          if (r.ok) return (await r.arrayBuffer()).slice(pg.offset, pg.offset + pg.size);
+          // A server that ignores ranges sends the whole file: keep it,
+          // and take every page from it from now on.
+          if (r.ok) {
+            const file = r.arrayBuffer();
+            this.wholeFiles.set(pg.url, file);
+            return (await file).slice(pg.offset, pg.offset + pg.size);
+          }
           throw new Error(`HTTP ${r.status}`);
         } catch (e) {
           if (attempt >= 3) throw e;
