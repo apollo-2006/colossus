@@ -109,6 +109,8 @@ export class Renderer {
     });
     const compute = (entryPoint, layout) => d.createComputePipeline({ layout, compute: { module: this.computeModule, entryPoint } });
     this.instanceCull = compute('instance_cull', layout3);
+    this.argsBig = compute('args_big', layout4);
+    this.expand = compute('expand', layout3);
     this.argsCull = compute('args_cull', layout4);
     this.clusterCull = compute('cluster_cull', layout3);
     this.argsDraw = compute('args_draw', layout4);
@@ -170,8 +172,9 @@ export class Renderer {
     this.hwVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
     this.swVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
     // [0, 8) culling dispatches per pass, [8, 16) hardware draws, [16, 24)
-    // software dispatches.
-    this.args = d.createBuffer({ size: 96, usage: S | GPUBufferUsage.INDIRECT });
+    // software dispatches, [24, 28) pass 2's instance culling and [28, 36)
+    // each pass's expand.
+    this.args = d.createBuffer({ size: 144, usage: S | GPUBufferUsage.INDIRECT });
     this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
     this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
     this.frameIndex = 0;
@@ -252,7 +255,8 @@ export class Renderer {
     });
     this.instanceCount = placements.length;
     this.late?.destroy();
-    this.late = d.createBuffer({ size: (MAX_VISIBLE + Math.max(1, placements.length)) * 8, usage: GPUBufferUsage.STORAGE });
+    // Hidden clusters, hidden instances, then each pass's big instances (two entries each).
+    this.late = d.createBuffer({ size: (MAX_VISIBLE + 5 * Math.max(1, placements.length)) * 8, usage: GPUBufferUsage.STORAGE });
     this.workGroup = null;  // Remade with it on the next resize
     this.width = 0;
     this.instanceBuffer?.destroy();
@@ -447,7 +451,16 @@ export class Renderer {
       cp.setBindGroup(2, this.imageGroup);
       cp.setBindGroup(3, this.argsGroup);
       cp.setPipeline(this.instanceCull);
-      cp.dispatchWorkgroups(Math.min(this.instanceCount, 65535), Math.ceil(this.instanceCount / 65535));
+      if (p === 0) {
+        const groups = Math.ceil(this.instanceCount / 64);
+        cp.dispatchWorkgroups(Math.min(groups, 65535), Math.ceil(groups / 65535));
+      } else {
+        cp.dispatchWorkgroupsIndirect(this.args, 96);
+      }
+      cp.setPipeline(this.argsBig);
+      cp.dispatchWorkgroups(1);
+      cp.setPipeline(this.expand);
+      cp.dispatchWorkgroupsIndirect(this.args, 112 + p * 16);
       cp.setPipeline(this.argsCull);
       cp.dispatchWorkgroups(1);
       cp.setPipeline(this.clusterCull);

@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 const MODELS = ['models/lucy', 'models/dragon'];
 const POOL_BYTES = 192 << 20;  // Pages streamed in; the rest stay on the server
 
-const human = (v) => (v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : `${v}`);
+const human = (v) => (v >= 1e12 ? `${(v / 1e12).toFixed(2)}T` : v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : `${v}`);
 
 // A small seeded generator, so the crowd is the same on every visit.
 function random(seed) {
@@ -20,6 +20,8 @@ function random(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+const GRID_SIDES = [1, 2, 3, 4, 6, 8, 10, 15, 20, 30, 45, 60, 100, 150, 200, 300, 450, 600, 800, 1000];
 
 // An n by n grid, models alternating, each turned and sized at random.
 export function crowd(n, models, spacing = 1.25) {
@@ -72,9 +74,10 @@ async function main() {
   const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS | FLAG_OCCLUSION | FLAG_TAA, threshold: 1, mode: 0, swPixels: 32, motion: true };
   let frozen = null;
   const build = () => {
-    const n = Number($('grid').value);
+    // The slider steps through grid sides, up to a million instances.
+    const n = GRID_SIDES[Number($('grid').value)];
     renderer.setPlacements(crowd(n, models.length));
-    $('grid-label').textContent = `${n * n} instances`;
+    $('grid-label').textContent = `${(n * n).toLocaleString('en-US')} instances`;
     $('full').textContent = human(renderer.fullDetail);
   };
   $('grid').oninput = build;
@@ -150,8 +153,8 @@ async function main() {
       $('breakdown').textContent = g ? `cull and compute raster ${g.cull.toFixed(2)}, hardware raster ${g.raster.toFixed(2)}, shading ${g.shade.toFixed(2)}` : '';
       $('triangles').textContent = human(s.triangles);
       $('clusters').textContent = `${human(s.hw + s.sw)} (${human(s.sw)} in compute)`;
-      $('instances').textContent = `${s.instances} of ${renderer.instanceCount}`;
-      $('hidden').textContent = `${human(s.hiddenLastFrame)} clusters, ${s.instancesOccluded} instances`;
+      $('instances').textContent = `${s.instances.toLocaleString('en-US')} of ${renderer.instanceCount.toLocaleString('en-US')}`;
+      $('hidden').textContent = `${human(s.hiddenLastFrame)} clusters, ${s.instancesOccluded.toLocaleString('en-US')} instances`;
       $('size').textContent = `${w} x ${h}`;
       const st = renderer.streamer.stats;
       $('pages').textContent = `${st.resident} pages, ${(st.bytes / 1e6).toFixed(0)} MB fetched${st.inFlight ? ' (streaming)' : ''}`;

@@ -29,6 +29,7 @@ struct Counters {
   // software [3, 6), and each pass's work items [6, 8). Written by the args
   // passes, read by the rasterizers.
   pass_start: array<u32, 8>,
+  big: array<atomic<u32>, 2>,  // Per pass: instances left to expand
 }
 
 // Which pass (0 or 1), and for the pyramid builder, which level: from a
@@ -205,23 +206,39 @@ fn request_finer(c: Cluster, priority: f32) {
 // threshold * distance / (scale * lod_scale), distance measured to the
 // model's LOD sphere, is skipped with a binary search.
 
-var<workgroup> wg_first_item: u32;
-var<workgroup> wg_items: u32;
-var<workgroup> wg_first_cluster: u32;
-var<workgroup> wg_count: u32;
-
+// One invocation per instance (as in the viewer's instance_cull.comp):
+// the workgroup writes its instances' pieces of 64 clusters together, a
+// prefix sum over their counts saying where each starts. Instances over
+// BIG_PIECES (near ones, thousands of pieces, and neighbours in the list)
+// go to expand instead, a workgroup each.
+//
 // Pass 1 runs over every instance and tests occlusion against last
 // frame's depth; what it finds hidden is listed for pass 2, which runs
-// over that list only and tests against the depth pass 1 drew.
+// over that list only (args_big sizes it) and tests against the depth
+// pass 1 drew.
+const BIG_PIECES = 16u;
+
+var<workgroup> wg_ends: array<u32, 64>;
+var<workgroup> wg_instance: array<u32, 64>;
+var<workgroup> wg_first: array<u32, 64>;
+var<workgroup> wg_base: u32;
+
+// Where each pass's big instances are listed in late: two entries each,
+// (instance, first cluster) and (pieces, 0).
+fn big_slot(pass_index: u32, k: u32) -> u32 {
+  return frame.max_visible + frame.instance_count * (1u + 2u * pass_index) + 2u * k;
+}
+
 @compute @workgroup_size(64)
 fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) lane: u32) {
   let pass_index = pass_info.pass_index;
-  if (lane == 0u) { wg_count = select(atomicLoad(&counters.late_instances), frame.instance_count, pass_index == 0u); }
-  let slot = wid.y * 65535u + wid.x;
-  if (slot >= workgroupUniformLoad(&wg_count)) { return; }
-  let i = select(late[frame.max_visible + slot].x, slot, pass_index == 0u);
-  if (lane == 0u) {
-    wg_items = 0u;
+  let count = select(atomicLoad(&counters.late_instances), frame.instance_count, pass_index == 0u);
+  let slot = (wid.y * 65535u + wid.x) * 64u + lane;
+  var chunks = 0u;
+  var i = 0u;
+  var first = 0u;
+  if (slot < count) {
+    i = select(late[frame.max_visible + slot].x, slot, pass_index == 0u);
     let inst = load_instance(i);
     let m = meshes[inst.mesh];
     let center = to_world(inst, m.bounds.xyz);
@@ -249,21 +266,77 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
         let mid = (lo + hi) / 2u;
         if (clusters[m.first_cluster + mid].parent_error > limit) { hi = mid; } else { lo = mid + 1u; }
       }
-      var n = (m.cluster_count - lo + 63u) / 64u;
-      var base = 0u;
-      if (n > 0u) { base = atomicAdd(&counters.work[pass_index], n); }
-      if (base + n > frame.max_work) {
-        atomicAdd(&counters.overflow, 1u);
-        n = select(0u, frame.max_work - base, base < frame.max_work);
+      chunks = (m.cluster_count - lo + 63u) / 64u;
+      first = m.first_cluster + lo;
+      if (chunks > BIG_PIECES) {
+        let at = big_slot(pass_index, atomicAdd(&counters.big[pass_index], 1u));
+        late[at] = vec2u(i, first);
+        late[at + 1u] = vec2u(chunks, 0u);
+        chunks = 0u;
       }
-      wg_first_item = pass_index * frame.max_work + base;
-      wg_items = n;
-      wg_first_cluster = m.first_cluster + lo;
     }
   }
-  let n = workgroupUniformLoad(&wg_items);
-  for (var k = lane; k < n; k += 64u) {
-    work[wg_first_item + k] = vec2u(i, wg_first_cluster + 64u * k);
+
+  // Prefix sum of the pieces over the workgroup (Hillis and Steele).
+  wg_ends[lane] = chunks;
+  wg_instance[lane] = i;
+  wg_first[lane] = first;
+  workgroupBarrier();
+  for (var step = 1u; step < 64u; step <<= 1u) {
+    var add = 0u;
+    if (lane >= step) { add = wg_ends[lane - step]; }
+    workgroupBarrier();
+    wg_ends[lane] += add;
+    workgroupBarrier();
+  }
+  var total = workgroupUniformLoad(&wg_ends[63]);
+  if (total == 0u) { return; }
+  if (lane == 0u) { wg_base = atomicAdd(&counters.work[pass_index], total); }
+  let at = workgroupUniformLoad(&wg_base);
+  if (at + total > frame.max_work) {
+    if (lane == 0u) { atomicAdd(&counters.overflow, 1u); }
+    total = select(0u, frame.max_work - at, at < frame.max_work);
+  }
+  for (var k = lane; k < total; k += 64u) {
+    // The invocation whose run holds piece k: the first end past it.
+    var lo = 0u;
+    var hi = 63u;
+    while (lo < hi) {
+      let mid = (lo + hi) / 2u;
+      if (wg_ends[mid] > k) { hi = mid; } else { lo = mid + 1u; }
+    }
+    var start = 0u;
+    if (lo > 0u) { start = wg_ends[lo - 1u]; }
+    work[pass_index * frame.max_work + at + k] = vec2u(wg_instance[lo], wg_first[lo] + 64u * (k - start));
+  }
+}
+
+// The pieces of instances with many, a workgroup each.
+var<workgroup> wg_expand_base: u32;
+var<workgroup> wg_expand_count: u32;
+
+@compute @workgroup_size(64)
+fn expand(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) lane: u32) {
+  let pass_index = pass_info.pass_index;
+  let k = wid.y * 65535u + wid.x;
+  if (lane == 0u) { wg_expand_count = atomicLoad(&counters.big[pass_index]); }
+  if (k >= workgroupUniformLoad(&wg_expand_count)) { return; }
+  let at = big_slot(pass_index, k);
+  let e = late[at];
+  if (lane == 0u) {
+    var chunks = late[at + 1u].x;
+    let b = atomicAdd(&counters.work[pass_index], chunks);
+    if (b + chunks > frame.max_work) {
+      atomicAdd(&counters.overflow, 1u);
+      chunks = select(0u, frame.max_work - b, b < frame.max_work);
+    }
+    wg_expand_base = pass_index * frame.max_work + b;
+    wg_expand_count = chunks;
+  }
+  let base = workgroupUniformLoad(&wg_expand_base);
+  let count = workgroupUniformLoad(&wg_expand_count);
+  for (var c = lane; c < count; c += 64u) {
+    work[base + c] = vec2u(e.x, e.y + 64u * c);
   }
 }
 
@@ -271,6 +344,15 @@ fn rows(n: u32, at: u32) {
   args[at] = min(n, 65535u);
   args[at + 1u] = (n + 65534u) / 65535u;
   args[at + 2u] = 1u;
+}
+
+// After a pass's instance culling: the dispatch for its big instances,
+// and after pass 1, pass 2's instance culling, over what pass 1 hid.
+@compute @workgroup_size(1)
+fn args_big() {
+  let pass_index = pass_info.pass_index;
+  rows(atomicLoad(&counters.big[pass_index]), 28u + pass_index * 4u);
+  if (pass_index == 0u) { rows((atomicLoad(&counters.late_instances) + 63u) / 64u, 24u); }
 }
 
 // A pass's cluster culling dispatch: one workgroup per work item, and in
