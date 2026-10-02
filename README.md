@@ -17,10 +17,10 @@ threshold and the crowd size there to play with.
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
 900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
-billion triangles at full detail, drawn at 1920x1080 in 0.75 ms on an rx 9070 xt,
-shadows and antialiasing included. about 3 million triangles reach the screen, from 23
-mb of the 579 mb on disk. a million instances (17.6 trillion triangles) take 1.06 ms,
-and instances can move.
+billion triangles at full detail, drawn at 1920x1080 in 0.92 ms on an rx 9070 xt, soft
+shadows, ambient occlusion and antialiasing included. about 3 million triangles reach
+the screen, from 23 mb of the 579 mb on disk. a million instances (17.6 trillion
+triangles) take about 1.3 ms, and instances can move.
 
 ## how it works
 
@@ -81,21 +81,30 @@ and instances can move.
    were last frame.
 5. **shading** (`shade.comp`) refetches each pixel's triangle and hits it with the
    pixel's ray for exact barycentrics. five materials (marble, sandstone, granite, bronze,
-   gold), lambert plus a ggx lobe.
+   gold), lambert plus a ggx lobe. sky, reflected and rim light are scaled by
+   ground-truth ambient occlusion (`ao.comp`, after jimenez and intel's xegtao): half
+   resolution, two slices a pixel rotated each frame for taa to average, reading a small
+   depth chain (`ao_depth.comp`) so far taps stay in cache. 0.08 ms; `--no-ao` or g.
 6. **shadows: virtual shadow maps** (`vsm.glsl`, `vsm_*.comp`). the sun's depth lives in
    a clipmap around the camera: 12 levels of 32x32 pages of 128x128 texels, each level's
    texels twice the last's, backed by a pool of physical pages. each frame every pixel
    marks the page it will read, missing pages get physical ones, and only new or invalid
    pages are drawn, from the same hierarchy seen from the sun with errors in that level's
    texels. pages keep two layers: still instances, drawn once (or until their geometry
-   has loaded), and moving ones, redrawn where something moved. with the camera still
-   they cost 0.06 ms; flying through the crowd draws about 3 pages a frame.
+   has loaded), and moving ones, redrawn where something moved and skipped by lookups
+   where empty. with the camera still they cost 0.06 ms; flying through the crowd draws
+   about 3 pages a frame.
+
+   shadows soften with distance from what casts them: a blocker search sizes each
+   penumbra for a sun drawn 1.5 degrees wide (a little wider than the real one, so it
+   shows at statue scale), then rotated taps filter over it for taa to average. 0.11
+   ms; `--hard-shadows` or j.
 
    ray traced shadows are still there (`--shadows rt`): coarser copies of each model,
    half resolution with full resolution at edges, moving instances in a refitted second
-   structure. they shade these views in 0.38 to 0.58 ms against 0.23 to 0.29, grow with
-   the instance count and need ray queries; the shadow maps draw from the full hierarchy,
-   so fine folds shadow themselves in more detail.
+   structure. hard edged, they cost about what the soft shadow maps do here, grow with the
+   instance count and need ray queries; the shadow maps draw from the full hierarchy, so
+   fine folds shadow themselves in more detail.
 
 7. **antialiasing** (`taa.comp`). eight sub-pixel offsets in turn, each pixel blended 10%
    into a history reprojected through last frame's camera (and a moving instance's last
@@ -131,20 +140,21 @@ small circle, computed in the shaders from the time (`animate()` in `common.glsl
 million moving instances need no uploads. occlusion and antialiasing use each instance's
 last transform, and the shadow maps redraw the pages it crossed.
 
-| instances | moving | shadow maps | ray traced |
+| instances | moving | shadow maps (soft) | ray traced (hard) |
 |---|---|---|---|
-| 900 | none | 0.74 ms | 0.85 ms |
-| 900 | 1% | 0.93 ms | 1.03 ms |
-| 900 | half | 1.32 ms | 1.12 ms |
-| 90,000 | 1% | 1.00 ms | 1.33 ms |
-| 1,000,000 | none | 1.06 ms | 1.34 ms |
-| 1,000,000 | 1% | 1.40 ms | 1.77 ms |
+| 900 | none | 0.97 ms | 0.97 ms |
+| 900 | 1% | 1.18 ms | 1.16 ms |
+| 900 | half | 1.76 ms | 1.25 ms |
+| 90,000 | 1% | 1.22 ms | 1.46 ms |
+| 1,000,000 | none | 1.33 ms | 1.47 ms |
+| 1,000,000 | 1% | 1.65 ms | 1.91 ms |
 
-the crowd view at 1920x1080. half the crowd moving is the one case the shadow maps lose:
-450 statues redrawn into 156 pages a frame cost 0.62 ms. a ray traced refit on radv costs
-by the size of the whole structure (2.7k entries 0.25 ms, 270k 0.94 ms), so still
-instances get a structure of their own. at a million, occlusion culling is what makes it
-work: without it the view draws 72 million triangles in 3.84 ms.
+the crowd view at 1920x1080, ambient occlusion on in both; runs vary by a few
+hundredths. half the crowd moving is where the shadow maps lose: 450 statues redrawn
+into their pages every frame. a ray traced refit on radv costs by the size of the whole
+structure (2.7k entries 0.25 ms, 270k 0.94 ms), so still instances get a structure of
+their own. at a million, occlusion culling is what makes it work: without it the view
+draws 72 million triangles in 3.84 ms.
 
 ![lucy, each cluster in its own colour](docs/clusters.png)
 
@@ -175,14 +185,15 @@ or push constants:
   offset per dispatch.
 * shadows are the viewer's virtual shadow maps, in a module of their own
   (`web/vsm.wgsl`) to keep the bind group small, their indirect arguments in their own
-  buffer (a dispatch can't write the buffer it reads arguments from). materials and
-  antialiasing match the viewer.
+  buffer (a dispatch can't write the buffer it reads arguments from). soft shadows use
+  fewer taps than the viewer; ambient occlusion (`web/ao.wgsl`), materials and
+  antialiasing match it.
 * a quarter of the middle 30x30 instances move, and the crowd slider goes to a million.
 
 the models are trimmed to 4 million triangles at their finest (`--max-triangles`): about
 4 mb of gzipped metadata each, up front, and 71 mb of pages, streamed. in chrome on the
-rx 9070 xt at 1600x813, 900 instances take 0.79 ms of gpu time once streaming settles,
-1.23 ms with the middle moving, and a million 1.85 ms. it needs 16 storage buffers per
+rx 9070 xt at 1600x813, 900 instances take 1.07 ms of gpu time once streaming settles,
+1.45 ms with the middle moving, and a million 2.32 ms. it needs 16 storage buffers per
 shader stage, which desktop gpus allow. `web/build.sh` builds the models;
 `node tests/web_screenshot.mjs` renders the page headless.
 
@@ -206,10 +217,11 @@ models/fetch.sh            # downloads lucy and the dragon (380 mb) and builds b
 | keys | |
 |---|---|
 | w a s d, q e | move, down and up; drag to look; scroll for speed, shift to hurry |
-| 1 to 9 | shaded, clusters, triangles, lod level, groups, instances, holes, rasterizer, shadow levels |
+| 1 to 9, 0 | shaded, clusters, triangles, lod level, groups, instances, holes, rasterizer, shadow levels, ambient occlusion |
 | [ and ] | halve or double the error threshold (1 pixel) |
 | f | freeze culling, then fly out and watch it |
 | c v o r h x | cone culling, frustum culling, occlusion, compute rasterizer, shadows, antialiasing |
+| j g | soft shadows, ambient occlusion |
 | t, p | wireframe; print the camera as a `--camera` argument |
 
 `--headless --frames n --screenshot out.png` renders without a window and prints the
@@ -239,15 +251,15 @@ streaming. shading includes shadows and antialiasing.
 
 | camera | frame | culling | raster | pass 2 | shadow pages | shading | triangles |
 |---|---|---|---|---|---|---|---|
-| beside lucy (top image) | 0.75 ms | 0.17 | 0.18 | 0.10 | 0.06 | 0.24 | 3.00m |
-| raised (lod image) | 0.79 ms | 0.09 | 0.25 | 0.09 | 0.07 | 0.29 | 4.33m |
-| ground level | 0.69 ms | 0.12 | 0.18 | 0.10 | 0.06 | 0.23 | 2.59m |
+| beside lucy (top image) | 0.92 ms | 0.17 | 0.18 | 0.10 | 0.06 | 0.42 | 3.00m |
+| raised (lod image) | 1.03 ms | 0.09 | 0.24 | 0.09 | 0.06 | 0.55 | 4.33m |
+| ground level | 0.85 ms | 0.12 | 0.16 | 0.11 | 0.06 | 0.40 | 2.58m |
 
-without shadows: 0.61, 0.61 and 0.56 ms; ray traced: 0.85, 1.02 and 0.78. without
-antialiasing: 0.67, 0.72 and 0.62. the compute rasterizer saves 0.30 to 0.44 ms. occlusion
-culling removes 46% of the triangles at ground level (0.76 to 0.69 ms) and next to
-nothing from the raised camera, which sees over the crowd. the culling built for a
-million instances costs these 900 about 0.03 ms.
+hard shadows: 0.81, 0.86 and 0.76 ms; no ambient occlusion: 0.83, 0.93 and 0.78; no
+shadows: 0.69, 0.69 and 0.64; ray traced (hard): 0.92, 1.09 and 0.85; no antialiasing:
+0.85, 0.97 and 0.79. the compute rasterizer saves 0.31 to 0.42 ms. occlusion culling
+removes 46% of the triangles at ground level (0.92 to 0.85 ms) and next to nothing from
+the raised camera, which sees over the crowd.
 
 early versions drew fewer triangles (0.86 million beside lucy); measured errors now
 refuse levels that strayed several pixels. the commit messages have every step's numbers.
