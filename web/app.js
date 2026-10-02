@@ -23,7 +23,7 @@ function random(seed) {
 
 // An n by n grid, models alternating, each turned and sized at random.
 export function crowd(n, models, spacing = 1.25) {
-  const rand = random(7), materialRand = random(11);
+  const rand = random(7), materialRand = random(11), motionRand = random(13);
   const out = [];
   for (let z = 0; z < n; z++)
     for (let x = 0; x < n; x++) {
@@ -34,7 +34,10 @@ export function crowd(n, models, spacing = 1.25) {
       // Mostly marble, some sandstone, bronze, gold and granite, as the
       // native viewer mixes them (shade materials in compute.wgsl).
       const material = n === 1 ? 1 : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5][Math.floor(materialRand() * 20)];
-      out.push({ model: (z * n + x) % models, scale, material, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
+      // A quarter of them move (animate() in common.wgsl): bit 9 marks
+      // it, bit 8 picks the direction, the low 8 bits the phase.
+      const anim = n > 1 && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
+      out.push({ model: (z * n + x) % models, scale, material, anim, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
     }
   return out;
 }
@@ -66,7 +69,7 @@ async function main() {
   $('loading').remove();
   renderer.loadModels(models, Math.min(POOL_BYTES, renderer.device.limits.maxStorageBufferBindingSize));
 
-  const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS | FLAG_OCCLUSION | FLAG_TAA, threshold: 1, mode: 0, swPixels: 32 };
+  const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS | FLAG_OCCLUSION | FLAG_TAA, threshold: 1, mode: 0, swPixels: 32, motion: true };
   let frozen = null;
   const build = () => {
     const n = Number($('grid').value);
@@ -87,6 +90,7 @@ async function main() {
   toggle('shadows', FLAG_SHADOWS);
   toggle('occlusion', FLAG_OCCLUSION);
   toggle('taa', FLAG_TAA);
+  $('motion').onchange = () => (settings.motion = $('motion').checked);
   $('freeze').onchange = () => {
     frozen = $('freeze').checked ? { eye: [...camera.eye], forward: camera.forward, fov: camera.fov, near: camera.near } : null;
   };

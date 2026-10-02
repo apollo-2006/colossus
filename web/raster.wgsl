@@ -39,7 +39,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) local: u32) -> Ve
     return out;
   }
   let packed = cluster_triangle(c, tri);
-  let inst = instances[v.x];
+  let inst = load_instance(v.x);
   let p = cluster_position(c, meshes[inst.mesh].grid, (packed >> (8u * (vi % 3u))) & 255u);
   out.position = frame.view_proj * vec4f(to_world(inst, p), 1.0);
   return out;
@@ -71,7 +71,7 @@ fn shadow_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
   let c = clusters[v.y];
   let tri = vi / 3u;
   if (tri >= c.triangle_count) { return vec4f(2.0, 2.0, 2.0, 1.0); }
-  let inst = instances[v.x];
+  let inst = load_instance(v.x);
   let packed = cluster_triangle(c, tri);
   let p = cluster_position(c, meshes[inst.mesh].grid, (packed >> (8u * (vi % 3u))) & 255u);
   return frame.view_proj * vec4f(to_world(inst, p), 1.0);

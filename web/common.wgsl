@@ -46,7 +46,7 @@ struct Frame {
   prev_view_proj: mat4x4f,
   jitter: vec2f,
   taa_valid: u32,
-  pad5: u32,
+  prev_time: f32,  // Last frame's time, for moving instances
 }
 
 // include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
@@ -90,8 +90,8 @@ struct Instance {
   rows: array<vec4f, 3>,  // The 3x4 to-world transform, by rows
   mesh: u32,
   scale: f32,
-  pad0: u32,
-  pad1: u32,
+  material: u32,  // Into compute.wgsl's materials
+  anim: u32,      // 0: still. Else moving (see animate()): phase in the low 8 bits, bit 8 turns it the other way
 }
 
 const FLAG_CONE = 1u;
@@ -111,6 +111,42 @@ const NO_PAGE = 0xffffffffu;
 @group(0) @binding(3) var<storage, read> pool: array<u32>;
 @group(0) @binding(6) var<storage, read> meshes: array<Mesh>;
 @group(0) @binding(7) var<storage, read> instances: array<Instance>;
+
+// As in the viewer's common.glsl: a moving instance turns on the spot and
+// drifts round a small circle, computed from the time. Last frame's
+// transform (load_prev_instance) is where last frame's depth pyramid and
+// image have it.
+fn animate(inst_in: Instance, t: f32) -> Instance {
+  var inst = inst_in;
+  if (inst.anim == 0u) { return inst; }
+  let phase = f32(inst.anim & 255u) * (6.2831853 / 256.0);
+  let turn = phase + t * select(0.7, -0.7, (inst.anim & 256u) != 0u);
+  let c = cos(turn);
+  let s = sin(turn);
+  let drift = vec2f(cos(phase + t * 0.9), sin(phase + t * 0.9)) * 0.2;
+  let r0 = inst.rows[0].xyz;
+  let r2 = inst.rows[2].xyz;
+  inst.rows[0] = vec4f(c * r0 + s * r2, inst.rows[0].w + drift.x);
+  inst.rows[2] = vec4f(-s * r0 + c * r2, inst.rows[2].w + drift.y);
+  return inst;
+}
+
+fn load_instance(i: u32) -> Instance {
+  return animate(instances[i], frame.time);
+}
+
+fn load_prev_instance(i: u32) -> Instance {
+  return animate(instances[i], frame.prev_time);
+}
+
+// The inverse of to_world: a rotation and a uniform scale.
+fn from_world(inst: Instance, p: vec3f) -> vec3f {
+  let d = p - vec3f(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
+  let c0 = vec3f(inst.rows[0].x, inst.rows[1].x, inst.rows[2].x);
+  let c1 = vec3f(inst.rows[0].y, inst.rows[1].y, inst.rows[2].y);
+  let c2 = vec3f(inst.rows[0].z, inst.rows[1].z, inst.rows[2].z);
+  return vec3f(dot(c0, d), dot(c1, d), dot(c2, d)) / (inst.scale * inst.scale);
+}
 
 fn to_world(inst: Instance, p: vec3f) -> vec3f {
   return vec3f(dot(inst.rows[0].xyz, p) + inst.rows[0].w, dot(inst.rows[1].xyz, p) + inst.rows[1].w,

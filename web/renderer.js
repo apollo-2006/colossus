@@ -119,6 +119,7 @@ export class Renderer {
     this.taaLayout = d.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
+        { binding: 1, visibility: C, texture: { sampleType: 'uint' } },
         { binding: 8, visibility: C, texture: { sampleType: 'float' } },
         { binding: 9, visibility: C, texture: { sampleType: 'float' } },
         { binding: 10, visibility: C, sampler: { type: 'filtering' } },
@@ -174,6 +175,7 @@ export class Renderer {
     this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
     this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
     this.frameIndex = 0;
+    this.time = 0;
     this.wanted = [];
     if (this.timestamps) {
       this.querySet = d.createQuerySet({ type: 'timestamp', count: 8 });
@@ -245,6 +247,7 @@ export class Renderer {
       new Uint32Array(instances, i * 64 + 48, 1)[0] = p.model;
       new Float32Array(instances, i * 64 + 52, 1)[0] = p.scale;
       new Uint32Array(instances, i * 64 + 56, 1)[0] = p.material ?? 0;
+      new Uint32Array(instances, i * 64 + 60, 1)[0] = p.anim ?? 0;
       this.fullDetail += this.models[p.model].leafTriangles;
     });
     this.instanceCount = placements.length;
@@ -283,7 +286,8 @@ export class Renderer {
     this.history = [0, 1].map(() => d.createTexture({ size: [width, height], format: 'rgba16float', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING }));
     this.taaGroups = [0, 1].map((k) => d.createBindGroup({
       layout: this.taaLayout,
-      entries: [{ binding: 0, resource: this.depthTexture.createView() }, { binding: 8, resource: this.shaded.createView() },
+      entries: [{ binding: 0, resource: this.depthTexture.createView() }, { binding: 1, resource: this.idTexture.createView() },
+        { binding: 8, resource: this.shaded.createView() },
         { binding: 9, resource: this.history[1 - k].createView() }, { binding: 10, resource: this.historySampler },
         { binding: 11, resource: this.history[k].createView() }, { binding: 12, resource: this.image.createView() }],
     }));
@@ -358,6 +362,12 @@ export class Renderer {
     const sunViewProj = mul(orthographic(SHADOW_HALF, 0, 2 * reach), lookTo(sunEye, SUN_DIR.map((x) => -x), [0, 1, 0]));
     const shadows = (settings.flags & FLAG_SHADOWS) !== 0;
     this.frameIndex++;
+    // Time, for moving instances: it stands still while motion is off.
+    const now = performance.now() / 1000;
+    const prevTime = this.time;
+    if (this.lastNow !== undefined && settings.motion) this.time += now - this.lastNow;
+    this.lastNow = now;
+    const time = this.time;
     if (shadows) {
       const sf = new ArrayBuffer(FRAME_BYTES);
       const sff = new Float32Array(sf), sfu = new Uint32Array(sf);
@@ -374,6 +384,7 @@ export class Renderer {
       sff[64] = 1; sff[65] = 8; sff[66] = 1e-3;
       sfu[68] = MAX_WORK; sfu[69] = MAX_VISIBLE;
       sfu[72] = this.frameIndex; sfu[73] = MAX_REQUESTS;
+      sff[71] = time; sff[151] = prevTime;
       sff[92] = SHADOW_SIZE / (2 * SHADOW_HALF);  // ortho_scale: texels per unit
       d.queue.writeBuffer(this.shadowFrameBuffer, 0, sf);
     }
@@ -412,7 +423,8 @@ export class Renderer {
     fu[67] = settings.mode;
     fu[68] = MAX_WORK; fu[69] = MAX_VISIBLE;
     ff[70] = settings.swPixels;
-    ff[71] = performance.now() / 1000;
+    ff[71] = time;
+    ff[151] = prevTime;
     fu[72] = this.frameIndex;
     fu[73] = MAX_REQUESTS;
     d.queue.writeBuffer(this.frameBuffer, 0, f);

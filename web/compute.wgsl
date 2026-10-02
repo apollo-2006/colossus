@@ -222,12 +222,15 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
   let i = select(late[frame.max_visible + slot].x, slot, pass_index == 0u);
   if (lane == 0u) {
     wg_items = 0u;
-    let inst = instances[i];
+    let inst = load_instance(i);
     let m = meshes[inst.mesh];
     let center = to_world(inst, m.bounds.xyz);
     let radius = m.bounds.w * inst.scale;
     var keep = pass_index != 0u || (frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, radius);
-    if (keep && occluded(center, radius)) {
+    // Pass 1 asks whether it was hidden last frame, where last frame was.
+    var then = center;
+    if (pass_index == 0u && inst.anim != 0u) { then = to_world(load_prev_instance(i), m.bounds.xyz); }
+    if (keep && occluded(then, radius)) {
       if (pass_index == 0u) { late[frame.max_visible + atomicAdd(&counters.late_instances, 1u)] = vec2u(i, 0u); }
       else { atomicAdd(&counters.instances_occluded, 1u); }
       keep = false;
@@ -316,7 +319,7 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
   let items = counters.pass_start[6u + pass_index];
   if (item < items) {
     let w = work[pass_index * frame.max_work + item];
-    let inst = instances[w.x];
+    let inst = load_instance(w.x);
     let m = meshes[inst.mesh];
     instance_id = w.x;
     cluster_id = w.y + lane;
@@ -334,7 +337,9 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
         let view = center - frame.cull_origin.xyz;
         if (dot(view, axis) >= c.cone_cutoff * length(view) + r) { draw = false; }
       }
-      if (draw && occluded(center, r)) {
+      var then = center;
+      if (pass_index == 0u && inst.anim != 0u) { then = to_world(load_prev_instance(w.x), c.center); }
+      if (draw && occluded(then, r)) {
         draw = false;
         hidden = true;
       }
@@ -359,7 +364,7 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       let ic = late[k];
       instance_id = ic.x;
       cluster_id = ic.y;
-      let inst = instances[instance_id];
+      let inst = load_instance(instance_id);
       let c = clusters[cluster_id];
       let center = to_world(inst, c.center);
       let r = c.radius * inst.scale;
@@ -450,7 +455,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   if (lane == 0u) { wg_valid = select(0u, 1u, k < counters.pass_start[4u + pass_info.pass_index]); }
   if (workgroupUniformLoad(&wg_valid) == 0u) { return; }
   let v = sw_visible[k];
-  let inst = instances[v.x];
+  let inst = load_instance(v.x);
   let c = clusters[v.y];
   if (lane < c.vertex_count) {
     let clip = frame.view_proj * vec4f(to_world(inst, cluster_position(c, meshes[inst.mesh].grid, lane)), 1.0);
@@ -552,7 +557,7 @@ fn level_color(level: u32) -> vec3f {
   return mix(vec3f(1.0), clamp(k - 1.0, vec3f(0.0), vec3f(1.0)), 0.75) * 0.85;
 }
 
-// Instances carry one of these (Instance::pad0 here, material natively),
+// Instances carry one of these (Instance::material),
 // as viewer/shaders/shade.comp's.
 struct Material {
   albedo: vec3f,
@@ -670,7 +675,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       color = mix(ground, color, 1.0 - exp(-t * 0.012));
     }
   } else {
-    let inst = instances[vc.x];
+    let inst = load_instance(vc.x);
     let c = clusters[vc.y];
     let packed = cluster_triangle(c, tri);
     let i0 = packed & 255u;
@@ -706,7 +711,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let behind = dot(n, dir) > 0.0;
     if (behind) { n = -n; }
 
-    var m = material(inst.pad0);
+    var m = material(inst.material);
     if (frame.debug_mode != 0u) { m = Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }
     switch (frame.debug_mode) {
       case 1u: { m.albedo = hash_color(vc.y * 7919u + vc.x * 104729u); }
@@ -795,12 +800,24 @@ fn taa(@builtin(global_invocation_id) gid: vec3u) {
     let near_point = frame.inv_view_proj * vec4f(ndc, 1.0, 1.0);
     let origin = frame.origin.xyz;
     let dir = normalize(near_point.xyz / near_point.w - origin);
-    let z = max(textureLoad(hw_depth, px, 0), bitcast<f32>(atomicLoad(&sw_buf[gid.x + gid.y * frame.width])));
+    let hd = textureLoad(hw_depth, px, 0);
+    let sd_bits = atomicLoad(&sw_buf[gid.x + gid.y * frame.width]);
+    let z = max(hd, bitcast<f32>(sd_bits));
     var prev: vec4f;
     if (z > 0.0) {
       let center = frame.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
       let forward = normalize(center.xyz / center.w - origin);
-      prev = frame.prev_view_proj * vec4f(origin + dir * (frame.near_z / z / dot(dir, forward)), 1.0);
+      var p = origin + dir * (frame.near_z / z / dot(dir, forward));
+      // A moving surface was elsewhere last frame: through its instance.
+      var instance = 0u;
+      if (hd > 0.0 && hd >= bitcast<f32>(sd_bits)) {
+        instance = hw_visible[textureLoad(hw_id, px, 0).x >> 7u].x;
+      } else {
+        instance = sw_visible[atomicLoad(&sw_buf[frame.width * frame.height + gid.x + gid.y * frame.width]) >> 7u].x;
+      }
+      let inst = load_instance(instance);
+      if (inst.anim != 0u) { p = to_world(load_prev_instance(instance), from_world(inst, p)); }
+      prev = frame.prev_view_proj * vec4f(p, 1.0);
     } else if (dir.y < 0.0) {
       prev = frame.prev_view_proj * vec4f(origin + dir * (-origin.y / dir.y), 1.0);
     } else {
