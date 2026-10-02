@@ -55,14 +55,15 @@ public:
     };
     struct stats_t {
         uint32_t resident = 0, slots = 0, loaded = 0, evicted = 0, waiting = 0, requested = 0, in_flight = 0;
+        uint32_t reads = 0;  // reads issued: pages close together in the file share one
         uint64_t bytes_loaded = 0;
     };
 
     // loader_threads 0 reads on the calling thread as issued, publishing the
     // same frame.
     streamer(std::vector<stream_page> pages, std::vector<uint32_t> deps, uint64_t pool_bytes, unsigned loader_threads = 2,
-             std::vector<uint32_t> children = {})
-        : pages_(std::move(pages)), deps_(std::move(deps)), children_(std::move(children)) {
+             std::vector<uint32_t> children = {}, bool merge_reads = true)
+        : pages_(std::move(pages)), deps_(std::move(deps)), children_(std::move(children)), merge_reads_(merge_reads) {
         uint32_t largest = 16;
         for (const stream_page& p : pages_) largest = std::max(largest, p.size);
         slot_bytes_ = (largest + 4095) / 4096 * 4096;
@@ -110,7 +111,7 @@ public:
     std::vector<copy> service(uint32_t frame, std::vector<std::pair<uint32_t, float>> requests, uint8_t* staging,
                               uint64_t staging_bytes, float threshold = INFINITY) {
         frame_ = frame;
-        stats_.loaded = stats_.evicted = 0;
+        stats_.loaded = stats_.evicted = stats_.reads = 0;
         stats_.requested = static_cast<uint32_t>(requests.size());
         stats_.bytes_loaded = 0;
         std::vector<copy> copies;
@@ -158,6 +159,7 @@ public:
             }
             if (!ok) ++waiting;
         }
+        flush_batch();
         if (loaders_.empty()) publish(staging, staging_bytes, copies, used);
         stats_.waiting = waiting;
         stats_.in_flight = static_cast<uint32_t>(issued_.size());
@@ -172,6 +174,18 @@ private:
         std::vector<uint8_t> data;
         std::atomic<bool> done{false};
     };
+    // one read covering pages close together in a file; each job gets its slice.
+    struct run {
+        int fd = -1;
+        uint64_t offset = 0, size = 0;
+        std::vector<std::shared_ptr<job>> jobs;
+    };
+    // pages issued in one frame merge into a read when the gap between them is at most this
+    // (read and dropped), up to max_run bytes: the file is laid out depth first, so a request
+    // and the pages prefetched below it are mostly neighbours.
+    static constexpr uint64_t max_gap = 64 << 10, max_run = 4 << 20;
+    std::vector<std::shared_ptr<job>> batch_;  // issued this frame, not yet read
+    bool merge_reads_ = true;                  // else a read per page
 
     static constexpr size_t max_prefetch = 4096;
     std::vector<stream_page> pages_;
@@ -191,31 +205,70 @@ private:
     std::vector<std::thread> loaders_;
     std::mutex queue_mutex_;
     std::condition_variable queue_ready_;
-    std::deque<std::shared_ptr<job>> queue_;  // waiting for a loader thread
+    std::deque<run> queue_;  // waiting for a loader thread
     bool stopping_ = false;
 
-    static void read(job& j, const stream_page& pg) {
-        j.data.resize(pg.size);
+    void read(const run& r) {
+        std::vector<uint8_t> buffer(r.size);
         size_t done = 0;
-        while (done < pg.size) {
-            const ssize_t n = pread(pg.fd, j.data.data() + done, pg.size - done, static_cast<off_t>(pg.file_offset + done));
+        while (done < r.size) {
+            const ssize_t n = pread(r.fd, buffer.data() + done, r.size - done, static_cast<off_t>(r.offset + done));
             if (n <= 0) throw std::runtime_error("reading a page failed");
             done += static_cast<size_t>(n);
         }
-        j.done.store(true, std::memory_order_release);
+        for (const auto& j : r.jobs) {
+            const stream_page& pg = pages_[j->page];
+            const uint8_t* from = buffer.data() + (pg.file_offset - r.offset);
+            j->data.assign(from, from + pg.size);
+            j->done.store(true, std::memory_order_release);
+        }
+    }
+
+    // this frame's issued pages, sorted by place in the file and merged into runs.
+    void flush_batch() {
+        std::sort(batch_.begin(), batch_.end(), [&](const auto& a, const auto& b) {
+            const stream_page &x = pages_[a->page], &y = pages_[b->page];
+            return x.fd != y.fd ? x.fd < y.fd : x.file_offset < y.file_offset;
+        });
+        std::vector<run> runs;
+        for (auto& j : batch_) {
+            const stream_page& pg = pages_[j->page];
+            if (!runs.empty() && merge_reads_) {
+                run& r = runs.back();
+                const uint64_t end = r.offset + r.size;
+                if (r.fd == pg.fd && pg.file_offset >= end && pg.file_offset - end <= max_gap &&
+                    pg.file_offset + pg.size - r.offset <= max_run) {
+                    r.size = pg.file_offset + pg.size - r.offset;
+                    r.jobs.push_back(std::move(j));
+                    continue;
+                }
+            }
+            runs.push_back({pg.fd, pg.file_offset, pg.size, {std::move(j)}});
+        }
+        batch_.clear();
+        stats_.reads += static_cast<uint32_t>(runs.size());
+        if (loaders_.empty()) {
+            for (const run& r : runs) read(r);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for (run& r : runs) queue_.push_back(std::move(r));
+        }
+        queue_ready_.notify_all();
     }
 
     void load_loop() {
         for (;;) {
-            std::shared_ptr<job> j;
+            run r;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 queue_ready_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
                 if (stopping_) return;
-                j = std::move(queue_.front());
+                r = std::move(queue_.front());
                 queue_.pop_front();
             }
-            read(*j, pages_[j->page]);
+            read(r);
         }
     }
 
@@ -299,15 +352,7 @@ private:
         auto j = std::make_shared<job>();
         j->page = p;
         issued_.push_back(j);
-        if (loaders_.empty()) {
-            read(*j, pg);
-        } else {
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex_);
-                queue_.push_back(std::move(j));
-            }
-            queue_ready_.notify_one();
-        }
+        batch_.push_back(std::move(j));  // read by flush_batch()
         return true;
     }
 };

@@ -140,6 +140,43 @@ paged_geometry page(const geometry& g) {
         members[pg].push_back(i);
     }
 
+    // file order: depth first from the roots, each page followed by the finer pages its clusters
+    // stand for, so a request and the pages prefetched below it sit close together and can be
+    // read in a few long runs (viewer/streamer.hpp, web/streamer.js).
+    {
+        std::vector<std::vector<uint32_t>> children(members.size());
+        for (const gpu_cluster& c : g.clusters) {
+            if (c.creator == UINT32_MAX) continue;
+            const uint32_t from = c.group == UINT32_MAX ? 0 : page_of_group.at(c.group);
+            const auto it = page_of_group.find(c.creator);
+            if (it != page_of_group.end()) children[from].push_back(it->second);
+        }
+        std::vector<uint32_t> order, stack = {0};
+        std::vector<uint8_t> seen(members.size(), 0);
+        seen[0] = 1;
+        while (!stack.empty()) {
+            const uint32_t pg = stack.back();
+            stack.pop_back();
+            order.push_back(pg);
+            auto& c = children[pg];
+            std::sort(c.begin(), c.end());
+            c.erase(std::unique(c.begin(), c.end()), c.end());
+            for (auto it = c.rbegin(); it != c.rend(); ++it)  // reversed, so the first child comes out first
+                if (!seen[*it]) {
+                    seen[*it] = 1;
+                    stack.push_back(*it);
+                }
+        }
+        for (uint32_t pg = 0; pg < members.size(); ++pg)
+            if (!seen[pg]) order.push_back(pg);  // unreachable: none expected, kept regardless
+        std::vector<uint32_t> new_index(members.size());
+        for (uint32_t k = 0; k < order.size(); ++k) new_index[order[k]] = k;
+        for (auto& [group, pg] : page_of_group) pg = new_index[pg];
+        std::vector<std::vector<uint32_t>> reordered(members.size());
+        for (uint32_t pg = 0; pg < members.size(); ++pg) reordered[new_index[pg]] = std::move(members[pg]);
+        members = std::move(reordered);
+    }
+
     // grid fine enough that the largest cluster spans grid_max steps.
     vec3 lo(INFINITY, INFINITY, INFINITY);
     float largest = 0;

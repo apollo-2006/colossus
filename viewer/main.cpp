@@ -236,6 +236,7 @@ struct options {
     float moving = 0;  // share of moving instances (animate() in common.glsl)
     bool full_res_shadows = false;
     bool prefetch = true;
+    bool merge_reads = true;   // pages close in the file share a read
 };
 
 struct camera {
@@ -494,9 +495,9 @@ std::string human(double v) {
 class renderer {
 public:
     renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, uint64_t pool_bytes, uint64_t upload_bytes,
-             unsigned loader_threads, bool prefetch, bool cull_only = false, uint32_t vsm_side = 32)
+             unsigned loader_threads, bool prefetch, bool cull_only = false, uint32_t vsm_side = 32, bool merge_reads = true)
         : ctx_(ctx), sc_(sc), cull_only_(cull_only), upload_bytes_(upload_bytes), vsm_side_(vsm_side),
-          streamer_(sc.pages, sc.deps, pool_bytes, loader_threads, prefetch ? sc.children : std::vector<uint32_t>{}) {
+          streamer_(sc.pages, sc.deps, pool_bytes, loader_threads, prefetch ? sc.children : std::vector<uint32_t>{}, merge_reads) {
         create_static_buffers();
         create_descriptors();
         create_pipelines();
@@ -1847,6 +1848,7 @@ options parse(int argc, char** argv) {
         else if (a == "--loader-threads") o.loader_threads = static_cast<unsigned>(std::stoul(next()));
         else if (a == "--cold") o.cold = true;
         else if (a == "--no-prefetch") o.prefetch = false;
+        else if (a == "--no-merge-reads") o.merge_reads = false;
         else if (a == "--sw-pixels") o.sw_pixels = std::clamp(std::stof(next()), 0.0f, 64.0f);  // sw_raster.comp's 32-bit math holds to 64
         else if (a == "--cull-only") o.cull_only = true;
         else if (a == "--camera") {
@@ -1896,13 +1898,15 @@ int main(int argc, char** argv) {
             vk::context ctx(nullptr, opt.validate);
             std::printf("GPU: %s\n", ctx.device_name.c_str());
             renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch, opt.cull_only,
-                       opt.vsm ? opt.vsm_side : 1);
+                       opt.vsm ? opt.vsm_side : 1, opt.merge_reads);
             std::vector<renderer::frame_result> results;
             const int total = opt.warmup + opt.frames;
             int settled = 0;  // frame after the last that asked for or waited on a page
             uint64_t streamed = 0;
-            uint32_t evicted = 0, most_resident = 0;
+            uint32_t evicted = 0, most_resident = 0, reads = 0;
             std::vector<double> service_ms;
+            const auto loop_start = std::chrono::steady_clock::now();
+            double settled_ms = 0;
             for (int i = 0; i < total + 2; ++i) {
                 if (opt.fly != 0 && i > 0) {
                     v.cam.eye += v.cam.forward() * opt.fly;
@@ -1915,16 +1919,21 @@ int main(int argc, char** argv) {
                                   last && !opt.screenshot.empty());
                 streamed += res.streaming.bytes_loaded;
                 evicted += res.streaming.evicted;
+                reads += res.streaming.reads;
                 service_ms.push_back(res.streaming_ms);
                 most_resident = std::max(most_resident, res.streaming.resident);
                 if (std::getenv("COLOSSUS_TRACE_STREAMING"))
-                    std::printf("frame %d: requests %u, loaded %u (%.1f MB), waiting %u, resident %u, drawn %u clusters, shadow pages %u (%u clusters)\n", i,
+                    std::printf("frame %d at %.0f ms: requests %u, loaded %u (%.1f MB), waiting %u, resident %u, drawn %u clusters, shadow pages %u (%u clusters)\n", i,
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_start).count(),
                                 res.streaming.requested, res.streaming.loaded, res.streaming.bytes_loaded / 1048576.0,
                                 res.streaming.waiting, res.streaming.resident, res.stats.clusters_drawn, res.stats.vsm_rendered,
                                 res.stats.vsm_visible);
                 // settled: nothing asked for or waiting from here on (the first frames ask
                 // nothing only because no requests are back yet).
-                if (res.streaming.requested != 0 || res.streaming.waiting != 0) settled = i + 1;
+                if (res.streaming.requested != 0 || res.streaming.waiting != 0) {
+                    settled = i + 1;
+                    settled_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_start).count();
+                }
                 if (res.valid && i >= opt.warmup + 2) results.push_back(res);
                 if (last && !opt.screenshot.empty()) {
                     png::write_rgb(opt.screenshot, opt.width, opt.height, r.read_pixels());
@@ -1932,9 +1941,10 @@ int main(int argc, char** argv) {
                 }
             }
             vkDeviceWaitIdle(ctx.device);
-            std::printf("streamed %.0f MB of %.0f MB on disk, evicted %u pages, at most %u resident; %s\n", streamed / 1048576.0,
-                        sc.total_page_bytes / 1048576.0, evicted, most_resident,
-                        settled < total ? ("settled after " + std::to_string(settled) + " frames").c_str() : "still streaming");
+            std::printf("streamed %.0f MB of %.0f MB on disk in %u reads, evicted %u pages, at most %u resident; %s\n",
+                        streamed / 1048576.0, sc.total_page_bytes / 1048576.0, reads, evicted, most_resident,
+                        settled < total ? ("settled after " + std::to_string(settled) + " frames, " + std::to_string(std::lround(settled_ms)) + " ms").c_str()
+                                        : "still streaming");
             std::sort(service_ms.begin(), service_ms.end());
             std::printf("render thread in the streamer: median %.3f ms, 99th percentile %.3f ms, worst %.3f ms (%s)\n",
                         service_ms[service_ms.size() / 2], service_ms[service_ms.size() * 99 / 100], service_ms.back(),
@@ -1966,7 +1976,7 @@ int main(int argc, char** argv) {
             swapchain swap(ctx, opt.vsync);
             swap.create(fw, fh);
             renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch,
-                       false, opt.vsm ? opt.vsm_side : 1);
+                       false, opt.vsm ? opt.vsm_side : 1, opt.merge_reads);
             std::printf("keys: wasd/qe move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-9, 0 view (shaded, clusters, triangles, lod level, groups, instances, holes, rasterizer,\n"
                         "      shadow levels, ambient occlusion)\n"
