@@ -27,16 +27,16 @@ geometry pack(const lod_mesh& lod) {
     for (const vec3& p : lod.positions) g.positions.insert(g.positions.end(), {p.x, p.y, p.z});
     for (const vec3& n : lod.normals) g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
     g.bounds = bounding_sphere(lod.positions.size(), [&](size_t i) { return lod.positions[i]; });
-    // Every LOD sphere, which can stick out past the model a little.
+    // every lod sphere, which can stick out past the model.
     g.lod_bounds = g.bounds;
     for (const lod_cluster& c : lod.clusters) {
         g.lod_bounds = merge(g.lod_bounds, c.lod_bounds);
         if (!std::isinf(c.parent_error)) g.lod_bounds = merge(g.lod_bounds, c.parent_bounds);
     }
 
-    // Sorted by parent error: a cluster can only be drawn while its parent
-    // looks too coarse, so from far away, only a tail of this order can be
-    // drawn, and the viewer skips the rest of a model with one binary search.
+    // by parent error: a cluster is drawable only while its parent looks too
+    // coarse, so from afar only a tail is, and the viewer skips the rest with
+    // one binary search.
     std::vector<uint32_t> order(lod.clusters.size());
     for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(),
@@ -106,12 +106,12 @@ geometry trim(const geometry& g, size_t max_triangles) {
     out.lod_bounds = g.lod_bounds;
     std::vector<uint32_t> remap(g.positions.size() / 3, UINT32_MAX);
     for (const gpu_cluster& c : g.clusters) {
-        if (c.parent_error <= floor_error) continue;  // Finer than the new leaves everywhere
+        if (c.parent_error <= floor_error) continue;  // finer than the new leaves everywhere
         gpu_cluster k = c;
         if (k.lod_error <= floor_error) {
             k.lod_error = 0;
             k.level = 0;
-            k.creator = UINT32_MAX;  // What it was made from is gone
+            k.creator = UINT32_MAX;  // its source is gone
         }
         k.vertex_offset = static_cast<uint32_t>(out.cluster_vertices.size());
         k.triangle_offset = static_cast<uint32_t>(out.cluster_triangles.size());
@@ -129,7 +129,7 @@ geometry trim(const geometry& g, size_t max_triangles) {
                                      g.cluster_triangles.begin() + c.triangle_offset + c.triangle_count);
         out.clusters.push_back(k);
     }
-    // Levels renumbered from the new leaves; stats are kept for the levels left.
+    // levels renumbered from the new leaves; stats kept for those left.
     uint32_t lowest = UINT32_MAX;
     for (const gpu_cluster& c : out.clusters)
         if (c.level != 0) lowest = std::min(lowest, c.level);
@@ -138,6 +138,6 @@ geometry trim(const geometry& g, size_t max_triangles) {
             if (c.level != 0) c.level -= lowest - 1;
     out.levels = g.levels;
     if (lowest != UINT32_MAX && lowest > 1) out.levels.erase(out.levels.begin(), out.levels.begin() + (lowest - 1));
-    // Still in order of parent error: the order is kept, only some removed.
+    // still by parent error: order kept, some removed.
     return out;
 }

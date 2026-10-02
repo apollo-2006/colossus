@@ -1,7 +1,7 @@
 #pragma once
-// A thin layer over Vulkan for the viewer: one device and queue, buffers,
-// images, shader modules, one-shot submissions, and a swapchain when there
-// is a window. Grown from photon_tracer's gpu/vk.hpp.
+// thin vulkan layer: one device and queue, buffers, images, shader modules,
+// one-shot submits, a swapchain with a window. grown from photon_tracer's
+// gpu/vk.hpp.
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -39,7 +39,7 @@ struct buffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceAddress address = 0;
     VkDeviceSize size = 0;
-    void* mapped = nullptr;  // For host-visible buffers
+    void* mapped = nullptr;  // host-visible buffers
 };
 
 struct image {
@@ -64,7 +64,7 @@ public:
 
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
 
-    // Ray queries, if the GPU has them: the viewer then traces shadows.
+    // ray queries, if present: for --shadows rt.
     bool ray_query = false;
     PFN_vkCreateAccelerationStructureKHR create_as = nullptr;
     PFN_vkDestroyAccelerationStructureKHR destroy_as = nullptr;
@@ -72,8 +72,7 @@ public:
     PFN_vkCmdBuildAccelerationStructuresKHR build_as = nullptr;
     PFN_vkGetAccelerationStructureDeviceAddressKHR as_address = nullptr;
 
-    // With a window, the instance gets the extensions GLFW needs and the
-    // device a swapchain.
+    // with a window: glfw's instance extensions and a device swapchain.
     context(GLFWwindow* window, bool validate) {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.pApplicationName = "colossus";
@@ -153,8 +152,8 @@ public:
         return b;
     }
 
-    // A device-local buffer holding bytes, copied in through a staging
-    // buffer in pieces, so a model of any size needs little host memory.
+    // device-local buffer filled through a staging buffer in pieces: any size,
+    // little host memory.
     buffer upload(const void* data, VkDeviceSize size, VkBufferUsageFlags usage) {
         buffer b = make_buffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         const VkDeviceSize piece = 64ull << 20;
@@ -206,7 +205,7 @@ public:
         return im;
     }
 
-    // An image from a full description, with a view of all its levels.
+    // image from a full description, viewing all levels.
     image make_image(const VkImageCreateInfo& ic, VkImageAspectFlags aspect) {
         image im;
         im.format = ic.format;
@@ -254,7 +253,7 @@ public:
         return cmd;
     }
 
-    // Records commands with record(cmd), submits them and waits.
+    // records with record(cmd), submits, waits.
     template <class Record>
     void submit(Record&& record) {
         VkCommandBuffer cmd = allocate_command_buffer();
@@ -289,8 +288,8 @@ private:
         return r;
     }
 
-    // The first GPU with Vulkan 1.3 and mesh shaders (and presenting, with
-    // a window); discrete first.
+    // first gpu with vulkan 1.3 and mesh shaders (and presenting, with a
+    // window); discrete first.
     void pick_device() {
         uint32_t n = 0;
         vkEnumeratePhysicalDevices(instance, &n, nullptr);
@@ -372,7 +371,7 @@ private:
         v13.pNext = &mesh;
         VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         v12.scalarBlockLayout = VK_TRUE;
-        v12.shaderBufferInt64Atomics = VK_TRUE;  // The visibility buffer
+        v12.shaderBufferInt64Atomics = VK_TRUE;  // visibility buffer
         v12.hostQueryReset = VK_TRUE;
         v12.bufferDeviceAddress = VK_TRUE;
         v12.pNext = &v13;
@@ -380,7 +379,7 @@ private:
         features.features.shaderInt64 = VK_TRUE;
         features.features.fragmentStoresAndAtomics = VK_TRUE;
         features.features.multiDrawIndirect = VK_TRUE;
-        features.features.shaderStorageImageArrayDynamicIndexing = VK_TRUE;  // The depth pyramid's levels
+        features.features.shaderStorageImageArrayDynamicIndexing = VK_TRUE;  // depth pyramid levels
         features.pNext = &v12;
 
         auto ext = required();
@@ -422,7 +421,7 @@ private:
     }
 };
 
-// Records a memory barrier between two stages.
+// memory barrier between two stages.
 inline void barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                     VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
     VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -436,7 +435,7 @@ inline void barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAcce
     vkCmdPipelineBarrier2(cmd, &di);
 }
 
-// Moves an image between layouts, waiting on src_stage and blocking dst_stage.
+// image layout change, waiting on src_stage, blocking dst_stage.
 inline void transition(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
                        VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
                        VkAccessFlags2 dst_access) {

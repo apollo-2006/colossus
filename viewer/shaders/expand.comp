@@ -1,7 +1,6 @@
 #version 460
-// Writes the pieces of work for instances instance_cull.comp found to have
-// many (a nearby instance can have thousands): one workgroup per instance,
-// all 64 invocations writing.
+// writes work items for instances with many (near ones, thousands): a workgroup
+// each, all 64 invocations writing.
 #include "common.glsl"
 
 layout(local_size_x = 64) in;

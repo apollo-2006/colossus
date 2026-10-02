@@ -1,20 +1,19 @@
 #pragma once
-// The built hierarchy, with the clusters as the GPU reads them and every
-// level indexing one shared vertex array: the form it is checked and
-// trimmed in, before page() packs it for shipping (paged_file.hpp).
+// the built hierarchy, clusters as the gpu reads them, all levels indexing one
+// vertex array: checked and trimmed here before page() packs it
+// (paged_file.hpp).
 //
-// Each cluster lists the vertices it uses (indices into the shared vertex
-// arrays) and its triangles as three bytes indexing that list, packed into
-// one uint32 each, the layout a mesh shader workgroup reads.
+// each cluster lists its vertices (into the shared arrays) and its triangles as
+// three bytes into that list, one uint32 each.
 #include "cluster.hpp"
 #include "dag.hpp"
 
 #include <string>
 #include <vector>
 
-// Laid out as the shaders read it: 112 bytes, a multiple of 16 for WGSL.
+// as the shaders read it: 112 bytes, a multiple of 16 for wgsl.
 struct gpu_cluster {
-    float center[3];  // Culling bounds
+    float center[3];  // culling bounds
     float radius;
     float cone_axis[3];
     float cone_cutoff;
@@ -24,35 +23,34 @@ struct gpu_cluster {
     float parent_radius;
     float lod_error;
     float parent_error;  // FLT_MAX for a root
-    uint32_t vertex_offset;    // Into cluster_vertices
-    uint32_t triangle_offset;  // Into cluster_triangles
+    uint32_t vertex_offset;    // into cluster_vertices
+    uint32_t triangle_offset;  // into cluster_triangles
     uint32_t vertex_count;
     uint32_t triangle_count;
     uint32_t level;
-    uint32_t group;    // The group it was simplified in (UINT32_MAX for a root)
-    uint32_t creator;  // The group whose simplification made it (UINT32_MAX for a leaf)
-    uint32_t origin[3];  // Paged: the cluster's corner on the model's grid (paged_file.hpp)
+    uint32_t group;    // group it was simplified in (UINT32_MAX for a root)
+    uint32_t creator;  // group whose simplification made it (UINT32_MAX for a leaf)
+    uint32_t origin[3];  // paged: the cluster's corner on the model's grid (paged_file.hpp)
 };
 static_assert(sizeof(gpu_cluster) == 112, "gpu_cluster must match the shaders");
 
 struct geometry {
     std::vector<float> positions;  // xyz per vertex
     std::vector<float> normals;    // xyz per vertex
-    std::vector<gpu_cluster> clusters;  // In order of parent error
+    std::vector<gpu_cluster> clusters;  // by parent error
     std::vector<uint32_t> cluster_vertices;
     std::vector<uint32_t> cluster_triangles;  // a | b << 8 | c << 16
     std::vector<lod_level_stats> levels;
-    sphere bounds;      // Around the whole model
-    sphere lod_bounds;  // Around bounds and every cluster's LOD and parent spheres
+    sphere bounds;      // around the model
+    sphere lod_bounds;  // around bounds and every lod and parent sphere
 
     size_t leaf_triangles() const;
 };
 
 geometry pack(const lod_mesh& lod);
 
-// Drops the finest levels, keeping the finest cut with at most
-// max_triangles triangles as the new leaves (their error becomes 0) and
-// every cluster that can be drawn above it. Each kept leaf's parent is
-// unchanged, so cuts stay crack-free. Unused vertices are dropped. For
-// shipping a model somewhere memory is short, like a web page.
+// drops the finest levels: the finest cut within max_triangles becomes the
+// leaves (error 0), with everything drawable above it. parents unchanged, so
+// cuts stay crack-free. unused vertices dropped. for memory-short targets like
+// the web.
 geometry trim(const geometry& g, size_t max_triangles);

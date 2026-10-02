@@ -1,54 +1,51 @@
-// Shared by every shader of the web demo: the scene, laid out as
-// renderer.js writes it, and the culling and LOD tests. A port of
-// viewer/shaders/common.glsl.
+// shared by every web shader: the scene as renderer.js writes it, culling and
+// lod tests. port of common.glsl.
 
 struct Frame {
   view_proj: mat4x4f,
   inv_view_proj: mat4x4f,
-  cull_planes: array<vec4f, 5>,  // World space: inside where dot(xyz, p) + w >= 0
+  cull_planes: array<vec4f, 5>,  // world space: inside where dot(xyz, p) + w >= 0
   cull_origin: vec4f,
   origin: vec4f,
   width: u32,
   height: u32,
   instance_count: u32,
   flags: u32,
-  lod_scale: f32,      // Pixels per unit of size at distance 1
-  lod_threshold: f32,  // Allowed error on screen, in pixels
+  lod_scale: f32,      // pixels per unit at distance 1
+  lod_threshold: f32,  // allowed error on screen, pixels
   near_z: f32,
   debug_mode: u32,
   max_work: u32,
   max_visible: u32,
   sw_max_pixels: f32,
   time: f32,
-  frame_index: u32,   // Counts from 1: stamps pages used and requested
+  frame_index: u32,   // from 1: stamps pages used and requested
   max_requests: u32,
   pad0: u32,
   pad1: u32,
-  unused0: mat4x4f,  // Held the old shadow map's camera; kept so the layout stands
+  unused0: mat4x4f,  // was the old shadow map's camera; kept for the layout
   unused1: f32,
   unused2: f32,
   pad2: u32,
   pad3: u32,
-  // Occlusion culling: the depth pyramid's cameras. Pass 1 tests against
-  // last frame's pyramid from last frame's camera; pass 2 against this
-  // frame's, built after pass 1.
+  // occlusion: the pyramid's cameras. pass 1 against last frame's pyramid and
+  // camera; pass 2 this frame's, built after pass 1.
   view: mat4x4f,
   prev_view: mat4x4f,
-  p00: f32,  // Projection scale in x and y
+  p00: f32,  // projection scale, x and y
   p11: f32,
   hzb_levels: u32,
   pad4: u32,
-  // Temporal antialiasing: last frame's camera without its sub-pixel
-  // offset, this frame's offset (clip space), and whether last frame's
-  // image fits this one.
+  // taa: last frame's unjittered camera, this frame's offset (clip space),
+  // whether last frame's image fits.
   prev_view_proj: mat4x4f,
   jitter: vec2f,
   taa_valid: u32,
-  prev_time: f32,  // Last frame's time, for moving instances
+  prev_time: f32,  // last frame's time, for motion
 }
 
-// include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
-// 112 bytes. `group` is its page, and the offsets are words into it.
+// gpu_cluster (include/geometry_file.hpp) as paged: 112 bytes. `group` is its
+// page; offsets are words into it.
 struct Cluster {
   center: vec3f,
   radius: f32,
@@ -67,8 +64,8 @@ struct Cluster {
   level: u32,
   group: u32,
   creator: u32,
-  // Its corner on the model's grid. Three u32, not a vec3u: that would
-  // align to 16 bytes and make the struct 128 bytes, not the file's 112.
+  // corner on the model's grid. three u32, not vec3u, which would align to 16
+  // and make 128 bytes.
   origin_x: u32,
   origin_y: u32,
   origin_z: u32,
@@ -81,15 +78,15 @@ struct Mesh {
   pad1: u32,
   bounds: vec4f,
   lod_bounds: vec4f,
-  grid: vec4f,  // Where positions snap: xyz grid point 0, w the step
+  grid: vec4f,  // position snapping: xyz grid point 0, w step
 }
 
 struct Instance {
-  rows: array<vec4f, 3>,  // The 3x4 to-world transform, by rows
+  rows: array<vec4f, 3>,  // 3x4 to-world, by rows
   mesh: u32,
   scale: f32,
-  material: u32,  // Into compute.wgsl's materials
-  anim: u32,      // 0: still. Else moving (see animate()): phase in the low 8 bits, bit 8 turns it the other way
+  material: u32,  // into compute.wgsl's materials
+  anim: u32,      // 0: still. else moving (animate()): phase in low 8 bits, bit 8 reverses
 }
 
 const FLAG_CONE = 1u;
@@ -97,22 +94,21 @@ const FLAG_FRUSTUM = 2u;
 const FLAG_SOFTWARE = 4u;
 const FLAG_SHADOWS = 16u;
 const FLAG_OCCLUSION = 32u;
-const FLAG_PREV_VALID = 64u;  // Last frame's pyramid fits this frame
+const FLAG_PREV_VALID = 64u;  // last frame's pyramid fits this frame
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
-// Pages stream into the pool (web/streamer.js): the page table holds each
-// one's first word there, or NO_PAGE.
+// pages stream into the pool (web/streamer.js); the page table holds each one's
+// first word, or NO_PAGE.
 const NO_PAGE = 0xffffffffu;
 @group(0) @binding(2) var<storage, read> page_table: array<u32>;
 @group(0) @binding(3) var<storage, read> pool: array<u32>;
 @group(0) @binding(6) var<storage, read> meshes: array<Mesh>;
 @group(0) @binding(7) var<storage, read> instances: array<Instance>;
 
-// As in the viewer's common.glsl: a moving instance turns on the spot and
-// drifts round a small circle, computed from the time. Last frame's
-// transform (load_prev_instance) is where last frame's depth pyramid and
-// image have it.
+// as common.glsl: a moving instance turns on the spot and drifts round a small
+// circle, from the time. its last transform (load_prev_instance) is where last
+// frame's pyramid and image have it.
 fn animate(inst_in: Instance, t: f32) -> Instance {
   var inst = inst_in;
   if (inst.anim == 0u) { return inst; }
@@ -136,7 +132,7 @@ fn load_prev_instance(i: u32) -> Instance {
   return animate(instances[i], frame.prev_time);
 }
 
-// The inverse of to_world: a rotation and a uniform scale.
+// inverse of to_world: rotation and uniform scale.
 fn from_world(inst: Instance, p: vec3f) -> vec3f {
   let d = p - vec3f(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
   let c0 = vec3f(inst.rows[0].x, inst.rows[1].x, inst.rows[2].x);
@@ -154,8 +150,8 @@ fn to_world_dir(inst: Instance, v: vec3f) -> vec3f {
   return vec3f(dot(inst.rows[0].xyz, v), dot(inst.rows[1].xyz, v), dot(inst.rows[2].xyz, v));
 }
 
-// A vertex is two words: 14-bit offsets from the cluster's corner on the
-// model's grid, and an 11 + 11 bit octahedral normal (include/paged_file.hpp).
+// a vertex is two words: 14-bit offsets from the cluster's corner and an 11 +
+// 11 bit octahedral normal (include/paged_file.hpp).
 fn cluster_position(c: Cluster, grid: vec4f, k: u32) -> vec3f {
   let at = page_table[c.group] + c.vertex_offset + 2u * k;
   let w0 = pool[at];
@@ -174,7 +170,7 @@ fn cluster_normal(c: Cluster, k: u32) -> vec3f {
   return normalize(n);
 }
 
-// Triangles are three bytes each, packed end to end.
+// triangles: three packed bytes each.
 fn cluster_triangle(c: Cluster, t: u32) -> u32 {
   let byte = 3u * t;
   let at = page_table[c.group] + c.triangle_offset + byte / 4u;
@@ -192,9 +188,8 @@ fn sphere_in_frustum(c: vec3f, r: f32) -> bool {
   return inside;
 }
 
-// How many pixels an error of world size `error` covers at the nearest
-// point of a sphere. Clusters of one group compute this from identical
-// numbers, so they always agree.
+// pixels an error of world size `error` covers at a sphere's nearest point. a
+// group computes it from identical numbers, so it agrees.
 fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
   let d = length(center - frame.cull_origin.xyz) - radius;
   return error * frame.lod_scale / max(d, frame.near_z);

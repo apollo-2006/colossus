@@ -1,20 +1,20 @@
-"""Splits a .cgeo file for the web demo: name.meta.gz (everything but the
-page data, gzipped) and name.pages (the page data, raw, so the page can
-read one page at a time with HTTP range requests)."""
+"""splits a .cgeo for the web demo: name.meta.gz (all but page data,
+gzipped) and name.pages (raw page data, read a page at a time by http
+range request)."""
 import gzip
 import struct
 import sys
 
 for path in sys.argv[1:]:
     data = open(path, "rb").read()
-    at = 8 + 48  # Magic, bounds, LOD bounds, grid
+    at = 8 + 48  # magic, bounds, lod bounds, grid
 
     def skip(element):
         global at
         n = struct.unpack_from("<Q", data, at)[0]
         at += 8 + n * element
 
-    for element in (112, 24, 4, 40):  # Clusters, pages, dependencies, levels
+    for element in (112, 24, 4, 40):  # clusters, pages, dependencies, levels
         skip(element)
     size = struct.unpack_from("<Q", data, at)[0]
     at += 8

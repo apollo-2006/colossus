@@ -1,7 +1,7 @@
 #version 460
-// Writes depth and triangle into the visibility buffer with one 64-bit
-// atomic max: depth is reversed, so the nearest wins. The depth attachment
-// still rejects most hidden fragments before they get here.
+// depth and triangle into the visibility buffer in one 64-bit atomic max:
+// reversed depth, nearest wins. the depth attachment rejects most hidden
+// fragments first.
 #extension GL_EXT_mesh_shader : require
 #extension GL_EXT_shader_atomic_int64 : require
 #include "common.glsl"

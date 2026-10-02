@@ -1,6 +1,5 @@
 #pragma once
-// Small vector and matrix types for the builder and the viewer. Matrices are
-// column major, as GLSL reads a mat4.
+// vector and matrix types. matrices are column major, as glsl reads a mat4.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -34,7 +33,7 @@ struct sphere {
     float radius = 0;
 };
 
-// The smallest sphere around a and b.
+// smallest sphere around a and b.
 inline sphere merge(const sphere& a, const sphere& b) {
     const vec3 d = b.center - a.center;
     const float dist = length(d);
@@ -44,9 +43,8 @@ inline sphere merge(const sphere& a, const sphere& b) {
     return {a.center + d * ((r - a.radius) / dist), r};
 }
 
-// A sphere around points, by Ritter's method: a start from two far apart
-// points, grown to take in any point left outside. Within a few percent of
-// the smallest.
+// sphere around points (ritter): start from two far points, grow to take in the
+// rest. within a few percent of the smallest.
 template <class Get>
 sphere bounding_sphere(size_t n, Get&& point) {
     if (n == 0) return {};
@@ -71,12 +69,12 @@ sphere bounding_sphere(size_t n, Get&& point) {
             s.radius = r;
         }
     }
-    s.radius *= 1.0001f;  // Rounding
+    s.radius *= 1.0001f;  // rounding
     return s;
 }
 
 struct mat4 {
-    float m[16] = {};  // Column major: m[col * 4 + row]
+    float m[16] = {};  // column major: m[col * 4 + row]
     float& at(int row, int col) { return m[col * 4 + row]; }
     float at(int row, int col) const { return m[col * 4 + row]; }
     static mat4 identity() {
@@ -103,7 +101,7 @@ inline vec3 transform_point(const mat4& a, vec3 p) {
             a.at(2, 0) * p.x + a.at(2, 1) * p.y + a.at(2, 2) * p.z + a.at(2, 3)};
 }
 
-// A camera looking from eye along forward, with up roughly up.
+// camera at eye, looking along forward.
 inline mat4 look_to(vec3 eye, vec3 forward, vec3 up) {
     const vec3 f = normalize(forward), s = normalize(cross(f, up)), u = cross(s, f);
     mat4 r = mat4::identity();
@@ -113,9 +111,9 @@ inline mat4 look_to(vec3 eye, vec3 forward, vec3 up) {
     return r;
 }
 
-// Perspective with reversed depth and no far plane: depth is near / z, 1 at
-// the near plane and falling toward 0, which spreads float precision evenly
-// over distance. Vulkan's y runs down, so y is flipped here.
+// perspective, reversed depth, no far plane: depth is near / z, 1 at the near
+// plane falling to 0, which spreads float precision over distance. y flipped
+// for vulkan.
 inline mat4 perspective_reverse_z(float fov_y, float aspect, float near_z) {
     const float f = 1 / std::tan(fov_y / 2);
     mat4 r;
@@ -126,7 +124,7 @@ inline mat4 perspective_reverse_z(float fov_y, float aspect, float near_z) {
     return r;
 }
 
-// Rotation by angle around a unit axis, then uniform scale, then translation.
+// rotate by angle around a unit axis, uniform scale, translate.
 inline mat4 trs(vec3 t, vec3 axis, float angle, float scale) {
     const float c = std::cos(angle), s = std::sin(angle), k = 1 - c;
     const vec3 a = normalize(axis);
@@ -144,7 +142,7 @@ inline mat4 trs(vec3 t, vec3 axis, float angle, float scale) {
     return r;
 }
 
-// The inverse of a general 4x4 matrix, by cofactors.
+// inverse of a general 4x4, by cofactors.
 inline mat4 inverse(const mat4& a) {
     const float* m = a.m;
     float inv[16];

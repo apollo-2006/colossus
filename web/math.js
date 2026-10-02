@@ -1,4 +1,4 @@
-// Column-major 4x4 matrices as Float32Array(16), as WGSL reads a mat4x4f.
+// column-major 4x4 matrices as Float32Array(16), as wgsl reads a mat4x4f.
 
 export const mul = (a, b) => {
   const r = new Float32Array(16);
@@ -24,9 +24,8 @@ export function lookTo(eye, forward, up) {
     -dot(s, eye), -dot(u, eye), dot(f, eye), 1]);
 }
 
-// Reversed depth with no far plane: near / z, 1 at the near plane falling
-// toward 0. WebGPU's clip space has y up, so unlike the Vulkan viewer's,
-// nothing is flipped.
+// reversed depth, no far plane: near / z, 1 at the near plane falling to 0.
+// webgpu clip space has y up: nothing flipped.
 export function perspectiveReverseZ(fovY, aspect, near) {
   const f = 1 / Math.tan(fovY / 2);
   return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, near, 0]);
@@ -55,7 +54,7 @@ export function invert(m) {
   return inv;
 }
 
-// Frustum planes (Gribb and Hartmann): left, right, bottom, top, near,
+// frustum planes (gribb and hartmann): left, right, bottom, top, near,
 // normalized, inside where dot(xyz, p) + w >= 0.
 export function frustumPlanes(m) {
   const row = (r) => [m[r], m[4 + r], m[8 + r], m[12 + r]];
@@ -69,10 +68,4 @@ export function frustumPlanes(m) {
     const l = Math.hypot(p[0], p[1], p[2]);
     return p.map((v) => v / l);
   });
-}
-
-// Orthographic projection of the box [-half, half] x [-half, half] x
-// [near, far] in view space (looking down -z), depth 0 at near and 1 at far.
-export function orthographic(half, near, far) {
-  return new Float32Array([1 / half, 0, 0, 0, 0, 1 / half, 0, 0, 0, 0, -1 / (far - near), 0, 0, 0, -near / (far - near), 1]);
 }

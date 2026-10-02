@@ -11,7 +11,7 @@ struct tri_edge {
     bool operator==(const tri_edge& o) const { return a == o.a && b == o.b; }
 };
 
-// Edges used by exactly one of the given triangles, and the area.
+// edges used by exactly one of the triangles, and the area.
 template <class ForEachTriangle>
 std::vector<tri_edge> single_edges(ForEachTriangle&& each, const geometry& g, double& area) {
     std::vector<tri_edge> e;
@@ -60,7 +60,7 @@ std::vector<cut_report> check_cuts(const geometry& g, int steps) {
     for (const gpu_cluster& c : g.clusters) top = std::max(top, c.lod_error);
     std::vector<cut_report> out;
     for (int s = 0; s <= steps; ++s) {
-        // Spaced geometrically, plus 0 and one past the top.
+        // geometric spacing, plus 0 and one past the top.
         const float t = s == 0 ? 0 : top * 1.01f * std::pow(1e-4f, 1 - static_cast<float>(s) / steps);
         cut_report r;
         r.threshold = t;

@@ -1,36 +1,27 @@
 #pragma once
-// Which pages live in the GPU's page pool: the CPU side of streaming.
+// which pages live in the gpu's page pool: streaming's cpu side.
 //
-// The GPU asks for pages: a cluster that is drawn but would rather be
-// replaced by finer clusters, whose page is missing, requests that page,
-// with its error on screen as the priority. Each frame the streamer reads
-// the requests and issues loads for the most wanted pages, dependencies
-// first, each into a slot of the pool (free, or taken from the least
-// recently used page). Loader threads read the pages from disk; the render
-// thread only issues loads and, frames later, publishes the ones that have
-// finished: it hands back the copies to record and a new page table.
+// the gpu asks: a drawn cluster that would rather be its finer clusters, whose
+// page is missing, requests it, with its error on screen as priority. each
+// frame the streamer issues loads for the most wanted pages, dependencies
+// first, into free or least recently used slots. loader threads read; the
+// render thread only issues and, frames later, publishes finished loads: copies
+// to record and a new page table.
 //
-// One rule keeps every cut whole: a page may only be resident while its
-// dependencies (the pages holding the coarser clusters its group was
-// simplified into) are. So:
-//   * loads are issued dependencies first, and published in the order they
-//     were issued, so a page never goes live before its dependencies,
-//     however the reads finish;
-//   * a page counts as depending on its dependencies from the moment its
-//     load is issued, and a page is evicted only when nothing resident or
-//     loading depends on it.
-// Then, wherever finer clusters are missing, the coarser ones that stand
-// for them are there to be drawn instead, and the GPU's test (lod_test()
-// in viewer/shaders/common.glsl) draws exactly one level along every path.
-// The roots (page 0 of each model) never leave.
+// one rule keeps cuts whole: a page is resident only while its dependencies
+// (pages of the coarser clusters its group simplified into) are. so:
+//   * loads are issued dependencies first and published in issue order, so a
+//     page never goes live before them;
+//   * a page depends on its dependencies from the moment its load is issued,
+//     and is evicted only when nothing resident or loading depends on it.
+// wherever finer clusters are missing, their stand-ins are there, and
+// lod_test() (viewer/shaders/common.glsl) draws one level per path. roots (each
+// model's page 0) never leave.
 //
-// A request also says how far from good enough its cluster is: its error
-// on screen, against the threshold. Each level of the hierarchy roughly
-// halves the error, so a cluster at four times the threshold will need
-// two more levels; the streamer prefetches the finer pages below the one
-// asked for, at half the priority a level, while that stays over the
-// threshold, instead of waiting for each level to be drawn and ask in
-// turn.
+// each level roughly halves the error, so a cluster at four times the threshold
+// needs two more levels: the streamer prefetches the pages below a request at
+// half the priority a level, while the predicted error stays over the
+// threshold.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -47,12 +38,12 @@
 #include <vector>
 
 struct stream_page {
-    int fd;                // The model's file
-    uint64_t file_offset;  // Where the page's bytes are in it
+    int fd;                // the model's file
+    uint64_t file_offset;  // where the page's bytes are
     uint32_t size;
-    uint32_t dep_first, dep_count;  // Into the streamer's dependency list, global page numbers
-    bool pinned;           // A root page: loaded first, never evicted
-    uint32_t child_first = 0, child_count = 0;  // Finer pages below it, in the streamer's child list
+    uint32_t dep_first, dep_count;  // into the dependency list, global page numbers
+    bool pinned;           // root: loaded first, never evicted
+    uint32_t child_first = 0, child_count = 0;  // finer pages below it, in the child list
 };
 
 class streamer {
@@ -67,8 +58,8 @@ public:
         uint64_t bytes_loaded = 0;
     };
 
-    // loader_threads 0 reads pages on the calling thread, as they are
-    // issued, and publishes them in the same frame.
+    // loader_threads 0 reads on the calling thread as issued, publishing the
+    // same frame.
     streamer(std::vector<stream_page> pages, std::vector<uint32_t> deps, uint64_t pool_bytes, unsigned loader_threads = 2,
              std::vector<uint32_t> children = {})
         : pages_(std::move(pages)), deps_(std::move(deps)), children_(std::move(children)) {
@@ -101,22 +92,21 @@ public:
 
     uint64_t slot_bytes() const { return slot_bytes_; }
     uint64_t pool_bytes() const { return uint64_t(slot_count_) * slot_bytes_; }
-    // Per page: its first word in the pool, or none.
+    // per page: its first word in the pool, or none.
     const std::vector<uint32_t>& table() const { return table_; }
-    // Published: in the table, for the GPU to draw from.
+    // published: in the table, drawable.
     bool resident(uint32_t page) const { return slot_of_[page] != none && !loading_[page]; }
     const stats_t& stats() const { return stats_; }
 
-    // Pages the GPU drew from, as frame numbers per page.
+    // pages the gpu drew from, as frame numbers.
     void note_used(const uint32_t* stamps) {
         for (size_t p = 0; p < pages_.size(); ++p) last_used_[p] = std::max(last_used_[p], stamps[p]);
     }
 
-    // Publishes the loads that have finished (into `staging`, at most
-    // staging_bytes this frame), then issues loads for what is asked for
-    // (page, priority: higher first). Returns the copies from staging into
-    // the pool to record before this frame's culling; table() is then this
-    // frame's page table.
+    // publishes finished loads (into `staging`, at most staging_bytes), then
+    // issues loads for requests (page, priority: higher first). returns the
+    // copies from staging to the pool to record before culling; table() is then
+    // this frame's page table.
     std::vector<copy> service(uint32_t frame, std::vector<std::pair<uint32_t, float>> requests, uint8_t* staging,
                               uint64_t staging_bytes, float threshold = INFINITY) {
         frame_ = frame;
@@ -127,8 +117,8 @@ public:
         uint64_t used = 0;
         publish(staging, staging_bytes, copies, used);
 
-        // Prefetch: the finer pages below each request, while their
-        // predicted error stays over the threshold.
+        // prefetch: finer pages below each request while their predicted error
+        // stays over the threshold.
         if (!children_.empty()) {
             for (size_t r = 0; r < requests.size() && requests.size() < 8 * max_prefetch; ++r) {
                 const auto [page, priority] = requests[r];
@@ -136,7 +126,7 @@ public:
                 const stream_page& pg = pages_[page];
                 for (uint32_t k = 0; k < pg.child_count; ++k) requests.push_back({children_[pg.child_first + k], priority * 0.5f});
             }
-            // Each page once, at its highest priority.
+            // each page once, at its highest priority.
             std::sort(requests.begin(), requests.end());
             size_t w = 0;
             for (size_t r = 0; r < requests.size(); ++r) {
@@ -145,18 +135,18 @@ public:
             }
             requests.resize(w);
         }
-        // Roots first, on the first frames.
+        // roots first, on the first frames.
         for (uint32_t p = 0; p < pages_.size(); ++p)
             if (pages_[p].pinned && slot_of_[p] == none) requests.push_back({p, INFINITY});
         std::sort(requests.begin(), requests.end(), [](auto& a, auto& b) { return a.second > b.second; });
         candidates_ready_ = false;
         uint32_t waiting = 0;
-        // Reads in flight are bounded too, so a burst of requests cannot
-        // queue more than a few frames' worth of disk.
+        // reads in flight are bounded too: a burst cannot queue more than a few
+        // frames of disk.
         const uint64_t flight_limit = 4 * staging_bytes;
         for (const auto& [page, priority] : requests) {
             if (page >= pages_.size() || slot_of_[page] != none) continue;
-            // The page and every missing dependency below it, coarsest first.
+            // the page and every missing dependency, coarsest first.
             std::vector<uint32_t> chain;
             collect(page, chain);
             bool ok = true;
@@ -191,17 +181,17 @@ private:
     std::vector<uint32_t> free_;
     std::vector<uint32_t> slot_of_, last_used_, dependents_, table_;
     std::vector<uint8_t> loading_;
-    std::vector<uint32_t> candidates_;  // Evictable pages, least recently used last
+    std::vector<uint32_t> candidates_;  // evictable, least recently used last
     bool candidates_ready_ = false;
     uint32_t frame_ = 0;
     stats_t stats_;
 
-    std::deque<std::shared_ptr<job>> issued_;  // In issue order, until published
+    std::deque<std::shared_ptr<job>> issued_;  // in issue order, until published
     uint64_t in_flight_bytes_ = 0;
     std::vector<std::thread> loaders_;
     std::mutex queue_mutex_;
     std::condition_variable queue_ready_;
-    std::deque<std::shared_ptr<job>> queue_;  // Waiting for a loader thread
+    std::deque<std::shared_ptr<job>> queue_;  // waiting for a loader thread
     bool stopping_ = false;
 
     static void read(job& j, const stream_page& pg) {
@@ -229,8 +219,8 @@ private:
         }
     }
 
-    // Publishes finished loads in the order they were issued, stopping at
-    // the first one still being read.
+    // publishes finished loads in issue order, stopping at the first still
+    // reading.
     void publish(uint8_t* staging, uint64_t staging_bytes, std::vector<copy>& copies, uint64_t& used) {
         while (!issued_.empty() && issued_.front()->done.load(std::memory_order_acquire)) {
             job& j = *issued_.front();
@@ -249,9 +239,8 @@ private:
         }
     }
 
-    // Lists the page and its missing dependencies, coarsest first. Its
-    // dependencies already there are marked used this frame: making room
-    // for the page must not evict what it is about to depend on.
+    // lists the page and its missing dependencies, coarsest first. dependencies
+    // present are marked used: making room must not evict them.
     void collect(uint32_t page, std::vector<uint32_t>& chain) {
         if (slot_of_[page] != none) {
             last_used_[page] = frame_;
@@ -263,9 +252,8 @@ private:
         chain.push_back(page);
     }
 
-    // A page may go if it is published, not a root, nothing resident or
-    // loading depends on it, and nothing drew from it in the last two
-    // frames.
+    // evictable: published, not a root, nothing resident or loading depends on
+    // it, unused for two frames.
     bool evictable(uint32_t p) const {
         return resident(p) && !pages_[p].pinned && dependents_[p] == 0 && last_used_[p] + 2 <= frame_;
     }
@@ -286,7 +274,7 @@ private:
         while (!candidates_.empty()) {
             const uint32_t p = candidates_.back();
             candidates_.pop_back();
-            if (!evictable(p)) continue;  // Something came to depend on it this frame
+            if (!evictable(p)) continue;  // something came to depend on it this frame
             const uint32_t s = slot_of_[p];
             slot_of_[p] = none;
             table_[p] = none;
@@ -298,14 +286,14 @@ private:
         return none;
     }
 
-    // Reserves a slot and starts the read; the page goes live when published.
+    // reserves a slot and starts the read; live when published.
     bool issue(uint32_t p) {
         const uint32_t s = take_slot();
         if (s == none) return false;
         const stream_page& pg = pages_[p];
         slot_of_[p] = s;
         loading_[p] = 1;
-        last_used_[p] = frame_;  // Not to be evicted again this frame
+        last_used_[p] = frame_;  // not to be evicted again this frame
         for (uint32_t k = 0; k < pg.dep_count; ++k) ++dependents_[deps_[pg.dep_first + k]];
         in_flight_bytes_ += pg.size;
         auto j = std::make_shared<job>();

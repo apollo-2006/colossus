@@ -12,33 +12,30 @@
 
 namespace {
 
-constexpr uint32_t group_target = 8;  // Clusters per group
-// A group whose simplification keeps more than this share of its
-// triangles is left as it is: its clusters become roots.
+constexpr uint32_t group_target = 8;  // clusters per group
+// a group keeping more than this share of its triangles is left as is: its
+// clusters become roots.
 constexpr float stuck_ratio = 0.85f;
 constexpr uint32_t max_levels = 48;
-// A simplification whose measured worst spot is more than this many times
-// its quadric estimate is tried again more gently (see build_lod).
+// a simplification measuring over this many times its quadric estimate is
+// retried more gently (see build_lod).
 constexpr float outlier_ratio = 4.0f;
 constexpr size_t min_group_triangles = 64;
-// The hierarchy goes on until a single cluster of at most this many
-// triangles is left: every instance draws at least its root, so a crowd
-// stretching to the horizon draws this many per speck.
+// go on until one cluster of at most this many triangles remains: every
+// instance draws at least its root.
 constexpr size_t root_triangles = 32;
 
-// Groups the clusters (numbers into all) into sets of about group_target
-// that share as many edges as possible.
+// groups clusters (numbers into all) into sets of about group_target sharing
+// the most edges.
 //
-// Greedy growth: seeds are taken in spatial order, and a group takes the
-// unassigned neighbour it shares the most edges with until it is full or
-// has no neighbours left. Groups that end up small are then merged into the
-// neighbouring group they share the most edges with.
+// greedy: seeds in spatial order; a group takes the unassigned neighbour it
+// shares most edges with until full or out of neighbours. small groups merge
+// into their best-connected neighbour.
 std::vector<std::vector<uint32_t>> partition(const std::vector<lod_cluster>& all, const std::vector<uint32_t>& level) {
     const size_t n = level.size();
 
-    // Each cluster's border edges (edges used by one of its triangles),
-    // tagged with the cluster; sorted, equal edges from two clusters make
-    // the clusters neighbours, weighted by how many edges they share.
+    // each cluster's border edges, tagged with it; sorted, equal edges from two
+    // clusters make them neighbours, weighted by edges shared.
     struct tagged { uint32_t a, b, cluster; };
     std::vector<std::vector<tagged>> per_cluster(n);
     parallel_for(n, [&](size_t i) {
@@ -86,7 +83,7 @@ std::vector<std::vector<uint32_t>> partition(const std::vector<lod_cluster>& all
         }
     }
 
-    // Seeds in Morton order of the cluster centers.
+    // seeds in morton order of cluster centres.
     vec3 lo = all[level[0]].bounds.center, hi = lo;
     for (uint32_t c : level) { lo = min(lo, all[c].bounds.center); hi = max(hi, all[c].bounds.center); }
     std::vector<uint64_t> code(n);
@@ -142,7 +139,7 @@ std::vector<std::vector<uint32_t>> partition(const std::vector<lod_cluster>& all
         for (uint32_t c : touched) weight[c] = 0;
     }
 
-    // Merge small groups into their best-connected neighbour group.
+    // merge small groups into their best-connected neighbour.
     for (size_t g = 0; g < groups.size(); ++g) {
         if (groups[g].empty() || groups[g].size() > group_target / 2) continue;
         std::vector<std::pair<uint32_t, uint32_t>> links;  // (group, shared edges)
@@ -203,8 +200,7 @@ void cluster_bounds(const std::vector<vec3>& positions, lod_cluster& c) {
         float min_dot = 1;
         for (const vec3& fn : normals) min_dot = std::min(min_dot, dot(fn, axis));
         c.cone_axis = axis;
-        // Normals spread past about 84 degrees from the axis leave too
-        // little to cull for the test to pay.
+        // normals spread past about 84 degrees cull too little to pay.
         if (min_dot > 0.1f) c.cone_cutoff = std::sqrt(1 - min_dot * min_dot);
     }
 }
@@ -253,7 +249,7 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
         const auto groups = partition(out.clusters, level);
         stats.groups = groups.size();
 
-        // A vertex is locked if two groups use it.
+        // a vertex is locked if two groups use it.
         std::fill(owner.begin(), owner.end(), UINT32_MAX);
         std::fill(locked.begin(), locked.end(), 0);
         for (uint32_t g = 0; g < groups.size(); ++g)
@@ -276,26 +272,21 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 bounds = merge(bounds, cl.lod_bounds);
             }
             const size_t tris = merged.size() / 3;
-            // The last group, all that is left of the model: nothing
-            // borders it, so when edge collapses get stuck (thin parts
-            // and hole rims, a few hundred triangles from the end),
-            // vertex clustering takes over.
+            // the last group, the whole model: nothing borders it, so when
+            // collapses stall (thin parts, hole rims) vertex clustering takes
+            // over.
             const bool last = groups.size() == 1;
-            // Errors add: the new level is this far from this one, which is
-            // child_error from the original. How far is measured, not the
-            // simplifier's quadric estimate, which is a mean and typically
-            // a little under half the worst spot; the larger is kept.
+            // errors add: child_error plus how far this level is from the last,
+            // measured, not the quadric estimate (a mean, typically under half
+            // the worst spot); the larger is kept.
             //
-            // A few groups come out far worse than their estimate (a thin
-            // part folded flat, a hole's rim pulled across). Those are
-            // simplified again, more gently, and the attempt that measures
-            // better is kept. Either way the measured error is the one
-            // recorded, so a bad spot costs detail, never correctness.
-            // Groups of a few triangles are islands of the scan, cut off
-            // from the rest: halving a ten-triangle flake reshapes it
-            // entirely (the dragon's worst three groups at level 0 were
-            // these, measuring 6 to 0.4 percent of its size). They stay as
-            // they are, roots at full detail, which costs a few triangles.
+            // groups far worse than their estimate (a thin part folded flat, a
+            // rim pulled across) are retried more gently and the better kept.
+            // the measured error is recorded either way: a bad spot costs
+            // detail, not correctness. groups of a few triangles are scan
+            // islands; halving one reshapes it (the dragon's worst level 0
+            // groups, 6 to 0.4 percent of its size). they stay as roots at full
+            // detail.
             if (tris < min_group_triangles && !last) {
                 stuck[g] = 1;
                 return;
@@ -328,10 +319,9 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
             }
         });
 
-        // A stuck group's clusters go on to the next level as they are.
-        // There they are grouped with other neighbours, so different
-        // vertices are locked, and they usually simplify. Their parent is
-        // whatever group finally does.
+        // a stuck group's clusters go to the next level as they are, grouped
+        // with other neighbours, locking other vertices; they usually simplify
+        // there. their parent is whichever group does.
         std::vector<uint32_t> next;
         for (uint32_t g = 0; g < groups.size(); ++g) {
             if (stuck[g]) {
@@ -357,7 +347,7 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                         stats.clusters, stats.triangles, stats.groups, stats.stuck_groups, stats.max_error,
                         seconds_since(start));
         group_base += static_cast<uint32_t>(groups.size());
-        if (stats.stuck_groups == groups.size()) break;  // No progress: what is left are roots
+        if (stats.stuck_groups == groups.size()) break;  // no progress: the rest are roots
         level = std::move(next);
     }
     return out;

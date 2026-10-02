@@ -1,9 +1,8 @@
-// The hardware path for large clusters: an ordinary render pipeline, since
-// WebGPU has no mesh shaders. One instance per visible cluster, 384
-// vertices each (128 triangles' worth); each vertex finds its cluster,
-// triangle and corner and pulls its position from storage. Triangles past a
-// cluster's count collapse to a point and draw nothing. The fragment writes
-// (visible cluster, triangle) into an r32uint target, behind the depth test.
+// hardware path for big clusters, a render pipeline for want of mesh shaders:
+// an instance per visible cluster, 384 vertices each; each vertex finds its
+// cluster, triangle and corner and pulls its position. triangles past the count
+// collapse to a point. the fragment writes (visible cluster, triangle) to an
+// r32uint target behind the depth test.
 
 @group(1) @binding(0) var<storage, read> hw_visible: array<vec2u>;
 struct PassInfo {
@@ -13,8 +12,8 @@ struct PassInfo {
   pad1: u32,
 }
 @group(1) @binding(2) var<uniform> pass_info: PassInfo;
-// compute.wgsl's Counters, for where each pass's clusters start in
-// hw_visible (args_draw writes it).
+// compute.wgsl's Counters, for each pass's start in hw_visible (written by
+// args_draw).
 struct Counters {
   counts: array<u32, 12>,
   pass_start: array<u32, 8>,
@@ -50,7 +49,7 @@ fn fs(in: VertexOut) -> @location(0) u32 {
   return in.id;
 }
 
-// Copies the shaded image to the canvas: a triangle covering the screen.
+// shaded image to the canvas: one screen-covering triangle.
 @group(1) @binding(1) var shaded: texture_2d<f32>;
 
 @vertex

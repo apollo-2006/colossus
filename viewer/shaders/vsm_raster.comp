@@ -1,21 +1,17 @@
 #version 460
-// Rasterizes clusters into the shadow pages being rendered: one workgroup
-// per cluster, one invocation per vertex and then per triangle, as in
-// sw_raster.comp. Coordinates are texels of the cluster's level, snapped
-// to 1/16, and edge functions are measured from each triangle's corner;
-// a triangle over 1024 texels across would overflow them and is left out
-// (none come near). Each covered texel is looked up in the page it falls
-// in, and kept if that page is being rendered; depth is written with an
-// atomic max, nearest the sun winning. Both sides are drawn. A triangle
-// whose box reaches no page being rendered is skipped outright: a moving
-// statue reaches hundreds of pages on the finest level, and only those a
-// pixel on screen needs are rendered.
+// rasterizes clusters into the shadow pages being rendered, like
+// sw_raster.comp: a workgroup per cluster, an invocation per vertex then per
+// triangle. texels of the cluster's level, snapped to 1/16, edges from each
+// triangle's corner; triangles over 1024 texels would overflow and are dropped
+// (none come near). each covered texel is kept if its page renders; depth by
+// atomic max, nearest the sun wins. both sides drawn. triangles whose box
+// reaches no rendered page are skipped.
 #include "common.glsl"
 #include "vsm.glsl"
 
 layout(local_size_x = 128) in;
 
-shared ivec2 snapped[128];  // Texels, in 1/16
+shared ivec2 snapped[128];  // texels, 1/16
 shared float depth[128];
 
 int edge(ivec2 a, ivec2 b, ivec2 p) {
@@ -48,7 +44,7 @@ void setup_and_small() {
     const uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
     ivec2 a = snapped[i0], b = snapped[i1], d = snapped[i2];
     float za = depth[i0], zb = depth[i1], zd = depth[i2];
-    // Texel centers are at n + 0.5: the box of centers inside.
+    // texel centres at n + 0.5: the box of centres inside.
     const ivec2 lo_abs = (min(a, min(b, d)) - 8 + 15) >> 4;
     const ivec2 hi_abs = (max(a, max(b, d)) - 8) >> 4;
     if (any(greaterThan(lo_abs, hi_abs)) || any(greaterThan(hi_abs - lo_abs, ivec2(1023)))) return;
@@ -63,8 +59,7 @@ void setup_and_small() {
         const float tz = zb; zb = zd; zd = tz;
         area = -area;
     }
-    // Most triangles fall within one page or two; if none of the pages the
-    // box reaches is being rendered, there is nothing to do.
+    // most triangles span a page or two; none rendering, nothing to do.
     const ivec2 page_lo = lo_abs >> 7, page_hi = hi_abs >> 7;
     bool any_page = false;
     for (int py = page_lo.y; py <= page_hi.y && !any_page; ++py)
@@ -83,7 +78,7 @@ void setup_and_small() {
     const ivec2 hi = hi_abs - lo_abs;
     for (int y = 0; y <= hi.y; ++y) {
         int w0 = row0, w1 = row1, w2 = row2;
-        // The page this row is in changes only every vsm_page texels.
+        // a row's page changes every vsm_page texels.
         uint phys = vsm_none;
         int page_x = 0x7fffffff;
         for (int x = 0; x <= hi.x; ++x) {

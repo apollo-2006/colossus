@@ -11,8 +11,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the Vulkan headers, GLFW and glslc
         run: sudo apt-get update && sudo apt-get install -y libvulkan-dev libglfw3-dev glslc
-      # The viewer is built to check it compiles; running it needs a GPU
-      # with mesh shaders, which the runner has not.
+      # the viewer only compiles here: running needs a gpu with mesh shaders.
       - name: Build
         run: make -j"$(nproc)"
       - name: Test the builder

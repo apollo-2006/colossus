@@ -1,14 +1,12 @@
 #version 460
-// Shades every pixel from the visibility buffer (see surface.glsl for how
-// the surface under a pixel is found). Pixels with nothing drawn get the
-// ground or the sky. Debug modes color by cluster, triangle, LOD level,
-// group, instance or rasterizer instead.
+// shades every pixel from the visibility buffer (surface.glsl finds the
+// surface); nothing drawn is ground or sky. debug modes colour by cluster,
+// triangle, lod level, group, instance, rasterizer or shadow level.
 //
-// Built twice: with RAY_QUERY defined, sunlight is tested against
-// acceleration structures over a coarser cut of each model (see
-// build_shadow_scene() in main.cpp). shadow.comp traces those rays at half
-// resolution; each pixel borrows the answer where its neighbours agree and
-// traces its own ray where they do not (see sunlight()).
+// built twice: with RAY_QUERY, --shadows rt traces against acceleration
+// structures over coarser cuts (build_shadow_scene() in main.cpp); shadow.comp
+// traces at half resolution and pixels borrow where neighbours agree
+// (sunlight()).
 #include "common.glsl"
 #include "surface.glsl"
 #include "vsm.glsl"
@@ -16,20 +14,19 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D out_image;
 
-// Instances carry one of these (Instance::material): albedo, roughness,
-// metalness.
+// per instance (Instance::material): albedo, roughness, metalness.
 struct Material {
     vec3 albedo;
     float roughness;
     float metallic;
 };
 const Material materials[6] = Material[](
-    Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0),   // Plaster: the plain look
-    Material(vec3(0.66, 0.64, 0.6), 0.3, 0.0),    // Polished marble
-    Material(vec3(0.62, 0.5, 0.38), 0.85, 0.0),   // Sandstone
-    Material(vec3(0.58, 0.38, 0.22), 0.35, 1.0),  // Bronze
-    Material(vec3(0.95, 0.74, 0.36), 0.28, 1.0),  // Gold
-    Material(vec3(0.2, 0.2, 0.22), 0.45, 0.0));   // Dark granite
+    Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0),   // plaster: the plain look
+    Material(vec3(0.66, 0.64, 0.6), 0.3, 0.0),    // polished marble
+    Material(vec3(0.62, 0.5, 0.38), 0.85, 0.0),   // sandstone
+    Material(vec3(0.58, 0.38, 0.22), 0.35, 1.0),  // bronze
+    Material(vec3(0.95, 0.74, 0.36), 0.28, 1.0),  // gold
+    Material(vec3(0.2, 0.2, 0.22), 0.45, 0.0));   // dark granite
 
 vec3 sky(vec3 dir) {
     const float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
@@ -41,8 +38,8 @@ vec3 hash_color(uint x) {
     return vec3(float(h & 255u), float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0 * 0.8 + 0.1;
 }
 
-// Cool to hot over the LOD levels: a hue wheel from blue (level 0, full
-// detail) through green and yellow to red and magenta (level 16 and up).
+// cool to hot over lod levels: blue (level 0) through green, yellow, red to
+// magenta (16 and up).
 vec3 level_color(uint level) {
     const float h = 0.66 - 0.055 * float(min(level, 16u));
     const vec3 k = abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
@@ -58,11 +55,9 @@ vec2 to_pixel(vec3 world) {
     return (clip.xy / clip.w * 0.5 + 0.5) * vec2(frame.width, frame.height);
 }
 
-// Sunlight at a pixel's surface. Borrowed from the half resolution
-// shadows when every neighbour whose surface is at this pixel's distance
-// agrees; traced here along shadow edges, where they do not, and wherever
-// no neighbour is at this distance (silhouettes). So shadow edges keep
-// full resolution, and only they cost a ray.
+// ray traced sunlight: borrowed from the half resolution result where every
+// neighbour at this distance agrees; traced here at shadow edges and
+// silhouettes.
 float sunlight(uvec2 px, Surface s) {
     if ((frame.flags & flag_shadows) == 0u) return 1.0;
     if ((frame.flags & flag_vsm) != 0u) return s.kind == surface_sky ? 1.0 : vsm_shadow(s.hit, s.n, s.t);
@@ -85,8 +80,7 @@ float sunlight(uvec2 px, Surface s) {
 #endif
 }
 
-// Sunlight off a surface: Lambert, plus GGX specular with Schlick's
-// Fresnel and a Smith shadowing term.
+// lambert plus ggx specular, schlick fresnel, smith shadowing.
 vec3 shade_material(Material m, vec3 n, vec3 v, float lit) {
     const vec3 f0 = mix(vec3(0.04), m.albedo, m.metallic);
     const float nl = max(dot(n, sun_dir), 0.0), nv = max(dot(n, v), 1e-4);
@@ -97,11 +91,11 @@ vec3 shade_material(Material m, vec3 n, vec3 v, float lit) {
     const float k = (m.roughness + 1.0) * (m.roughness + 1.0) / 8.0;
     const float g = nl / (nl * (1.0 - k) + k) * nv / (nv * (1.0 - k) + k);
     const vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
-    // Scaled by pi, as the diffuse term leaves out its 1 / pi.
+    // times pi: the diffuse term drops its 1 / pi.
     const vec3 specular = 3.14159 * d * g * fresnel / max(4.0 * nl * nv, 1e-4);
     const vec3 diffuse = m.albedo * (1.0 - m.metallic) * (1.0 - fresnel);
     const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42;
-    // Sky seen in the reflection, fading with roughness.
+    // sky in the reflection, fading with roughness.
     const vec3 env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
     const vec3 env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8;
     return (diffuse + specular) * sun_color * nl * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
@@ -119,10 +113,9 @@ void main() {
     const Surface s = surface_at(px);
     vec3 color = sky(s.dir);
     if (s.kind != surface_object && frame.debug_mode == 6u) {
-        color = vec3(1.0, 0.0, 1.0);  // Holes: anything not drawn
+        color = vec3(1.0, 0.0, 1.0);  // holes: nothing drawn
     } else if (s.kind == surface_ground) {
-        // The ground: a plane at y = 0 with a faint grid, fading into the
-        // sky with distance.
+        // ground: y = 0 with a faint grid, fading into the sky.
         const vec2 cell = abs(fract(s.hit.xz * 0.5) - 0.5);
         const float line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
         const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) *
@@ -130,8 +123,8 @@ void main() {
         color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
     }
     if (s.kind != surface_sky && frame.debug_mode == 8u) {
-        // Shadow levels: the virtual shadow map level each pixel reads, dark
-        // where it is in shadow; magenta where no level had its pages.
+        // shadow levels: each pixel's vsm level, dark in shadow; magenta where
+        // no level had pages.
         uint used = vsm_levels;
         const float lit = vsm_lookup(s.hit, s.n, s.t, used);
         color = used == vsm_levels ? vec3(1.0, 0.0, 1.0) : level_color(used * 2u) * (0.3 + 0.7 * lit);
@@ -151,7 +144,7 @@ void main() {
 
         const float lit = dot(s.n, sun_dir) > 0.0 ? sunlight(px, s) : 0.0;
         color = shade_material(m, s.n, -s.dir, lit);
-        // Seen from behind: no rim light, which would outline every sliver.
+        // from behind: no rim light, which would outline every sliver.
         if (!s.behind) color += pow(1.0 - max(dot(s.n, -s.dir), 0.0), 4.0) * 0.25 * sky(s.n) * (1.0 - m.metallic);
 
         if ((frame.flags & flag_wireframe) != 0u) {

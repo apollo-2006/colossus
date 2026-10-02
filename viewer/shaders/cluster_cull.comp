@@ -1,17 +1,14 @@
 #version 460
-// Cluster culling: one workgroup per work item, one invocation per cluster.
-// Each cluster is drawn if it is the right LOD for its distance (see
-// include/dag.hpp), inside the view, facing the camera and not hidden; the
-// survivors are appended to the visible list, which the mesh shaders draw.
+// cluster culling: a workgroup per work item, an invocation per cluster. kept
+// if the right lod for its distance (include/dag.hpp), in view, facing the
+// camera, not hidden; survivors go to the visible list.
 //
-// This was a task shader at first, emitting mesh workgroups directly. On
-// RADV, task workgroups cost enough each that testing 630k clusters took
-// 1.1 ms; as plain compute it takes a fraction of that.
+// once a task shader. on radv task workgroups cost enough that 630k clusters
+// took 1.1 ms; as compute, a fraction.
 //
-// Pass 1 tests occlusion against last frame's depth, and lists what it
-// finds hidden. Pass 2 takes its own work items (instances pass 1 found
-// hidden) and then that list, 64 to a workgroup, and tests them against the
-// depth pass 1 drew: what was hidden last frame but is seen now is drawn.
+// pass 1 tests against last frame's depth and lists what it hides. pass 2 takes
+// its own items (instances pass 1 hid) then that list, 64 a workgroup, against
+// pass 1's depth: hidden last frame, seen now, drawn.
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 #include "common.glsl"
@@ -28,7 +25,7 @@ void main() {
     uint instance_id = 0u, cluster_id = 0u, triangles = 0u;
     const uint items = cull_args[pass].w;
     if (group < items) {
-        // A work item: 64 clusters of one instance, tested in full.
+        // a work item: 64 clusters of one instance, fully tested.
         const WorkItem w = work[pass * frame.max_work_items + group];
         const Instance inst = load_instance(w.instance);
         const Mesh m = meshes[inst.mesh];
@@ -42,15 +39,14 @@ void main() {
             const vec3 center = to_world(inst, c.center);
             const float r = c.radius * s;
             if (draw && (frame.flags & flag_frustum_culling) != 0u) draw = sphere_in_frustum(center, r);
-            // Every triangle faces away when the view direction lies inside
-            // the cone around the axis: see include/dag.hpp.
+            // all triangles face away when the view direction lies in the cone:
+            // include/dag.hpp.
             if (draw && (frame.flags & flag_cone_culling) != 0u && c.cone_cutoff < 1.0) {
                 const vec3 axis = normalize(to_world_dir(inst, c.cone_axis));
                 const vec3 view = center - frame.cull_origin.xyz;
                 if (dot(view, axis) >= c.cone_cutoff * length(view) + r) draw = false;
             }
-            // Pass 1 asks whether it was hidden last frame, where last
-            // frame was.
+            // pass 1: was it hidden last frame, where it was last frame.
             const vec3 then = pass == 0u && inst.anim != 0u ? to_world(load_prev_instance(w.instance), c.center) : center;
             if (draw && occluded(then, r)) {
                 draw = false;
@@ -58,7 +54,7 @@ void main() {
             }
         }
     } else if (pass == 1u) {
-        // A piece of pass 1's hidden clusters: only occlusion is left to test.
+        // pass 1's hidden clusters: only occlusion left to test.
         const uint k = (group - items) * 64u + lane;
         if (k < min(late_cluster_count, frame.max_visible)) {
             tested = true;
@@ -75,8 +71,8 @@ void main() {
     if (draw) {
         const Cluster c = clusters[cluster_id];
         triangles = c.triangle_count;
-        // For the streamer: this page is in use, and this cluster would
-        // rather be finer clusters that are not loaded.
+        // streaming: page in use; this cluster would rather be unloaded finer
+        // ones.
         page_used[c.group] = frame.frame_index;
         if (wants_finer) request_finer(c, self_error);
     }
@@ -96,9 +92,8 @@ void main() {
         else atomicAdd(stats.clusters_late, drawn_n);
     }
 
-    // Small clusters go to the software rasterizer: their triangles are a
-    // pixel or two, which the hardware rasterizer handles poorly. Clusters
-    // reaching the near plane always go to the hardware, which clips.
+    // small clusters go to the software rasterizer (pixel-sized triangles suit
+    // it). clusters reaching the near plane go to the hardware, which clips.
     bool software = false;
     if (draw && (frame.flags & flag_software_raster) != 0u) {
         const Instance inst = load_instance(instance_id);
@@ -113,7 +108,7 @@ void main() {
     }
     const bool hw = draw && !software;
 
-    // Survivors take consecutive slots: one atomic per subgroup per list.
+    // survivors take consecutive slots: one atomic per subgroup per list.
     const uint hw_n = subgroupAdd(hw ? 1u : 0u);
     const uint sw_n = subgroupAdd(software ? 1u : 0u);
     uint hw_base = 0u, sw_base = 0u;

@@ -1,24 +1,18 @@
-// colossus viewer: draws instanced cluster LOD hierarchies (.cgeo
-// files from colossus_build) with task and mesh shaders on Vulkan.
+// colossus viewer: draws instanced cluster lod hierarchies (.cgeo from colossus_build) with mesh
+// shaders and a compute rasterizer on vulkan.
 //
-// Each frame:
-//   1. instance_cull.comp drops instances outside the view and, for each
-//      one left, finds by binary search the clusters that might be drawn
-//      at its distance, as work items of 64 clusters.
-//   2. cluster_cull.comp tests each of those clusters: the LOD cut, the
-//      frustum, the normal cone and occlusion. Survivors are appended to a
-//      visible list.
-//   3. draw.mesh draws each survivor; vis.frag writes depth and triangle
-//      into a 64-bit visibility buffer with an atomic max. Clusters small
-//      on screen go to sw_raster.comp instead, a compute rasterizer that
-//      writes the same buffer the same way.
-// Steps 1 to 3 run twice: first testing occlusion against last frame's
-// depth pyramid, then, after a pyramid is built from what that drew,
-// re-testing what the first pass found hidden.
-//   4. shade.comp rebuilds the triangle under every pixel and shades it.
+// each frame:
+//   1. cell_cull.comp, then instance_cull.comp: drop cells and instances out of view or hidden;
+//      binary search the clusters an instance might draw, as work items of 64.
+//   2. cluster_cull.comp: lod cut, frustum, normal cone, occlusion. survivors go to a visible
+//      list.
+//   3. draw.mesh + vis.frag for big clusters, sw_raster.comp for small: depth and triangle into
+//      a 64-bit visibility buffer by atomic max.
+// steps 1 to 3 run twice: against last frame's depth pyramid, then a fresh one.
+//   4. shadow pages (vsm_*.comp), shade.comp, taa.comp.
 //
-//   colossus --model models/lucy.cgeo --grid 10
-//   colossus --model a.cgeo --model b.cgeo --grid 40 --headless --frames 60 --screenshot out.png
+//     colossus --model models/lucy.cgeo --grid 10
+//     colossus --model a.cgeo --model b.cgeo --grid 40 --headless --frames 60 --screenshot out.png
 #include "paged_file.hpp"
 #include "streamer.hpp"
 #include "png.hpp"
@@ -111,30 +105,29 @@ constexpr uint32_t frames_in_flight = 2;
 constexpr uint32_t vsm_levels = 12, vsm_window = 32, vsm_page = 128, vsm_slots = vsm_levels * vsm_window * vsm_window;
 constexpr uint32_t vsm_lists_header = 8 + 8 * vsm_levels + 2 * vsm_levels * vsm_window, vsm_big_capacity = 65536;
 constexpr uint32_t max_work_items = 1u << 22;
-constexpr uint32_t max_visible = 1u << 22;  // Leaves 7 bits for the triangle in a 32-bit id... and 3 to spare
+constexpr uint32_t max_visible = 1u << 22;  // leaves 7 bits for the triangle in a 32-bit id, and 3 to spare
 constexpr const char* mode_names[] = {"shaded", "clusters", "triangles", "LOD level", "groups", "instances", "holes", "rasterizer",
                                       "shadow levels"};
 constexpr uint32_t mode_count = 9;
 
-// Laid out as viewer/shaders/common.glsl declares them (scalar layout).
+// as common.glsl declares them (scalar layout).
 struct gpu_mesh {
     uint32_t first_cluster, cluster_count;
     float shadow_error;
     uint32_t pad1;
     float bounds[4];
     float lod_bounds[4];
-    float grid[4];  // Grid point 0 and the step: see paged_file.hpp
+    float grid[4];  // grid point 0 and step: see paged_file.hpp
 };
 struct gpu_instance {
     float rows[3][4];
     uint32_t mesh;
     float scale;
-    uint32_t material;  // Into shade.comp's materials
-    uint32_t anim;      // See animate() in common.glsl
+    uint32_t material;  // into shade.comp's materials
+    uint32_t anim;      // see animate() in common.glsl
 };
-// Instances are culled in cells of up to 64 neighbours first (see
-// cell_cull.comp): a sphere around the cell, and its instances, which are
-// consecutive.
+// cells of up to 64 neighbouring instances, culled first (cell_cull.comp): a sphere, and
+// consecutive instances.
 struct gpu_cell {
     float center[3], radius;
     uint32_t first, count;
@@ -178,11 +171,10 @@ struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
     uint32_t work_overflow, visible_overflow;
     uint32_t instances_occluded, clusters_occluded, clusters_late, clusters_software;
-    uint32_t vsm_rendered, vsm_overflow;  // Copied from vsm.glsl's lists, not counted by the shaders
+    uint32_t vsm_rendered, vsm_overflow;  // copied from vsm.glsl's lists
     uint32_t vsm_work, vsm_big, vsm_visible;
 };
-// common.glsl's DrawArgs, for its size and where pass 2's instance
-// culling arguments sit.
+// common.glsl's DrawArgs: size and argument offsets.
 struct draw_args_layout {
     uint32_t cull_args[2][4], draw_args[2][4], sw_args[2][4];
     uint32_t pass_start[3], sw_pass_start[3];
@@ -198,15 +190,14 @@ struct gpu_push {
 
 constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
                    flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64, flag_full_res_shadows = 128, flag_taa = 256,
-                   flag_moving = 512,  // Some instances move: see animate() in common.glsl
-                   flag_vsm = 1024;    // Shadows from virtual shadow maps (vsm.glsl), not rays
-// Shadows are traced against cuts of each model, the finest within each of
-// these budgets: rays from far surfaces use the coarser ones (see
-// trace_surface() in surface.glsl).
+                   flag_moving = 512,  // some instances move: see animate() in common.glsl
+                   flag_vsm = 1024;    // virtual shadow maps (vsm.glsl), not rays
+// ray traced shadows use the finest cut within each budget; far surfaces use coarser ones
+// (trace_surface() in surface.glsl).
 constexpr size_t shadow_budgets[] = {1u << 18, 1u << 15, 1u << 12};
 constexpr uint32_t shadow_lods = 3;
 constexpr uint32_t max_hzb_levels = 16;
-constexpr uint32_t max_requests = 1u << 14;  // Pages the GPU may ask for in a frame
+constexpr uint32_t max_requests = 1u << 14;  // pages the gpu may ask for per frame
 
 struct options {
     std::vector<std::string> models;
@@ -214,7 +205,7 @@ struct options {
     float spacing = 1.4f;
     int width = 1600, height = 900;
     bool headless = false, validate = false, vsync = true;
-    int frames = 0;  // Headless: how many to draw (they are timed)
+    int frames = 0;  // headless: frames drawn and timed
     std::string screenshot;
     float threshold = 1.0f;
     uint32_t mode = 0;
@@ -222,27 +213,27 @@ struct options {
     vec3 eye;
     float yaw = 0, pitch = 0;
     bool wireframe = false;
-    uint32_t disable = 0;  // Flags turned off from the command line
+    uint32_t disable = 0;  // flags turned off on the command line
     bool cull_only = false;
     float sw_pixels = 32;
-    uint64_t pool_mb = 1024;   // The page pool
-    bool vsm = true;           // Shadows from virtual shadow maps, not ray queries (--shadows rt)
-    uint32_t vsm_side = 32;    // Physical shadow pages a side: 32 is 1024 pages, 128 MB (two layers)
-    uint64_t upload_mb = 64;   // Pages loaded per frame, at most
-    int warmup = 0;            // Headless: frames drawn before timing starts
-    float fly = 0;             // Headless: move the camera this far forward each frame, turning slowly
+    uint64_t pool_mb = 1024;   // page pool
+    bool vsm = true;           // virtual shadow maps, not ray queries (--shadows rt)
+    uint32_t vsm_side = 32;    // physical shadow pages a side: 32 is 1024 pages, 128 mb (two layers)
+    uint64_t upload_mb = 64;   // pages loaded per frame, at most
+    int warmup = 0;            // headless: frames before timing
+    float fly = 0;             // headless: camera moves this far forward per frame, turning slowly
     unsigned loader_threads = 2;  // 0: read pages on the render thread
-    bool cold = false;         // Drop the models from the OS's file cache first, so pages come off the disk
+    bool cold = false;         // evict the models from the os file cache first
     bool mixed_materials = true;
-    float moving = 0;  // Share of instances that move (see animate() in common.glsl)
+    float moving = 0;  // share of moving instances (animate() in common.glsl)
     bool full_res_shadows = false;
     bool prefetch = true;
 };
 
 struct camera {
     vec3 eye{0, 0.6f, 2.5f};
-    float yaw = 0, pitch = -0.15f;  // Yaw 0 looks down -z
-    float fov = 1.0f;               // Vertical, radians
+    float yaw = 0, pitch = -0.15f;  // yaw 0 looks down -z
+    float fov = 1.0f;               // vertical, radians
     float near_z = 0.01f;
 
     vec3 forward() const {
@@ -253,8 +244,8 @@ struct camera {
     }
 };
 
-// Frustum planes from a view-projection matrix (Gribb and Hartmann): left,
-// right, bottom, top and near, normalized. There is no far plane.
+// frustum planes from a view-projection (gribb and hartmann): left, right, bottom, top, near,
+// normalized. no far plane.
 void frustum_planes(const mat4& m, float out[5][4]) {
     auto row = [&](int r) { return std::array<float, 4>{m.at(r, 0), m.at(r, 1), m.at(r, 2), m.at(r, 3)}; };
     const auto r0 = row(0), r1 = row(1), r2 = row(2), r3 = row(3);
@@ -263,7 +254,7 @@ void frustum_planes(const mat4& m, float out[5][4]) {
         {r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]},
         {r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]},
         {r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]},
-        {r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]},  // Reversed depth: z <= w
+        {r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]},  // reversed depth: z <= w
     };
     for (int k = 0; k < 5; ++k) {
         const float l = std::sqrt(planes[k][0] * planes[k][0] + planes[k][1] * planes[k][1] + planes[k][2] * planes[k][2]);
@@ -271,27 +262,27 @@ void frustum_planes(const mat4& m, float out[5][4]) {
     }
 }
 
-// The coarser copy of a model that shadow rays are traced against.
+// coarser copy of a model for shadow rays.
 struct shadow_mesh {
-    uint32_t first_vertex, vertex_count;  // In scene::shadow_positions
-    uint32_t first_index, index_count;    // In scene::shadow_indices, relative to first_vertex
+    uint32_t first_vertex, vertex_count;  // in scene::shadow_positions
+    uint32_t first_index, index_count;    // in scene::shadow_indices, relative to first_vertex
 };
 
 struct scene {
-    std::vector<gpu_cluster> clusters;  // Every model's, with page numbers made global
+    std::vector<gpu_cluster> clusters;  // every model's, page numbers made global
     std::vector<stream_page> pages;
-    std::vector<uint32_t> deps;         // Global page numbers
-    std::vector<uint32_t> children;     // Global page numbers, for prefetching
+    std::vector<uint32_t> deps;         // global page numbers
+    std::vector<uint32_t> children;     // global page numbers, for prefetch
     std::vector<int> files;
     std::vector<gpu_mesh> meshes;
     std::vector<gpu_instance> instances;
     std::vector<gpu_cell> cells;
     std::vector<shadow_mesh> shadow_meshes;  // shadow_lods per model
-    float shadow_lod_error[4] = {};          // The largest error of each shadow copy over the models
+    float shadow_lod_error[4] = {};          // each shadow copy's largest error over the models
     std::vector<float> shadow_positions;
     std::vector<uint32_t> shadow_indices;
-    size_t instanced_triangles = 0;  // At full detail, over every instance
-    size_t moving = 0;               // Instances that move
+    size_t instanced_triangles = 0;  // at full detail, all instances
+    size_t moving = 0;               // moving instances
     uint64_t total_page_bytes = 0;
 
     scene() = default;
@@ -301,9 +292,8 @@ struct scene {
     }
 };
 
-// The finest cut of a model's hierarchy within the shadow budget, read
-// from its pages: positions (three floats a vertex, repeated per cluster)
-// and indices into them. Returns the cut's error.
+// finest cut within the shadow budget, from the model's pages: positions (three floats a vertex,
+// per cluster) and indices. returns its error.
 float shadow_cut(const paged_geometry& g, int fd, size_t budget, std::vector<float>& positions, std::vector<uint32_t>& indices) {
     auto triangles_at = [&](float t) {
         size_t n = 0;
@@ -315,7 +305,7 @@ float shadow_cut(const paged_geometry& g, int fd, size_t budget, std::vector<flo
     for (const gpu_cluster& c : g.clusters) errors.push_back(c.lod_error);
     std::sort(errors.begin(), errors.end());
     errors.erase(std::unique(errors.begin(), errors.end()), errors.end());
-    size_t lo = 0, hi = errors.size() - 1;  // The cut at the coarsest error is the roots: small enough
+    size_t lo = 0, hi = errors.size() - 1;  // the coarsest cut is the roots: small enough
     while (lo < hi) {
         const size_t mid = (lo + hi) / 2;
         if (triangles_at(errors[mid]) <= budget) hi = mid;
@@ -346,8 +336,8 @@ float shadow_cut(const paged_geometry& g, int fd, size_t budget, std::vector<flo
     return error;
 }
 
-// Reads the models' clusters and page lists (their geometry streams in
-// later), and places them on a grid, turned and sized at random.
+// reads models' clusters and page lists (geometry streams later) and places them on a grid,
+// turned and sized at random.
 void make_scene(const options& opt, scene& s) {
     std::vector<size_t> leaf_triangles;
     for (const std::string& path : opt.models) {
@@ -368,7 +358,7 @@ void make_scene(const options& opt, scene& s) {
             const page_info& pg = g.pages[p];
             s.pages.push_back({fd, g.data_offset + pg.offset, pg.size, pg.dep_first + dep_base, pg.dep_count, p == 0});
         }
-        // Each page's children: the finer pages its clusters stand for.
+        // each page's children: the finer pages its clusters stand for.
         std::vector<std::vector<uint32_t>> children(g.pages.size());
         for (const gpu_cluster& c : g.clusters)
             if (c.creator != no_page) children[c.group].push_back(c.creator);
@@ -420,12 +410,11 @@ void make_scene(const options& opt, scene& s) {
     std::mt19937 rng(7), material_rng(11), motion_rng(13);
     std::uniform_real_distribution<float> chance(0, 1);
     std::uniform_real_distribution<float> turn(0, 6.2831853f), size(0.85f, 1.15f);
-    // Mostly marble, some sandstone, bronze, gold and granite: the
-    // materials table in shade.comp. One statue alone is marble.
+    // mostly marble; some sandstone, bronze, gold, granite (shade.comp's table). a lone statue
+    // is marble.
     const uint32_t mix[20] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5};
     const int n = std::max(1, opt.grid);
-    // In tiles of cell_side x cell_side, so each cell's instances are
-    // consecutive; the random draws stay in row order.
+    // tiles of cell_side x cell_side so cells are consecutive; random draws stay in row order.
     std::vector<gpu_instance> placed(size_t(n) * n);
     for (int z = 0; z < n; ++z)
         for (int x = 0; x < n; ++x) {
@@ -440,7 +429,7 @@ void make_scene(const options& opt, scene& s) {
             inst.mesh = mesh;
             inst.scale = scale;
             inst.material = !opt.mixed_materials ? 0 : n == 1 ? 1 : mix[material_rng() % 20];
-            // Moving: bit 9 marks it, bit 8 picks the direction, the low 8 bits the phase.
+            // moving: bit 9 marks it, bit 8 the direction, low 8 bits the phase.
             if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
             s.moving += inst.anim != 0;
             placed[size_t(z) * n + x] = inst;
@@ -450,9 +439,8 @@ void make_scene(const options& opt, scene& s) {
         for (int tx = 0; tx < n; tx += cell_side) {
             gpu_cell cell{};
             cell.first = uint32_t(s.instances.size());
-            // Each instance's sphere: around its bounds, or for a moving
-            // instance around everywhere it goes (it turns about its
-            // origin and drifts 0.2 from it: see animate() in common.glsl).
+            // each instance's sphere: its bounds, or for a moving one its whole path (turns
+            // about its origin, drifts 0.2: animate() in common.glsl).
             std::vector<std::pair<vec3, float>> spheres;
             for (int z = tz; z < std::min(n, tz + int(cell_side)); ++z)
                 for (int x = tx; x < std::min(n, tx + int(cell_side)); ++x) {
@@ -560,7 +548,7 @@ public:
         vkDestroyDescriptorSetLayout(ctx_.device, set_layout_, nullptr);
     }
 
-    // (Re)creates everything sized by the image.
+    // (re)creates everything sized by the image.
     void resize(uint32_t width, uint32_t height) {
         vkDeviceWaitIdle(ctx_.device);
         destroy_targets();
@@ -595,7 +583,7 @@ public:
             m.pBufferInfo = &mask_info;
             vkUpdateDescriptorSets(ctx_.device, 1, &m, 0, nullptr);
         }
-        // The two history images, ping-ponged by the two frame slots.
+        // two history images, ping-ponged by the frame slots.
         if (!history_sampler_) {
             VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
             sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
@@ -637,17 +625,16 @@ public:
 
     struct frame_result {
         gpu_stats stats{};
-        // Pass 1 culling, pass 1 drawing, both pyramids and pass 2, shading,
-        // and the total: from the frame that last used this slot.
-        double ms[6] = {};  // The last is the total
+        // pass 1 culling, pass 1 drawing, pyramids and pass 2, shadow pages, shading, then the
+        // total: from the frame that last used this slot.
+        double ms[6] = {};  // the last is the total
         streamer::stats_t streaming;
-        double streaming_ms = 0;  // Render thread time in the streamer this frame
+        double streaming_ms = 0;  // render thread time in the streamer
         bool valid = false;
     };
 
-    // Records and submits one frame. With a swapchain image, the result is
-    // blitted into it; without, it can be read back with read_pixels().
-    // Returns what the GPU reported for the last frame drawn in this slot.
+    // records and submits a frame. with a swapchain image the result is blitted into it, else
+    // read_pixels() reads it. returns the gpu's report for the slot's last frame.
     frame_result draw(const gpu_frame& frame_in, VkImage target, VkSemaphore wait, VkSemaphore signal, bool readback) {
         frame_slot& f = slots_[slot_];
         slot_ = (slot_ + 1) % frames_in_flight;
@@ -666,8 +653,8 @@ public:
                 result.valid = true;
             }
         }
-        // Streaming: what the GPU asked for and drew from, two frames ago,
-        // and the pages loaded for it into this slot's staging buffer.
+        // streaming: what the gpu asked for and drew from two frames ago, and pages loaded for
+        // it into this slot's staging.
         std::vector<std::pair<uint32_t, float>> wanted;
         if (f.used) {
             streamer_.note_used(static_cast<const uint32_t*>(f.used_readback.mapped));
@@ -696,10 +683,9 @@ public:
         fr.vsm_atlas_side = vsm_side_;
 
         prev_time_ = fr.time;
-        // Temporal antialiasing: each frame's projection is nudged by a
-        // sub-pixel offset, the Halton (2, 3) sequence over eight frames,
-        // and taa.comp blends the frames. Its history is last frame's
-        // image, reprojected with last frame's camera, unnudged.
+        // taa: each frame's projection nudged by a sub-pixel offset (halton 2, 3 over eight
+        // frames); taa.comp blends with last frame's image reprojected through last frame's
+        // camera, unnudged.
         float unjittered[16];
         std::memcpy(unjittered, fr.view_proj, sizeof unjittered);
         const bool taa = (fr.flags & flag_taa) && fr.debug_mode == 0;
@@ -713,7 +699,7 @@ public:
             const float jx = (halton(k, 2) - 0.5f) * 2 / width_, jy = (halton(k, 3) - 0.5f) * 2 / height_;
             fr.jitter[0] = jx;
             fr.jitter[1] = jy;
-            // clip.xy += jitter * clip.w, the w row being the last.
+            // clip.xy += jitter * clip.w; w is the last row.
             for (int c = 0; c < 4; ++c) {
                 fr.view_proj[c * 4 + 0] += jx * fr.view_proj[c * 4 + 3];
                 fr.view_proj[c * 4 + 1] += jy * fr.view_proj[c * 4 + 3];
@@ -752,7 +738,7 @@ public:
         VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
         vkCmdResetQueryPool(cmd, f.queries, 0, timestamp_count);
 
-        // The last frame's passes may still be reading what this one clears.
+        // last frame's passes may still read what this clears.
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 0);
@@ -763,7 +749,7 @@ public:
         vkCmdCopyBuffer(cmd, f.staging.handle, page_table_.handle, 1, &table_copy);
         vkCmdFillBuffer(cmd, requests_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, vis_.handle, 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, work_.handle, 0, 32, 0);  // Both passes' counts, the late counts and the big counts
+        vkCmdFillBuffer(cmd, work_.handle, 0, 32, 0);  // both passes' counts, late counts, big counts
         vkCmdFillBuffer(cmd, cell_lists_.handle, 0, 16, 0);
         if (fr.flags & flag_vsm) {
             vkCmdFillBuffer(cmd, vsm_lists_.handle, 0, 4 * vsm_lists_header, 0);
@@ -782,9 +768,8 @@ public:
                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
-        // Pass 1: what last frame's depth does not hide. Then the pyramid
-        // from what it drew, and pass 2: what pass 1 thought hidden but is
-        // not. Then the pyramid again, for next frame's pass 1.
+        // pass 1: what last frame's depth does not hide. then a pyramid from it, and pass 2:
+        // what pass 1 wrongly hid. then the pyramid again, for next frame.
         draw_pass(cmd, 0, f.queries);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 2);
         build_hzb(cmd);
@@ -807,7 +792,7 @@ public:
         vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
-        // Into this slot's history image, from the other's (last frame's).
+        // into this slot's history image, from the other (last frame's).
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, taa_);
         vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 5);
@@ -829,7 +814,7 @@ public:
                            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
         }
-        // What this frame asked for and drew from, for the streamer.
+        // what this frame asked for and drew from, for the streamer.
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                     VK_ACCESS_2_TRANSFER_READ_BIT);
         const VkBufferCopy request_copy{0, 0, f.request_readback.size};
@@ -861,14 +846,13 @@ public:
         return result;
     }
 
-    // The next frame's acquire semaphore, once the frame that last used it
-    // is done.
+    // next frame's acquire semaphore, once its last user is done.
     VkSemaphore image_ready_semaphore() {
         VK_CHECK(vkWaitForFences(ctx_.device, 1, &slots_[slot_].fence, VK_TRUE, UINT64_MAX));
         return slots_[slot_].image_ready;
     }
 
-    // The last frame drawn with readback, as 8-bit sRGB.
+    // last frame drawn with readback, as 8-bit srgb.
     std::vector<uint8_t> read_pixels() {
         vkDeviceWaitIdle(ctx_.device);
         std::vector<uint8_t> rgb(size_t(width_) * height_ * 3);
@@ -898,9 +882,9 @@ private:
         VkQueryPool queries = VK_NULL_HANDLE;
         VkDescriptorSet set = VK_NULL_HANDLE;
         vk::buffer frame, stats;
-        vk::buffer staging;           // Pages loaded for this frame, then the page table
-        vk::buffer request_readback;  // What this frame asked for
-        vk::buffer used_readback;     // The frame each page was last drawn from
+        vk::buffer staging;           // pages loaded for this frame, then the page table
+        vk::buffer request_readback;  // this frame's requests
+        vk::buffer used_readback;     // frame each page was last drawn from
         bool used = false;
     };
 
@@ -912,7 +896,7 @@ private:
 
     vk::buffer clusters_, page_table_, pool_buffer_, page_used_, requests_, request_stamp_, shadow_positions_, meshes_, instances_;
     vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_, cells_, cell_lists_;
-    // Virtual shadow maps: see vsm.glsl.
+    // virtual shadow maps: see vsm.glsl.
     uint32_t vsm_side_ = 1;
     vk::buffer vsm_entries_, vsm_phys_, vsm_lists_, vsm_atlas_, vsm_work_, vsm_visible_, vsm_args_, moving_instances_;
     VkPipeline vsm_mark_ = VK_NULL_HANDLE, vsm_alloc_ = VK_NULL_HANDLE, vsm_clear_ = VK_NULL_HANDLE, vsm_args_pipeline_ = VK_NULL_HANDLE,
@@ -924,9 +908,8 @@ private:
                     VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
     }
 
-    // Brings the shadow pages this frame needs up to date (see vsm.glsl):
-    // marks them from the visibility buffer, gives the missing ones
-    // physical pages, and renders those and any invalidated ones.
+    // updates this frame's shadow pages (vsm.glsl): mark from the visibility buffer, give
+    // missing ones physical pages, render those and invalidated ones.
     void update_shadow_pages(VkCommandBuffer cmd, frame_slot& f) {
         auto run = [&](VkPipeline p, uint32_t step, uint32_t groups) {
             const gpu_push push{0, step};
@@ -956,7 +939,7 @@ private:
         run_indirect(vsm_cluster_, 48);
         run(vsm_args_pipeline_, 3, 1);
         run_indirect(vsm_raster_, 64);
-        // How many pages were rendered, and how many found no physical page.
+        // pages rendered, and pages that found no physical page.
         const VkBufferCopy counts[2] = {{12, offsetof(gpu_stats, vsm_rendered), 4}, {24, offsetof(gpu_stats, vsm_overflow), 4}};
         vkCmdCopyBuffer(cmd, vsm_lists_.handle, f.stats.handle, 2, counts);
         const VkBufferCopy work_counts{0, offsetof(gpu_stats, vsm_work), 12};
@@ -979,7 +962,7 @@ private:
                hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE, sw_raster_ = VK_NULL_HANDLE, shadow_ = VK_NULL_HANDLE;
     vk::buffer shadow_mask_;
     VkPipeline taa_ = VK_NULL_HANDLE, expand_ = VK_NULL_HANDLE, cell_cull_ = VK_NULL_HANDLE;
-    std::array<vk::image, frames_in_flight> history_;  // Slot k writes history_[k] and reads the other
+    std::array<vk::image, frames_in_flight> history_;  // slot k writes history_[k], reads the other
     VkSampler history_sampler_ = VK_NULL_HANDLE;
     float prev_view_proj_[16] = {};
     float prev_time_ = 0;
@@ -1001,9 +984,8 @@ private:
         ctx_.destroy(hzb_image_);
     }
 
-    // The depth pyramid: level 0 half the screen (rounded up), each level
-    // half the last, down to 1x1. One view of every level for sampling,
-    // and one view per level for writing.
+    // depth pyramid: level 0 half the screen (rounded up), each level half the last, down to
+    // 1x1. one view of all levels for sampling, one per level for writing.
     void create_hzb() {
         hzb_width_ = (width_ + 1) / 2;
         hzb_height_ = (height_ + 1) / 2;
@@ -1075,8 +1057,7 @@ private:
         }
     }
 
-    // Runs args.comp for a pass: step 0 sizes the cluster culling, step 1
-    // the draw.
+    // args.comp for a pass: step 0 sizes cluster culling, step 1 the draw.
     void write_args(VkCommandBuffer cmd, uint32_t pass, uint32_t step) {
         const gpu_push push{pass, step};
         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
@@ -1090,12 +1071,11 @@ private:
         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof back, &back);
     }
 
-    // Culls and draws one pass: instances, then clusters, into the
-    // visibility buffer.
+    // culls and draws a pass into the visibility buffer.
     void draw_pass(VkCommandBuffer cmd, uint32_t pass, VkQueryPool queries) {
         const gpu_push push{pass, 0};
         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
-        // Cells first: every cell in pass 1, those it hid in pass 2.
+        // cells first: all in pass 1, those it hid in pass 2.
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cell_cull_);
         if (pass == 0) {
             const uint32_t n = (uint32_t(sc_.cells.size()) + 63) / 64;
@@ -1106,13 +1086,12 @@ private:
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
         write_args(cmd, pass, 3);
-        // Then the instances of the cells found visible (and in pass 2, the
-        // instances pass 1 hid): args.comp sized it.
+        // then visible cells' instances (and in pass 2 those pass 1 hid): sized by args.comp.
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instance_cull_);
         vkCmdDispatchIndirect(cmd, draw_args_.handle, offsetof(draw_args_layout, instance_args) + 16 * pass);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
-        // Instances with many pieces of work get a workgroup each.
+        // instances with many work items get a workgroup each.
         write_args(cmd, pass, 2);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, expand_);
         vkCmdDispatchIndirect(cmd, draw_args_.handle, offsetof(draw_args_layout, big_args) + 16 * pass);
@@ -1173,7 +1152,7 @@ private:
             vkCmdFillBuffer(cmd, page_used_.handle, 0, VK_WHOLE_SIZE, 0);
             vkCmdFillBuffer(cmd, request_stamp_.handle, 0, VK_WHOLE_SIZE, 0);
         });
-        // The top of the scene: each instance's bounding sphere, placed.
+        // top of the scene: each instance's bounding sphere, placed.
         for (const gpu_instance& inst : sc_.instances) {
             const gpu_mesh& m = sc_.meshes[inst.mesh];
             const float y = inst.rows[1][0] * m.bounds[0] + inst.rows[1][1] * m.bounds[1] + inst.rows[1][2] * m.bounds[2] + inst.rows[1][3];
@@ -1190,7 +1169,7 @@ private:
         vsm_entries_ = ctx_.make_buffer(16ull * vsm_slots, filled, false);
         vsm_phys_ = ctx_.make_buffer(8ull * vsm_side_ * vsm_side_, filled, false);
         vsm_lists_ = ctx_.make_buffer(4ull * (vsm_lists_header + 5 * vsm_slots), filled | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
-        // Two layers: still instances, moving instances.
+        // two layers: still, moving.
         vsm_atlas_ = ctx_.make_buffer(2 * 4ull * vsm_side_ * vsm_side_ * vsm_page * vsm_page, ssbo, false);
         vsm_work_ = ctx_.make_buffer(16 + 8ull * (max_work_items + 2 * vsm_big_capacity), filled | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
         vsm_visible_ = ctx_.make_buffer(8ull * max_visible, ssbo, false);
@@ -1198,9 +1177,9 @@ private:
         std::vector<uint32_t> moving;
         for (uint32_t i = 0; i < sc_.instances.size(); ++i)
             if (sc_.instances[i].anim) moving.push_back(i);
-        if (moving.empty()) moving.push_back(0);  // A buffer cannot be empty; nothing reads it then
+        if (moving.empty()) moving.push_back(0);  // a buffer cannot be empty; unread then
         moving_instances_ = ctx_.upload(moving, ssbo);
-        // Every slot empty, every physical page free (vsm_none is all ones).
+        // all slots empty, all physical pages free (vsm_none is all ones).
         ctx_.submit([&](VkCommandBuffer cmd) {
             vkCmdFillBuffer(cmd, vsm_entries_.handle, 0, VK_WHOLE_SIZE, 0xffffffffu);
             vkCmdFillBuffer(cmd, vsm_phys_.handle, 0, VK_WHOLE_SIZE, 0xffffffffu);
@@ -1209,7 +1188,7 @@ private:
         work_ = ctx_.make_buffer(32 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         visible_ = ctx_.make_buffer(16 + uint64_t(max_visible) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         draw_args_ = ctx_.make_buffer(sizeof(draw_args_layout), ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
-        // Hidden instances, then each pass's instances for expand.comp (three words each).
+        // hidden instances, then each pass's instances for expand.comp (three words each).
         late_instances_ = ctx_.make_buffer(4 * 7 * sc_.instances.size(), ssbo, false);
         late_clusters_ = ctx_.make_buffer(uint64_t(max_visible) * 8, ssbo, false);
         VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -1233,18 +1212,16 @@ private:
         VkDeviceAddress address = 0;
     };
     std::vector<accel> blas_;
-    accel tlas_, tlas_moving_;  // Still instances; moving instances
+    accel tlas_, tlas_moving_;  // still instances; moving instances
     vk::buffer shadow_indices_, as_instances_, as_moving_;
     uint32_t moving_entries_ = 0;
     VkAccelerationStructureGeometryKHR tlas_geom_{};
-    vk::buffer tlas_scratch_;  // For refitting: see update_shadow_scene()
+    vk::buffer tlas_scratch_;  // for refits: see update_shadow_scene()
     VkDeviceAddress tlas_scratch_address_ = 0;
     VkPipeline tlas_update_ = VK_NULL_HANDLE;
 
-    // Moves the shadow scene's moving instances to where they are this
-    // frame: tlas.comp writes their transforms, then the top level is
-    // refitted in place, its tree kept. The motion is small and periodic,
-    // so the tree stays good.
+    // moves the shadow scene's moving instances: tlas.comp writes transforms, the top level
+    // refits in place. small periodic motion keeps the tree good.
     void update_shadow_scene(VkCommandBuffer cmd) {
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
@@ -1268,7 +1245,7 @@ private:
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     }
 
-    // Builds an acceleration structure over one geometry and waits for it.
+    // builds an acceleration structure over one geometry and waits.
     accel build_accel(VkAccelerationStructureTypeKHR type, const VkAccelerationStructureGeometryKHR& geom, uint32_t primitives,
                       bool updatable = false) {
         VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
@@ -1309,10 +1286,9 @@ private:
         return a;
     }
 
-    // What shadow rays are traced against: per model, a bottom level over
-    // the finest cut of its hierarchy within the shadow budget (see
-    // shadow_cut()), and a top level over every instance. Shadow rays skip
-    // back faces: see sunlight() in shade.comp.
+    // shadow ray targets: per model a bottom level over its finest cut within the budget
+    // (shadow_cut()), and top levels over the instances. rays skip back faces: sunlight() in
+    // shade.comp.
     void build_shadow_scene() {
         const auto start = std::chrono::steady_clock::now();
         shadow_indices_ = ctx_.upload(sc_.shadow_indices, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
@@ -1332,12 +1308,9 @@ private:
             blas_.push_back(build_accel(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geom, m.index_count / 3));
             triangles += m.index_count / 3;
         }
-        // Every instance three times, once per shadow copy, each copy
-        // under its own mask bit: a ray sees only the copy it asks for.
-        // Still instances go in one top level, built once; moving ones in
-        // another, refitted every frame (see update_shadow_scene()), since
-        // a refit costs by the size of the whole structure, not by what
-        // moved.
+        // each instance three times, one per shadow copy, each under its own mask bit: a ray
+        // sees only the copy it asks for. still instances in a top level built once, moving ones
+        // in another refitted each frame: a refit costs by the whole structure's size.
         std::vector<VkAccelerationStructureInstanceKHR> still, moving;
         for (size_t k = 0; k < sc_.instances.size(); ++k)
             for (uint32_t lod = 0; lod < shadow_lods; ++lod) {
@@ -1358,7 +1331,7 @@ private:
             return geom;
         };
         const VkBufferUsageFlags input = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-        if (still.empty()) still.push_back({});  // A top level of one empty instance (mask 0): nothing to hit
+        if (still.empty()) still.push_back({});  // one empty instance (mask 0): nothing to hit
         as_instances_ = ctx_.upload(still, input);
         tlas_ = build_accel(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, top_level(as_instances_), uint32_t(still.size()));
         if (!moving.empty()) {
@@ -1418,7 +1391,7 @@ private:
             VkDescriptorBufferInfo infos[35];
             std::vector<VkWriteDescriptorSet> writes;
             for (uint32_t i = 0; i < 35; ++i) {
-                if (!buffers[i]) continue;  // The visibility buffer and output image: written by resize()
+                if (!buffers[i]) continue;  // visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 w.dstSet = f.set;
@@ -1428,8 +1401,8 @@ private:
                 w.pBufferInfo = &infos[i];
                 writes.push_back(w);
             }
-            // The moving instances' top level, or with none moving, the
-            // still one again (shaders skip it then: flag_moving).
+            // the moving top level, or with nothing moving the still one again (skipped:
+            // flag_moving).
             VkWriteDescriptorSetAccelerationStructureKHR as_info[2] = {
                 {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, nullptr, 1, &tlas_.handle},
                 {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, nullptr, 1,
@@ -1506,7 +1479,7 @@ private:
         viewport.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.polygonMode = VK_POLYGON_MODE_FILL;
-        // Scans have holes, through which the inside shows: draw both sides.
+        // scans have holes, showing the inside: draw both sides.
         raster.cullMode = VK_CULL_MODE_NONE;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1;
@@ -1515,7 +1488,7 @@ private:
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         ds.depthTestEnable = VK_TRUE;
         ds.depthWriteEnable = VK_TRUE;
-        ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;  // Reversed depth
+        ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;  // reversed depth
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -1543,7 +1516,7 @@ class swapchain {
 public:
     VkSwapchainKHR handle = VK_NULL_HANDLE;
     std::vector<VkImage> images;
-    std::vector<VkSemaphore> done;  // One per image: presenting waits on it
+    std::vector<VkSemaphore> done;  // one per image: presenting waits on it
     VkExtent2D extent{};
 
     swapchain(vk::context& ctx, bool vsync) : ctx_(ctx), vsync_(vsync) {}
@@ -1616,7 +1589,7 @@ private:
 
 struct view_state {
     camera cam;
-    camera cull_cam;  // Equal to cam unless frozen
+    camera cull_cam;  // cam unless frozen
     bool frozen = false;
     float threshold = 1;
     uint32_t mode = 0;
@@ -1643,10 +1616,9 @@ gpu_frame frame_data(const view_state& v, uint32_t width, uint32_t height, float
     std::memcpy(f.view, view.m, sizeof f.view);
     const mat4 proj = perspective_reverse_z(v.cam.fov, aspect, v.cam.near_z);
     f.p00 = proj.at(0, 0);
-    f.p11 = -proj.at(1, 1);  // The projection flips y for Vulkan; the sphere test wants it upright
+    f.p11 = -proj.at(1, 1);  // the projection flips y for vulkan; the sphere test wants it upright
     f.flags = v.flags;
-    // Depth from the drawing camera says nothing about what a frozen
-    // culling camera would see.
+    // depth from the drawing camera says nothing about a frozen culling camera.
     if (v.frozen) f.flags &= ~flag_occlusion;
     f.lod_scale = float(height) / (2 * std::tan(v.cam.fov / 2));
     f.lod_threshold = v.threshold;
@@ -1823,7 +1795,7 @@ int main(int argc, char** argv) {
                        opt.vsm ? opt.vsm_side : 1);
             std::vector<renderer::frame_result> results;
             const int total = opt.warmup + opt.frames;
-            int settled = 0;  // The frame after the last that asked for or waited on a page
+            int settled = 0;  // frame after the last that asked for or waited on a page
             uint64_t streamed = 0;
             uint32_t evicted = 0, most_resident = 0;
             std::vector<double> service_ms;
@@ -1834,8 +1806,7 @@ int main(int argc, char** argv) {
                     v.cull_cam = v.cam;
                 }
                 const bool last = i == total - 1;
-                // Time moves on at 60 frames a second, so moving instances move
-                // the same in every run.
+                // time at 60 frames a second, so motion repeats run to run.
                 auto res = r.draw(frame_data(v, opt.width, opt.height, i / 60.0f), VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
                                   last && !opt.screenshot.empty());
                 streamed += res.streaming.bytes_loaded;
@@ -1847,8 +1818,8 @@ int main(int argc, char** argv) {
                                 res.streaming.requested, res.streaming.loaded, res.streaming.bytes_loaded / 1048576.0,
                                 res.streaming.waiting, res.streaming.resident, res.stats.clusters_drawn, res.stats.vsm_rendered,
                                 res.stats.vsm_visible);
-                // Settled: nothing asked for or waiting from here on. (The first
-                // frames ask for nothing only because no requests are back yet.)
+                // settled: nothing asked for or waiting from here on (the first frames ask
+                // nothing only because no requests are back yet).
                 if (res.streaming.requested != 0 || res.streaming.waiting != 0) settled = i + 1;
                 if (res.valid && i >= opt.warmup + 2) results.push_back(res);
                 if (last && !opt.screenshot.empty()) {
@@ -1865,7 +1836,7 @@ int main(int argc, char** argv) {
                         service_ms[service_ms.size() / 2], service_ms[service_ms.size() * 99 / 100], service_ms.back(),
                         opt.loader_threads ? (std::to_string(opt.loader_threads) + " loader threads").c_str() : "loads on the render thread");
             if (!results.empty()) {
-                // The median frame, by total time.
+                // median frame by total time.
                 std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[5] < b.ms[5]; });
                 std::printf("%s\n", stats_line(results[results.size() / 2], v, sc.instances.size()).c_str());
                 const auto& s = results[results.size() / 2].stats;

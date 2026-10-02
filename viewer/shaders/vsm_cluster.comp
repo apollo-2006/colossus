@@ -1,11 +1,9 @@
 #version 460
-// Cluster culling for the shadow pages: one workgroup per piece of work,
-// one invocation per cluster. The level of detail is the camera's rule
-// seen orthographically (errors in texels of the piece's level), and a
-// cluster is kept if its sphere reaches a page being rendered. A cluster
-// standing in for finer clusters not yet loaded asks for them; it and any
-// cluster of the cut not loaded itself mark the pages they reach
-// provisional, so those are rendered again until everything arrives.
+// cluster culling for shadow pages: a workgroup per work item, an invocation
+// per cluster. the camera's lod rule, orthographic (error in the level's
+// texels); kept if its sphere reaches a rendering page. stand-ins request their
+// finer clusters; they and unloaded clusters of the cut mark their pages
+// provisional, rendered again until all arrive.
 #include "common.glsl"
 #include "vsm.glsl"
 
@@ -31,11 +29,9 @@ void main() {
     const vec2 center = vsm_light_space(to_world(inst, c.center)).xy;
     const float radius = c.radius * inst.scale;
     if (!vsm_touches(layer, level, center, radius)) return;
-    // Drawn with a stand-in, or not drawn at all because its own clusters
-    // are not loaded yet (in the first frames, not even the roots): either
-    // way the pages it reaches are not finished, and are rendered again
-    // next frame.
-    // (The moving layer is rendered again every frame anything moves.)
+    // a stand-in, or unloaded (in the first frames, even the roots): its pages
+    // are unfinished, render them again next frame.
+    // (the moving layer redraws whenever anything moves.)
     if ((wants_finer || !loaded) && layer == vsm_still) {
         const float size = texel * float(vsm_page);
         const ivec4 r = vsm_rendered(layer, level);

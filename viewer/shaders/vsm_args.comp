@@ -1,7 +1,6 @@
 #version 460
-// Indirect arguments for the shadow page passes, after each step
-// (push.level): 0 after allocation, 1 after instance culling, 2 after
-// expansion, 3 after cluster culling.
+// shadow page indirect arguments, per step (push.level): 0 after allocation, 1
+// after instance culling, 2 after expansion, 3 after cluster culling.
 #include "common.glsl"
 #include "vsm.glsl"
 

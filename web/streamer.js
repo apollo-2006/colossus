@@ -1,12 +1,10 @@
-// Which pages live in the GPU's page pool, for the web demo: a port of
-// viewer/streamer.hpp, with HTTP range requests where the native viewer
-// reads its file. See that file for why the rules below keep every cut
-// whole:
-//   * loads are issued dependencies first and published in issue order;
-//   * a page counts as depending on its dependencies from the moment it
-//     is issued, and is evicted only when nothing depends on it;
-//   * the finer pages below a request are prefetched while their error,
-//     halving a level, stays over the threshold.
+// which pages live in the gpu pool: viewer/streamer.hpp ported, with http range
+// requests for file reads. that file explains why these keep cuts whole:
+//   * loads issue dependencies first and publish in issue order;
+//   * a page depends on its dependencies from issue, and is evicted only when nothing
+//     depends on it;
+//   * pages below a request prefetch while their error, halving a level, stays over
+//     the threshold.
 const NONE = 0xffffffff;
 
 export class Streamer {
@@ -31,7 +29,7 @@ export class Streamer {
     this.uploadBytes = uploadBytes;
     this.frame = 0;
     this.stats = { resident: 0, loaded: 0, inFlight: 0, bytes: 0 };
-    this.wholeFiles = new Map();  // url -> Promise<ArrayBuffer>, for servers that ignore ranges
+    this.wholeFiles = new Map();  // url -> Promise<ArrayBuffer>, for servers ignoring ranges
   }
 
   resident(p) { return this.slotOf[p] !== NONE && !this.loading[p]; }
@@ -40,9 +38,8 @@ export class Streamer {
     for (let p = 0; p < stamps.length; p++) if (stamps[p] > this.lastUsed[p]) this.lastUsed[p] = stamps[p];
   }
 
-  // Publishes finished loads, then issues new ones. Returns the uploads to
-  // write into the pool ({slot, data}); this.table is then the frame's
-  // page table.
+  // publishes finished loads, issues new ones. returns pool uploads ({slot, data});
+  // this.table is then the frame's page table.
   service(frame, requests, threshold) {
     this.frame = frame;
     const uploads = [];
@@ -56,7 +53,7 @@ export class Streamer {
       this.stats.loaded++;
       this.stats.bytes += j.data.byteLength;
     }
-    // Prefetch below each request, then each page once at its best priority.
+    // prefetch below each request, then each page once at its best priority.
     const best = new Map();
     const want = (page, priority) => {
       if (page >= this.pages.length) return;
@@ -139,8 +136,8 @@ export class Streamer {
           if (whole) return (await whole).slice(pg.offset, pg.offset + pg.size);
           const r = await fetch(pg.url, { headers: { Range: `bytes=${pg.offset}-${pg.offset + pg.size - 1}` } });
           if (r.status === 206) return r.arrayBuffer();
-          // A server that ignores ranges sends the whole file: keep it,
-          // and take every page from it from now on.
+          // a server ignoring ranges sends the whole file: keep it and take every page
+          // from it.
           if (r.ok) {
             const file = r.arrayBuffer();
             this.wholeFiles.set(pg.url, file);

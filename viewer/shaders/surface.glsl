@@ -1,21 +1,19 @@
-// What is under a pixel: shared by shade.comp and shadow.comp, which must
-// agree on it exactly. The visible triangle is fetched again, the camera
-// ray through the pixel center meets its plane for barycentrics, and the
-// distance comes from the depth drawn. Pixels with nothing drawn are the
-// ground, or the sky.
+// what is under a pixel, shared by shade.comp and shadow.comp, which must
+// agree: the visible triangle refetched, the pixel ray meeting its plane for
+// barycentrics, distance from depth. nothing drawn is ground or sky.
 
 
 const uint surface_sky = 0u, surface_ground = 1u, surface_object = 2u;
 
 struct Surface {
     uint kind;
-    vec3 dir;     // From the camera, through the pixel
-    float t;      // Distance along dir
+    vec3 dir;     // from the camera through the pixel
+    float t;      // distance along dir
     vec3 hit;
-    vec3 n;       // Facing the camera
-    bool behind;  // The back of the surface: the inside of a fold, or through a hole
-    float bias;   // How far a shadow ray must start above it, for the drawn surface's own error
-    uint id;      // In the visibility buffer
+    vec3 n;       // facing the camera
+    bool behind;  // back of the surface: inside a fold or through a hole
+    float bias;   // shadow ray start offset, for the drawn surface's error
+    uint id;      // in the visibility buffer
     uvec2 vc;     // (instance, cluster)
     vec3 p0, p1, p2;
 };
@@ -56,19 +54,19 @@ Surface surface_at(uvec2 px) {
     s.p1 = to_world(inst, cluster_position(base, c, grid, i1));
     s.p2 = to_world(inst, cluster_position(base, c, grid, i2));
 
-    // The ray against the triangle's plane (Moller-Trumbore, without the
-    // bounds checks: the rasterizer already said it hits).
+    // ray against the triangle's plane (moller-trumbore, no bounds checks: the
+    // rasterizer said it hits).
     const vec3 e1 = s.p1 - s.p0, e2 = s.p2 - s.p0;
     const vec3 pv = cross(s.dir, e2);
     const float det = dot(e1, pv);
     const vec3 tv = origin - s.p0;
     const float inv = abs(det) > 1e-20 ? 1.0 / det : 0.0;
     const vec3 qv = cross(tv, e1);
-    // Clamped: at a silhouette the triangle under a pixel center can be
-    // nearly edge-on, and the ray meets its plane far outside it.
+    // clamped: at a silhouette the triangle can be edge-on and the plane hit
+    // far outside.
     const float bu = clamp(dot(tv, pv) * inv, 0.0, 1.0);
     const float bv = clamp(dot(s.dir, qv) * inv, 0.0, 1.0 - bu);
-    // The distance from depth, which is exact, not from that plane.
+    // distance from depth, which is exact.
     const vec4 center = frame.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
     const vec3 forward = normalize(center.xyz / center.w - origin);
     s.t = frame.near_z / uintBitsToFloat(uint(v >> 32)) / dot(s.dir, forward);
@@ -77,16 +75,16 @@ Surface surface_at(uvec2 px) {
                                            cluster_normal(base, c, i2) * bv));
     s.behind = dot(s.n, s.dir) > 0.0;
     if (s.behind) s.n = -s.n;
-    // The drawn cut strays up to this cluster's error from the original;
-    // trace_surface() adds the shadow copy's.
+    // the drawn cut strays up to this cluster's error; trace_surface() adds the
+    // shadow copy's.
     s.bias = c.lod_error * inst.scale * 1.5 + 1e-4 + s.t * 2e-5;
     return s;
 }
 
 #ifdef RAY_QUERY
 #extension GL_EXT_ray_query : require
-layout(set = 0, binding = 18) uniform accelerationStructureEXT shadow_scene;   // Still instances
-layout(set = 0, binding = 24) uniform accelerationStructureEXT shadow_moving;  // Moving ones, refitted every frame
+layout(set = 0, binding = 18) uniform accelerationStructureEXT shadow_scene;   // still instances
+layout(set = 0, binding = 24) uniform accelerationStructureEXT shadow_moving;  // moving ones, refitted every frame
 
 bool hits(accelerationStructureEXT scene, vec3 start, uint mask) {
     rayQueryEXT q;
@@ -98,16 +96,13 @@ bool hits(accelerationStructureEXT scene, vec3 start, uint mask) {
     return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-// 1 where the sun reaches p, 0 where something is in the way. The ray
-// starts `bias` above the surface: the shadow geometry is a coarser copy
-// and can stand that far above the surface drawn. Back faces are skipped,
-// so where the drawn surface dips inside the copy, the ray leaves through
-// the copy's back and is not stopped (the builder winds every model
+// 1 if the sun reaches p, else 0. starts `bias` above the surface (the shadow
+// copy may stand that far above). back faces skipped, so where the drawn
+// surface dips inside the copy the ray leaves through its back (models wind
 // counterclockwise from outside).
 //
-// Nothing stands above frame.scene_top, so the ray stops where it climbs
-// past it: that loses no shadow, and spares the traversal every instance
-// the ray would otherwise cross on its way out of the crowd.
+// nothing stands above frame.scene_top, so rays stop there: no lost shadow, far
+// less traversal.
 float trace_sun(vec3 p, vec3 n, float bias, uint mask) {
     const vec3 start = p + n * bias;
     if (start.y >= frame.scene_top) return 1.0;
@@ -115,10 +110,8 @@ float trace_sun(vec3 p, vec3 n, float bias, uint mask) {
     return (frame.flags & flag_moving) != 0u && hits(shadow_moving, start, mask) ? 0.0 : 1.0;
 }
 
-// Whether a surface faces the sun and is lit by it. The ray is traced
-// against the coarsest shadow copy whose error, seen from the camera at
-// this distance, is under half a pixel (occluders stand within a statue's
-// shadow of what they shade, about as far away), and clears that error.
+// lit test: traced against the coarsest shadow copy whose error is under half a
+// pixel at this distance, clearing that error.
 float trace_surface(Surface s) {
     if (s.kind == surface_sky) return 1.0;
     if (s.kind == surface_ground && s.t > 200.0) return 1.0;
@@ -130,8 +123,8 @@ float trace_surface(Surface s) {
 }
 #endif
 
-// Shadows are traced at half resolution by shadow.comp: one ray per two
-// by two pixels, stored with the distance it was traced at.
+// half resolution shadows from shadow.comp: a ray per 2x2 pixels, with its
+// distance.
 layout(set = 0, binding = 20, scalar) buffer ShadowMask { vec2 shadow_mask[]; };
 
 uvec2 shadow_size() {

@@ -1,6 +1,5 @@
 #version 460
-// The pieces of work of instances with many, for the shadow pages: a
-// workgroup each (see expand.comp).
+// work items of shadow instances with many: a workgroup each (see expand.comp).
 #include "common.glsl"
 #include "vsm.glsl"
 

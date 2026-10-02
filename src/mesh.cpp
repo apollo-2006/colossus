@@ -35,9 +35,8 @@ void add_polygon(mesh& m, const uint32_t* v, size_t n) {
     }
 }
 
-// PLY: a text header naming elements and their properties, then the data,
-// as text or binary. Only x, y, z of vertices and the index list of faces
-// are kept; other properties are skipped by their size.
+// ply: a text header of elements and properties, then text or binary data.
+// keeps vertex x, y, z and face index lists; skips the rest by size.
 struct ply_property {
     std::string name, type, count_type;  // count_type set for lists
     bool list = false;
@@ -153,8 +152,8 @@ mesh load_ply(const std::string& data) {
         binary_reader r{reinterpret_cast<const unsigned char*>(data.data()) + body,
                         reinterpret_cast<const unsigned char*>(data.data()) + data.size(), format == "binary_big_endian"};
         for (const ply_element& e : elements) {
-            // The common layouts get a fast path: float x y z, and a face of
-            // only a uchar-counted int list.
+            // fast path for the common layout: float x y z, faces of a
+            // uchar-counted int list.
             const bool xyz = e.name == "vertex" && e.properties.size() >= 3 && e.properties[0].name == "x" &&
                              e.properties[1].name == "y" && e.properties[2].name == "z" &&
                              e.properties[0].type == "float" && e.properties[1].type == "float" && e.properties[2].type == "float";
@@ -221,13 +220,13 @@ mesh load_obj(const std::string& data) {
                 char* next;
                 const long v = std::strtol(q, &next, 10);
                 if (next == q) break;
-                // Negative indices count back from the last vertex.
+                // negative indices count back from the last vertex.
                 const long index = v < 0 ? static_cast<long>(m.positions.size()) + v : v - 1;
                 if (index < 0 || index >= static_cast<long>(m.positions.size()))
                     throw std::runtime_error("OBJ: face index out of range");
                 poly.push_back(static_cast<uint32_t>(index));
                 q = next;
-                while (q < end && *q != ' ' && *q != '\t') ++q;  // Skip /vt/vn
+                while (q < end && *q != ' ' && *q != '\t') ++q;  // skip /vt/vn
                 while (q < end && (*q == ' ' || *q == '\t' || *q == '\r')) ++q;
             }
             add_polygon(m, poly.data(), poly.size());
@@ -266,8 +265,7 @@ void weld(mesh& m) {
         remap[i] = it->second;
     }
 
-    // Drop degenerate and repeated triangles. A triangle is repeated if the
-    // same three vertices appear in the same winding.
+    // drop degenerate and repeated triangles (same vertices, same winding).
     struct tri_hash {
         size_t operator()(const std::array<uint32_t, 3>& t) const {
             return (t[0] * 2654435761u) ^ (t[1] * 40503u) ^ (t[2] * 2246822519u);
@@ -280,14 +278,14 @@ void weld(mesh& m) {
     for (size_t t = 0; t < m.triangle_count(); ++t) {
         uint32_t a = remap[m.indices[3 * t]], b = remap[m.indices[3 * t + 1]], c = remap[m.indices[3 * t + 2]];
         if (a == b || b == c || a == c) continue;
-        // Rotate the smallest index first, keeping the winding.
+        // smallest index first, winding kept.
         std::array<uint32_t, 3> k = {a, b, c};
         while (k[0] != std::min({a, b, c})) std::rotate(k.begin(), k.begin() + 1, k.end());
         if (!seen.emplace(k, 0).second) continue;
         indices.insert(indices.end(), {a, b, c});
     }
 
-    // Drop vertices no triangle uses.
+    // drop unused vertices.
     std::vector<uint32_t> used(positions.size(), UINT32_MAX);
     m.positions.clear();
     for (uint32_t& i : indices) {
@@ -304,9 +302,8 @@ void normalize_placement(mesh& m, bool up_z) {
     if (m.positions.empty()) return;
     if (up_z)
         for (vec3& p : m.positions) p = {p.x, p.z, -p.y};
-    // Wind triangles counterclockwise seen from outside: the viewer's
-    // shadow rays skip back faces, which needs to know which side is out.
-    // The signed volume says, even for a scan with holes.
+    // wind counterclockwise from outside (shadow rays skip back faces). the
+    // signed volume decides, holes or not.
     double volume = 0;
     for (size_t t = 0; t < m.triangle_count(); ++t) {
         const vec3 a = m.positions[m.indices[3 * t]], b = m.positions[m.indices[3 * t + 1]], c = m.positions[m.indices[3 * t + 2]];
@@ -326,7 +323,7 @@ std::vector<vec3> vertex_normals(const mesh& m) {
     std::vector<vec3> n(m.positions.size());
     for (size_t t = 0; t < m.triangle_count(); ++t) {
         const uint32_t* i = &m.indices[3 * t];
-        // The cross product's length is twice the area: an area weight.
+        // cross product length is twice the area: an area weight.
         const vec3 fn = cross(m.positions[i[1]] - m.positions[i[0]], m.positions[i[2]] - m.positions[i[0]]);
         for (int c = 0; c < 3; ++c) n[i[c]] += fn;
     }

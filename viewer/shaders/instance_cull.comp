@@ -1,43 +1,35 @@
 #version 460
-// One invocation per instance: drops instances outside the view or hidden,
-// then hands cluster culling the clusters that might be drawn, in pieces of
-// 64. A distant instance is a piece or two, and the workgroup writes its
-// instances' pieces together: a prefix sum over the 64 counts says where
-// each instance's pieces start, and every invocation writes every 64th
-// piece of the whole run. A nearby Lucy is thousands of pieces, and near
-// instances are neighbours in the instance list, so one workgroup would
-// write them all: instances over big_pieces go to expand.comp instead,
-// which gives each its own workgroup.
+// an invocation per instance: drops those out of view or hidden, hands cluster
+// culling the clusters that might draw, in work items of 64. the workgroup
+// writes all its instances' items after a prefix sum of their counts. near
+// instances (thousands of items, neighbours in the list) over big_pieces go to
+// expand.comp, a workgroup each.
 //
-// A workgroup per visible cell (cell_cull.comp), an invocation per
-// instance in it. Pass 1 tests occlusion against last frame's depth; what
-// it finds hidden is listed for pass 2, which runs over that list, then
-// over the cells pass 2 found visible again, and tests against the depth
-// pass 1 drew.
+// a workgroup per visible cell (cell_cull.comp). pass 1 tests against last
+// frame's depth and lists what it hides; pass 2 runs that list, then the cells
+// pass 2 found visible again, against pass 1's depth.
 //
-// Clusters are stored in order of parent error, and a cluster can only be
-// drawn while its parent looks too coarse. Nowhere on the model is nearer
-// than the model's LOD sphere, so every cluster whose parent error is under
-// threshold * distance / (scale * lod_scale) is fine enough everywhere and
-// skipped: a binary search finds where the rest begin. From far away that
-// is a short tail of the coarsest clusters.
+// clusters are by parent error and drawable only while the parent looks too
+// coarse. nothing on the model is nearer than its lod sphere, so clusters with
+// parent error under threshold * distance / (scale * lod_scale) are skipped by
+// binary search: from afar, a short tail remains.
 #include "common.glsl"
 
 layout(local_size_x = 64) in;
 
 const uint big_pieces = 16u;
 
-shared uint ends[64];        // Inclusive prefix sum of each invocation's pieces
+shared uint ends[64];        // inclusive prefix sum of items
 shared uint instance_of[64];
-shared uint first_of[64];    // Its first cluster
-shared uint base;            // Where the workgroup's pieces go
+shared uint first_of[64];    // its first cluster
+shared uint base;            // where the workgroup's items go
 
 void main() {
     const uint pass = push.pass;
     const uint lane = gl_LocalInvocationIndex;
     const uint group = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
-    // Which instance: one of a visible cell's, or in pass 2 first the
-    // instances pass 1 hid (already inside the frustum).
+    // which instance: a visible cell's, or in pass 2 first those pass 1 hid
+    // (inside the frustum already).
     bool valid = false, hidden_before = false;
     uint i = 0u;
     const uint late_groups = pass == 0u ? 0u : (late_instance_count + 63u) / 64u;
@@ -59,7 +51,7 @@ void main() {
         const vec3 center = to_world(inst, m.bounds.xyz);
         const float radius = m.bounds.w * inst.scale;
         bool keep = hidden_before || (frame.flags & flag_frustum_culling) == 0u || sphere_in_frustum(center, radius);
-        // Pass 1 asks whether it was hidden last frame, where last frame was.
+        // pass 1: was it hidden last frame, where it was last frame.
         const vec3 then = pass == 0u && inst.anim != 0u ? to_world(load_prev_instance(i), m.bounds.xyz) : center;
         if (keep && occluded(then, radius)) {
             if (pass == 0u) late_instances[atomicAdd(late_instance_count, 1u)] = i;
@@ -89,7 +81,7 @@ void main() {
         }
     }
 
-    // Prefix sum of the pieces over the workgroup (Hillis and Steele).
+    // prefix sum over the workgroup (hillis and steele).
     ends[lane] = chunks;
     instance_of[lane] = i;
     first_of[lane] = first;
@@ -111,7 +103,7 @@ void main() {
     }
     if (lane == 0u) atomicAdd(stats.work_items, total);
     for (uint k = lane; k < total; k += 64u) {
-        // The invocation whose run holds piece k: the first end past it.
+        // invocation whose run holds item k: the first end past it.
         uint lo = 0u, hi = 63u;
         while (lo < hi) {
             const uint mid = (lo + hi) / 2u;

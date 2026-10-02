@@ -17,8 +17,8 @@ $(OBJ_DIR):
 colossus_build: tools/colossus_build.cpp $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@
 
-# The viewer. Needs the Vulkan headers and loader, GLFW, and glslc for the
-# shaders, whose SPIR-V is built into the program.
+# the viewer: vulkan headers and loader, glfw, and glslc for the shaders, whose
+# spir-v is built in.
 SHADERS = $(wildcard viewer/shaders/*.comp viewer/shaders/*.task viewer/shaders/*.mesh viewer/shaders/*.frag)
 SPIRV = $(patsubst viewer/shaders/%,$(OBJ_DIR)/shaders/%.inc,$(SHADERS))
 
@@ -28,7 +28,7 @@ $(OBJ_DIR)/shaders/%.inc: viewer/shaders/% $(SHADER_INCLUDES)
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -O -mfmt=num -o $@ $<
 
-# shade.comp a second time, tracing shadows with ray queries.
+# shade.comp again, with ray queries.
 $(OBJ_DIR)/shaders/shade_rt.comp.inc: viewer/shaders/shade.comp $(SHADER_INCLUDES)
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -DRAY_QUERY -O -mfmt=num -o $@ $<
@@ -42,8 +42,7 @@ tests/builder_test: tests/builder_test.cpp $(LIB_OBJS)
 tests/streamer_test: tests/streamer_test.cpp viewer/streamer.hpp $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/streamer_test.cpp $(LIB_OBJS) -o $@
 
-# The builder's and the streamer's tests, on procedural meshes: no GPU or
-# downloads needed.
+# builder and streamer tests on procedural meshes: no gpu, no downloads.
 test: tests/builder_test tests/streamer_test
 	./tests/builder_test
 	./tests/streamer_test

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Renders the README's images into docs/, from models/fetch.sh's models.
-# Each view streams in for 60 frames first. The viewer writes PNG without
-# compression; docs/recompress.py squeezes them afterwards.
+# renders the readme images into docs/ from models/fetch.sh's models, 60 frames
+# of streaming each. the viewer writes uncompressed png; docs/recompress.py
+# squeezes them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 crowd=(--model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30 --spacing 1.25)

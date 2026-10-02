@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// Opens the web demo in a headless Chrome with WebGPU, lets it render, and
-// saves a screenshot, printing anything the page logs as an error:
+// opens the web demo in headless chrome with webgpu, lets it render, saves a
+// screenshot, printing page errors:
 //
-//   node tests/web_screenshot.mjs [--out shot.png] [--wait SECONDS] [--eval JS]
+//     node tests/web_screenshot.mjs [--out shot.png] [--wait SECONDS] [--eval JS] [--clip x,y,w,h,scale]
 //
-// Serves web/ (with web/models/*.cgeo.gz built: see web/build.sh). Needs
-// google-chrome-stable and a GPU Chrome can use.
+// serves web/ (models built by web/build.sh). needs google-chrome-stable and a
+// gpu chrome can use.
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -31,7 +31,7 @@ const server = createServer((req, res) => {
   try {
     const body = readFileSync(join(root, path));
     const type = types[extname(path)] || 'application/octet-stream';
-    // Range requests, as GitHub Pages serves them: the demo streams pages.
+    // range requests, as github pages serves them: the demo streams pages.
     const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
     if (range) {
       const start = Number(range[1]), end = Math.min(Number(range[2]), body.length - 1);

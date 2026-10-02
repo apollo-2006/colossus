@@ -1,28 +1,26 @@
 #version 460
-// Gives the needed shadow pages physical pages, in three steps (push.level):
+// gives needed shadow pages physical pages, by step (push.level):
 //
-// 0. Per slot: a page the window has moved off loses its physical page. A
-//    needed page that is resident is touched, and rendered again if
-//    something invalidated it; one that is not is requested.
-// 1. Per physical page: those no needed page uses are listed, free ones
-//    first, then those still holding a page from an earlier frame.
-// 2. Per request: the next listed physical page, taken from its old page
-//    if it had one. Requests beyond the list get nothing this frame, and
-//    shading falls back to a coarser level.
+// 0. per slot: a page the window left loses its physical page. a needed
+//    resident page is touched, and listed if invalidated; a needed missing one
+//    is requested.
+// 1. per physical page: those unused this frame are listed, free first, then
+//    those holding an old page.
+// 2. per request: the next listed physical page, evicting its old page.
+//    requests past the list wait; shading falls back a level.
 //
-// Every page given a physical page, or invalidated, is listed to render.
+// anything given a physical page or invalidated is listed to render.
 //
-// Before them, step 3, a workgroup per moving instance: it invalidates
-// every resident page its sphere reaches, where it was last frame (to
-// clear its old shadow) and where it is now. A sphere reaches a few
-// hundred pages over the finer levels, so the workgroup shares them out.
+// step 3 runs first, a workgroup per moving instance: it invalidates every
+// resident page its sphere reaches, where it was and where it is. a few hundred
+// pages over the fine levels, so the workgroup shares them.
 #include "common.glsl"
 #include "vsm.glsl"
 
 layout(local_size_x = 64) in;
 
-// Bounds per level, kept as unsigned maxima so a zeroed buffer means empty:
-// x and y store (1 << 21) - (page + (1 << 20)), z and w page + (1 << 20).
+// per level bounds as unsigned maxima, so zero means empty: x, y store (1 <<
+// 21) - (page + (1 << 20)); z, w page + (1 << 20).
 void render(uint slot, uint layer) {
     vsm_list[3u * vsm_slots + atomicAdd(vsm_render_count, 1u)] = slot | (layer << 31);
     const uint level = slot / (vsm_window * vsm_window);
@@ -37,7 +35,7 @@ void render(uint slot, uint layer) {
     atomicMax(vsm_render_rect[r].w, biased.y);
 }
 
-// A new page: both layers (the moving one only if anything moves).
+// a new page: both layers (moving only if anything moves).
 void render_new(uint slot) {
     render(slot, vsm_still);
     if ((frame.flags & flag_moving) != 0u) render(slot, vsm_moving);
@@ -107,7 +105,7 @@ void main() {
             return;
         }
         const uint p = k < unowned ? vsm_list[vsm_slots + k] : vsm_list[2u * vsm_slots + k - unowned];
-        // The old page was not needed this frame, so nothing else touches it.
+        // the old page went unneeded this frame: nothing else touches it.
         const uint old = vsm_phys[p].owner;
         if (old != vsm_none) vsm_entries[old].phys = vsm_none;
         const uint slot = vsm_list[k];

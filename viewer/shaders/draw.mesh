@@ -1,7 +1,7 @@
 #version 460
-// Mesh shader: one workgroup per visible cluster, one invocation per vertex
-// and per triangle. Each triangle carries its visible-cluster number and
-// its index in the cluster, which is all shading needs to find it again.
+// mesh shader: a workgroup per visible cluster, an invocation per vertex and
+// triangle. each triangle carries its visible-cluster number and index, all
+// shading needs.
 #extension GL_EXT_mesh_shader : require
 #include "common.glsl"
 

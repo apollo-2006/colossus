@@ -1,5 +1,5 @@
-"""Re-encodes PNG files in place with zlib at its best compression. The
-viewer stores image data uncompressed to stay free of libraries."""
+"""re-encodes png files in place at zlib's best compression. the viewer
+writes them uncompressed to need no library."""
 import struct
 import sys
 import zlib

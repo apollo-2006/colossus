@@ -1,12 +1,10 @@
-// Reads a model's metadata (name.meta.gz, from web/split.py): its clusters,
-// pages and their dependencies, all of a .cgeo file but the page data,
-// which streams in from name.pages a page at a time (web/streamer.js).
-// See include/paged_file.hpp for the layout.
+// reads a model's metadata (name.meta.gz from web/split.py): clusters, pages
+// and dependencies, all of a .cgeo but page data, which streams from name.pages
+// (web/streamer.js). layout: include/paged_file.hpp.
 
 const MAGIC = 'CGEOv006';
 
-// Streams a URL, reporting progress as (bytes so far, total or 0), and
-// gunzips it if its name ends in .gz.
+// streams a url, reporting (bytes so far, total or 0), gunzipping .gz names.
 export async function fetchBytes(url, onProgress) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
@@ -47,7 +45,7 @@ export function parseMeta(buffer) {
   const clusters = array(112);
   const pageBytes = array(24);
   const deps = new Uint32Array(array(4));
-  array(40);  // Level statistics
+  array(40);  // level stats
   const pageView = new DataView(pageBytes);
   const clusterCount = clusters.byteLength / 112;
   const words = new Uint32Array(clusters);
@@ -60,8 +58,8 @@ export function parseMeta(buffer) {
       deps: Array.from(deps.subarray(first, first + count)), children: [],
     });
   }
-  // Each page's children: the finer pages its clusters stand for (word 24
-  // of a cluster is the page of the clusters it stands for, word 23 its own).
+  // each page's children: the finer pages its clusters stand for (cluster word
+  // 24 is the creator page, word 23 its own).
   for (let c = 0; c < clusterCount; c++) {
     const creator = words[28 * c + 24];
     if (creator !== 0xffffffff) pages[words[28 * c + 23]].children.push(creator);

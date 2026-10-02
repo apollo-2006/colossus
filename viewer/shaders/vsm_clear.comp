@@ -1,6 +1,5 @@
 #version 460
-// Empties the layers of physical pages about to be rendered: a workgroup
-// per page and layer.
+// empties the page layers about to render: a workgroup per page and layer.
 #include "common.glsl"
 #include "vsm.glsl"
 

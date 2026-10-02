@@ -1,46 +1,35 @@
 #pragma once
-// Mesh simplification by edge collapse with quadric error metrics (Garland
-// and Heckbert 1997), for the LOD builder.
+// edge collapse simplification with quadric error metrics (garland and heckbert
+// 1997).
 //
-// Each vertex carries a quadric: the sum of squared distances to the planes
-// of the triangles around it, area weighted, which collapses add together,
-// so a vertex remembers every plane the surface it stands for used to touch.
-// Collapses are endpoint collapses: one end of an edge moves onto the other,
-// so the simplified mesh only ever uses vertices of the input. Every LOD of
-// a model therefore shares one vertex buffer.
+// each vertex carries a quadric: summed squared distances to its triangles'
+// planes, area weighted, added on collapse. collapses keep an endpoint, so
+// every lod uses the input's vertices and a model shares one vertex buffer.
 #include "math.hpp"
 
 #include <cstdint>
 #include <vector>
 
 struct simplify_result {
-    std::vector<uint32_t> indices;  // Into the same positions as the input
-    // Estimated distance between the result and the input: the square root
-    // of the largest area-weighted mean squared distance of any collapse.
+    std::vector<uint32_t> indices;  // into the input's positions
+    // estimated distance from the input: root of the worst collapse's
+    // area-weighted mean squared distance.
     float error = 0;
 };
 
-// Collapses edges, cheapest first, until at most target_triangles remain or
-// no collapse is allowed. A vertex with locked[v] set never moves (other
-// vertices can still move onto it), which keeps the outline of a cluster
-// group fixed so it meets its neighbours at every LOD. Collapses that would
-// flip a triangle, or join two sheets of surface at a vertex (the link
-// condition), are refused. A vertex on an open border of the mesh may only
-// collapse along the border, and planes through each border edge,
-// perpendicular to its triangle, make that cost what it moves the outline.
+// collapses edges, cheapest first, down to target_triangles or until none is
+// allowed. locked[v] never moves (others may move onto it), which holds group
+// outlines fixed. refuses flips and link-condition violations. border vertices
+// only slide along the border, where planes through each border edge price
+// moving the outline.
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
                          const std::vector<uint8_t>& locked, size_t target_triangles);
 
-// Vertex clustering (Rossignac and Borrel): every vertex moves to one
-// vertex of the cell it falls in on a grid, made coarser until at most
-// target_triangles remain, and triangles that collapse are dropped. It
-// ignores topology, so it gets anywhere, which edge collapses cannot once
-// a mesh is a few hundred triangles of thin parts and hole rims; the LOD
-// builder uses it only for the last levels, where nothing else depends on
-// the outline. Two things keep the result crack-free in the builder's
-// sense: duplicate triangles are kept, so every edge keeps the parity of
-// its use count (a closed surface stays closed), and a cell with a vertex
-// on an open border keeps one, so open edges still end on the border.
-// The result's error is 0: measure it.
+// vertex clustering (rossignac and borrel): each vertex snaps to one vertex of
+// its grid cell, the grid coarsened until at most target_triangles remain;
+// collapsed triangles drop. ignores topology, so it gets anywhere edge
+// collapses cannot; used only for the last group, which nothing borders. stays
+// crack-free: duplicates are kept (edge use counts keep their parity) and a
+// cell with a border vertex keeps one. error is 0: measure it.
 simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
                                  size_t target_triangles);

@@ -1,40 +1,34 @@
-// The web demo's compute passes: instance culling, cluster culling, the
-// software rasterizer, and shading. A port of the Vulkan viewer's, shaped by
-// what WebGPU lacks:
+// the web demo's compute passes: instance and cluster culling, the software
+// rasterizer, shading. the vulkan viewer's, shaped by what webgpu lacks:
 //
-// * No mesh shaders: large clusters are drawn by raster.wgsl, an ordinary
-//   render pipeline that pulls each cluster's triangles from storage.
-// * No 64-bit atomics: the software rasterizer cannot write depth and
-//   triangle in one atomic. It runs twice instead, first keeping the
-//   nearest depth per pixel with a 32-bit atomic max, then writing the
-//   triangle wherever its depth is the one that won.
-// * No ray queries: shadows come from virtual shadow maps (vsm.wgsl).
+// * no mesh shaders: big clusters go through raster.wgsl, a render pipeline
+//   pulling triangles from storage.
+// * no 64-bit atomics: the software rasterizer runs twice, first the nearest
+//   depth by 32-bit atomic max, then the triangle wherever its depth won.
+// * no ray queries: shadows from virtual shadow maps (vsm.wgsl).
 //
-// The hardware and software results are kept apart and shade() takes the
-// nearer of the two at each pixel.
+// hardware and software results stay apart; shade() takes the nearer.
 
 struct Counters {
-  work: array<atomic<u32>, 2>,  // Work items, per pass
+  work: array<atomic<u32>, 2>,  // work items, per pass
   hw: atomic<u32>,
   sw: atomic<u32>,
   instances_visible: atomic<u32>,
   clusters_tested: atomic<u32>,
   triangles: atomic<u32>,
   overflow: atomic<u32>,
-  late_instances: atomic<u32>,  // Hidden in pass 1, for pass 2
+  late_instances: atomic<u32>,  // hidden in pass 1, for pass 2
   late_clusters: atomic<u32>,
   instances_occluded: atomic<u32>,
-  clusters_late: atomic<u32>,  // Drawn in pass 2
-  // Where each pass's clusters start in the lists: hardware [0, 3),
-  // software [3, 6), and each pass's work items [6, 8). Written by the args
-  // passes, read by the rasterizers.
+  clusters_late: atomic<u32>,  // drawn in pass 2
+  // where each pass's clusters start: hardware [0, 3), software [3, 6), work
+  // items [6, 8). written by the args passes, read by the rasterizers.
   pass_start: array<u32, 8>,
-  big: array<atomic<u32>, 2>,  // Per pass: instances left to expand
+  big: array<atomic<u32>, 2>,  // per pass: instances for expand
 }
 
-// Which pass (0 or 1), and for the pyramid builder, which level: from a
-// uniform buffer bound at an offset per dispatch, WebGPU having no push
-// constants.
+// pass (0 or 1), and the pyramid builder's level: a uniform bound at an offset
+// per dispatch, for want of push constants.
 struct PassInfo {
   pass_index: u32,
   level: u32,
@@ -46,25 +40,25 @@ struct PassInfo {
 @group(1) @binding(1) var<storage, read_write> work: array<vec2u>;        // (instance, first cluster)
 @group(1) @binding(2) var<storage, read_write> hw_visible: array<vec2u>;  // (instance, cluster)
 @group(1) @binding(3) var<storage, read_write> sw_visible: array<vec2u>;
-// The software rasterizer's depth per pixel, then its triangle per pixel:
-// one buffer, as WebGPU allows a stage few storage buffers.
+// software rasterizer depth per pixel, then triangle per pixel: one buffer,
+// storage buffers being scarce.
 @group(1) @binding(4) var<storage, read_write> sw_buf: array<atomic<u32>>;
 @group(2) @binding(0) var hw_depth: texture_depth_2d;
 @group(2) @binding(1) var hw_id: texture_2d<u32>;
 @group(2) @binding(2) var out_image: texture_storage_2d<rgba8unorm, write>;
-// The virtual shadow maps (vsm_common.wgsl), for shading to read.
+// virtual shadow maps (vsm_common.wgsl), for shading.
 @group(2) @binding(3) var<storage, read> vsm_entries: array<u32>;
 @group(2) @binding(4) var<storage, read> vsm_atlas: array<u32>;
-// The depth pyramid: level 0 half the screen, each texel the farthest
-// (smallest, depth being reversed) depth drawn over the pixels it covers.
+// depth pyramid: level 0 half the screen, each texel the farthest (smallest,
+// reversed) depth it covers.
 @group(2) @binding(5) var hzb: texture_2d<f32>;
-// For building it: the level below, and the level being written.
+// building it: the level below, the level written.
 @group(2) @binding(6) var hzb_src: texture_2d<f32>;
 @group(2) @binding(7) var hzb_dst: texture_storage_2d<r32float, write>;
 
-// The screen rectangle a sphere covers, in [0, 1] texture coordinates,
-// for a sphere in view space with z forward (Mara and McGuire 2013, as in
-// zeux's niagara). False if the sphere reaches the near plane.
+// screen rectangle of a view-space sphere (z forward) in [0, 1] texture
+// coordinates (mara and mcguire 2013, as in zeux's niagara). false if it
+// reaches the near plane.
 fn project_sphere(c: vec3f, r: f32, aabb: ptr<function, vec4f>) -> bool {
   if (c.z < r + frame.near_z) { return false; }
   let cr = c * r;
@@ -80,10 +74,9 @@ fn project_sphere(c: vec3f, r: f32, aabb: ptr<function, vec4f>) -> bool {
   return true;
 }
 
-// Whether a world-space sphere is certainly hidden: its nearest point is
-// farther than the farthest depth drawn anywhere in the rectangle it
-// covers. Pass 1 asks from last frame's camera, against last frame's
-// pyramid; pass 2 from this frame's.
+// whether a world-space sphere is surely hidden: nearest point farther than the
+// farthest depth in its rectangle. pass 1 from last frame's camera and pyramid,
+// pass 2 from this frame's.
 fn occluded(center: vec3f, radius: f32) -> bool {
   if ((frame.flags & FLAG_OCCLUSION) == 0u) { return false; }
   if (pass_info.pass_index == 0u && (frame.flags & FLAG_PREV_VALID) == 0u) { return false; }
@@ -93,11 +86,10 @@ fn occluded(center: vec3f, radius: f32) -> bool {
   var aabb: vec4f;
   if (!project_sphere(c, radius, &aabb)) { return false; }
   let screen = vec2f(f32(frame.width), f32(frame.height));
-  // A pixel's margin: frames are drawn with a sub-pixel offset (taa below),
-  // which the projection above leaves out.
+  // a pixel's margin for the taa jitter, which the projection leaves out.
   let lo = max(clamp(aabb.xy, vec2f(0.0), vec2f(1.0)) * screen - 1.0, vec2f(0.0));
   let hi = min(clamp(aabb.zw, vec2f(0.0), vec2f(1.0)) * screen + 0.5, screen - 0.5);
-  // The finest level at which the rectangle spans at most 2 x 2 texels.
+  // finest level where the rectangle spans at most 2x2 texels.
   var level = 0u;
   var t0: vec2i;
   var t1: vec2i;
@@ -118,9 +110,8 @@ fn occluded(center: vec3f, radius: f32) -> bool {
   return frame.near_z / (c.z - radius) < far_depth;
 }
 
-// The depth pyramid's first level, from the hardware rasterizer's depth
-// and the software rasterizer's, the nearer of the two at each pixel; an
-// empty pixel counts as infinitely far.
+// pyramid level 0: the nearer of hardware and software depth per pixel; empty
+// counts as infinitely far.
 @compute @workgroup_size(8, 8)
 fn hzb_first(@builtin(global_invocation_id) gid: vec3u) {
   let size = textureDimensions(hzb_dst);
@@ -136,7 +127,7 @@ fn hzb_first(@builtin(global_invocation_id) gid: vec3u) {
   textureStore(hzb_dst, gid.xy, vec4f(far_depth));
 }
 
-// Each level after, from the one before.
+// each later level from the one before.
 @compute @workgroup_size(8, 8)
 fn hzb_down(@builtin(global_invocation_id) gid: vec3u) {
   let size = textureDimensions(hzb_dst);
@@ -149,8 +140,8 @@ fn hzb_down(@builtin(global_invocation_id) gid: vec3u) {
   }
   textureStore(hzb_dst, gid.xy, vec4f(far_depth));
 }
-// Streaming: the frame each page was last drawn from, the pages asked for
-// this frame (page, priority as float bits), and when each was last asked.
+// streaming: the frame each page was last drawn from, this frame's requests
+// (page, priority as float bits), when each was last asked.
 struct Requests {
   count: atomic<u32>,
   pad0: u32,
@@ -158,18 +149,16 @@ struct Requests {
   pad2: u32,
   list: array<vec2u>,
 }
-// Per page: the frame it was last drawn from, then the frame it was last
-// asked for.
+// per page: frame last drawn from, then frame last asked for.
 @group(1) @binding(6) var<storage, read_write> page_stamps: array<atomic<u32>>;
 @group(1) @binding(9) var<uniform> pass_info: PassInfo;
-// What pass 1 found hidden: clusters (instance, cluster) first, then
-// instances (instance, 0) from max_visible on.
+// what pass 1 hid: clusters (instance, cluster) first, then instances
+// (instance, 0) from max_visible.
 @group(1) @binding(12) var<storage, read_write> late: array<vec2u>;
 @group(1) @binding(7) var<storage, read_write> requests: Requests;
 
-// The LOD test with streaming, as viewer/shaders/common.glsl's: a cluster
-// is drawn when it is the right level, or when the finer clusters it
-// stands for are not resident; it must be resident itself.
+// lod test with streaming, as common.glsl's: drawn at the right level, or when
+// the finer clusters it stands for are missing; it must be resident.
 struct Lod {
   draw: bool,
   wants_finer: bool,
@@ -194,29 +183,20 @@ fn request_finer(c: Cluster, priority: f32) {
   if (k < frame.max_requests) { requests.list[k] = vec2u(c.creator, bitcast<u32>(priority)); }
 }
 
-// The indirect arguments: [0, 3) the cluster culling dispatch, [4, 8) the
-// hardware draw, [8, 11) the software rasterizer's dispatch. Bound only
-// for the two passes that write them: a dispatch may not both read a
-// buffer as its arguments and have it bound for writing.
+// indirect arguments: [0, 8) cluster culling per pass, [8, 16) hardware draws,
+// [16, 24) software dispatches, [24, 28) pass 2 instance culling, [28, 36)
+// expand per pass. bound only for the passes writing them: a dispatch may not
+// read its arguments from a buffer bound for writing.
 @group(3) @binding(0) var<storage, read_write> args: array<u32>;
 
-// --- Instance culling: one workgroup per instance. One invocation decides
-// and finds where the drawable clusters begin; all 64 write the work items.
-// Clusters are stored by parent error, and one can only be drawn while its
-// parent looks too coarse, so every cluster whose parent error is under
-// threshold * distance / (scale * lod_scale), distance measured to the
-// model's LOD sphere, is skipped with a binary search.
 
-// One invocation per instance (as in the viewer's instance_cull.comp):
-// the workgroup writes its instances' pieces of 64 clusters together, a
-// prefix sum over their counts saying where each starts. Instances over
-// BIG_PIECES (near ones, thousands of pieces, and neighbours in the list)
-// go to expand instead, a workgroup each.
+// an invocation per instance (as instance_cull.comp): the workgroup writes its
+// instances' work items after a prefix sum of their counts. instances over
+// BIG_PIECES (near ones, neighbours in the list) go to expand, a workgroup
+// each.
 //
-// Pass 1 runs over every instance and tests occlusion against last
-// frame's depth; what it finds hidden is listed for pass 2, which runs
-// over that list only (args_big sizes it) and tests against the depth
-// pass 1 drew.
+// pass 1 runs every instance against last frame's depth and lists what it
+// hides; pass 2 runs only that list (sized by args_big) against pass 1's depth.
 const BIG_PIECES = 16u;
 
 var<workgroup> wg_ends: array<u32, 64>;
@@ -224,8 +204,8 @@ var<workgroup> wg_instance: array<u32, 64>;
 var<workgroup> wg_first: array<u32, 64>;
 var<workgroup> wg_base: u32;
 
-// Where each pass's big instances are listed in late: two entries each,
-// (instance, first cluster) and (pieces, 0).
+// each pass's big instances in late: two entries each, (instance, first
+// cluster) and (pieces, 0).
 fn big_slot(pass_index: u32, k: u32) -> u32 {
   return frame.max_visible + frame.instance_count * (1u + 2u * pass_index) + 2u * k;
 }
@@ -245,7 +225,7 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
     let center = to_world(inst, m.bounds.xyz);
     let radius = m.bounds.w * inst.scale;
     var keep = pass_index != 0u || (frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, radius);
-    // Pass 1 asks whether it was hidden last frame, where last frame was.
+    // pass 1: was it hidden last frame, where it was last frame.
     var then = center;
     if (pass_index == 0u && inst.anim != 0u) { then = to_world(load_prev_instance(i), m.bounds.xyz); }
     if (keep && occluded(then, radius)) {
@@ -275,7 +255,7 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
     }
   }
 
-  // Prefix sum of the pieces over the workgroup (Hillis and Steele).
+  // prefix sum over the workgroup (hillis and steele).
   wg_ends[lane] = chunks;
   wg_instance[lane] = i;
   wg_first[lane] = first;
@@ -296,7 +276,7 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
     total = select(0u, frame.max_work - at, at < frame.max_work);
   }
   for (var k = lane; k < total; k += 64u) {
-    // The invocation whose run holds piece k: the first end past it.
+    // invocation whose run holds item k: the first end past it.
     var lo = 0u;
     var hi = 63u;
     while (lo < hi) {
@@ -309,7 +289,7 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
   }
 }
 
-// The pieces of instances with many, a workgroup each.
+// work items of instances with many, a workgroup each.
 var<workgroup> wg_expand_base: u32;
 var<workgroup> wg_expand_count: u32;
 
@@ -344,8 +324,8 @@ fn rows(n: u32, at: u32) {
   args[at + 2u] = 1u;
 }
 
-// After a pass's instance culling: the dispatch for its big instances,
-// and after pass 1, pass 2's instance culling, over what pass 1 hid.
+// after instance culling: the expand dispatch, and after pass 1 the pass 2
+// instance dispatch over what it hid.
 @compute @workgroup_size(1)
 fn args_big() {
   let pass_index = pass_info.pass_index;
@@ -353,8 +333,8 @@ fn args_big() {
   if (pass_index == 0u) { rows((atomicLoad(&counters.late_instances) + 63u) / 64u, 24u); }
 }
 
-// A pass's cluster culling dispatch: one workgroup per work item, and in
-// pass 2 one per 64 clusters pass 1 found hidden.
+// cluster culling dispatch: a workgroup per work item, plus in pass 2 one per
+// 64 hidden clusters.
 @compute @workgroup_size(1)
 fn args_cull() {
   let pass_index = pass_info.pass_index;
@@ -369,9 +349,9 @@ fn args_cull() {
   }
 }
 
-// --- Cluster culling: one workgroup per work item, one invocation per
-// cluster: the LOD cut, the frustum and the normal cone. Survivors small on
-// screen go to the software rasterizer, the rest to the hardware.
+// --- cluster culling: a workgroup per work item, an invocation per cluster:
+// lod cut, frustum, normal cone. small survivors go to the software rasterizer,
+// the rest to the hardware.
 
 var<workgroup> wg_hw: atomic<u32>;
 var<workgroup> wg_sw: atomic<u32>;
@@ -427,15 +407,15 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
         atomicAdd(&wg_triangles, c.triangle_count);
         atomicStore(&page_stamps[c.group], frame.frame_index);
         if (lod.wants_finer) { request_finer(c, lod.self_error); }
-        // The sphere's size on screen, roughly; clusters reaching the
-        // near plane always go to the hardware, which clips.
+        // rough size on screen; clusters at the near plane go to the hardware,
+        // which clips.
         let d = length(center - frame.origin.xyz) - r;
         software = (frame.flags & FLAG_SOFTWARE) != 0u && d > frame.near_z * 2.0 &&
                    2.0 * r * frame.lod_scale / d < frame.sw_max_pixels;
       }
     }
   } else if (pass_index == 1u) {
-    // A piece of pass 1's hidden clusters: only occlusion is left to test.
+    // pass 1's hidden clusters: only occlusion left to test.
     let k = (item - items) * 64u + lane;
     if (k < min(atomicLoad(&counters.late_clusters), frame.max_visible)) {
       atomicAdd(&wg_tested, 1u);
@@ -488,9 +468,8 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
   }
 }
 
-// A pass's draws: the hardware draw (128 triangles' worth of vertices per
-// cluster, one instance per cluster) and the software dispatch, over the
-// clusters this pass added to each list.
+// a pass's draws: hardware (384 vertices per cluster, an instance per cluster)
+// and software, over the clusters this pass added.
 @compute @workgroup_size(1)
 fn args_draw() {
   let pass_index = pass_info.pass_index;
@@ -506,12 +485,10 @@ fn args_draw() {
   rows(sw_end - counters.pass_start[3u + pass_index], 16u + pass_index * 4u);
 }
 
-// --- The software rasterizer: one workgroup per small cluster, one
-// invocation per vertex and then per triangle. Vertices are snapped to
-// 1/256 pixel, edges follow a top-left rule, and edge functions are
-// measured from each triangle's corner so they fit 32 bits (clusters sent
-// here are small). Pass 1 keeps the nearest depth per pixel; pass 2 writes
-// the triangle wherever its depth won.
+// --- software rasterizer: a workgroup per small cluster, an invocation per
+// vertex then per triangle. 1/256 pixel snapping, top-left rule, edges from
+// each triangle's corner to fit 32 bits. pass 1 keeps the nearest depth; pass 2
+// writes the triangle where its depth won.
 
 var<workgroup> screen: array<vec2i, 128>;
 var<workgroup> depth: array<f32, 128>;
@@ -521,8 +498,8 @@ fn edge(a: vec2i, b: vec2i, p: vec2i) -> i32 {
   return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 }
 
-// Top-left rule, y down: an edge running up (or flat and running right, in
-// this winding) owns the pixel centers on it.
+// top-left rule, y down: an edge running up (or flat, running right, in this
+// winding) owns its pixel centres.
 fn owns_edge(a: vec2i, b: vec2i) -> bool {
   let d = b - a;
   return d.y < 0 || (d.y == 0 && d.x > 0);
@@ -538,7 +515,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   if (lane < c.vertex_count) {
     let clip = frame.view_proj * vec4f(to_world(inst, cluster_position(c, meshes[inst.mesh].grid, lane)), 1.0);
     let ndc = clip.xy / clip.w;
-    // Pixels run down; clip space runs up.
+    // pixels run down; clip space up.
     let px = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(f32(frame.width), f32(frame.height));
     screen[lane] = vec2i(round(px * 256.0));
     depth[lane] = clip.z / clip.w;
@@ -565,7 +542,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   var za = depth[i0];
   var zb = depth[i1];
   var zd = depth[i2];
-  // Both sides are drawn: put every triangle in one winding.
+  // both sides drawn: one winding.
   if (area < 0) {
     let t = b; b = d; d = t;
     let tz = zb; zb = zd; zd = tz;
@@ -613,8 +590,8 @@ fn sw_id_pass(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
   sw_raster(wid, lane, true);
 }
 
-// --- Shading: the nearer of the hardware and software results, its
-// triangle fetched again and intersected with the pixel's ray.
+// --- shading: the nearer of the hardware and software results, its triangle
+// refetched and hit with the pixel's ray.
 
 const SUN_DIR = normalize(vec3f(0.75, 0.5, 0.3));
 const SUN_COLOR = vec3f(1.0, 0.92, 0.82) * 1.7;
@@ -635,8 +612,7 @@ fn level_color(level: u32) -> vec3f {
   return mix(vec3f(1.0), clamp(k - 1.0, vec3f(0.0), vec3f(1.0)), 0.75) * 0.85;
 }
 
-// Instances carry one of these (Instance::material),
-// as viewer/shaders/shade.comp's.
+// per instance (Instance::material), as shade.comp's.
 struct Material {
   albedo: vec3f,
   roughness: f32,
@@ -645,17 +621,17 @@ struct Material {
 
 fn material(index: u32) -> Material {
   switch (index) {
-    case 1u: { return Material(vec3f(0.66, 0.64, 0.6), 0.3, 0.0); }    // Polished marble
-    case 2u: { return Material(vec3f(0.62, 0.5, 0.38), 0.85, 0.0); }   // Sandstone
-    case 3u: { return Material(vec3f(0.58, 0.38, 0.22), 0.35, 1.0); }  // Bronze
-    case 4u: { return Material(vec3f(0.95, 0.74, 0.36), 0.28, 1.0); }  // Gold
-    case 5u: { return Material(vec3f(0.2, 0.2, 0.22), 0.45, 0.0); }    // Dark granite
-    default: { return Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }   // Plaster
+    case 1u: { return Material(vec3f(0.66, 0.64, 0.6), 0.3, 0.0); }    // polished marble
+    case 2u: { return Material(vec3f(0.62, 0.5, 0.38), 0.85, 0.0); }   // sandstone
+    case 3u: { return Material(vec3f(0.58, 0.38, 0.22), 0.35, 1.0); }  // bronze
+    case 4u: { return Material(vec3f(0.95, 0.74, 0.36), 0.28, 1.0); }  // gold
+    case 5u: { return Material(vec3f(0.2, 0.2, 0.22), 0.45, 0.0); }    // dark granite
+    default: { return Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }   // plaster
   }
 }
 
-// Sunlight off a surface: Lambert, plus GGX specular with Schlick's
-// Fresnel and a Smith shadowing term, and the sky in the reflection.
+// lambert plus ggx specular, schlick fresnel, smith shadowing, sky in the
+// reflection.
 fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32) -> vec3f {
   let f0 = mix(vec3f(0.04), m.albedo, m.metallic);
   let nl = max(dot(n, SUN_DIR), 0.0);
@@ -679,12 +655,10 @@ fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32) -> vec3f {
          m.albedo * m.metallic * ambient * 0.5;
 }
 
-// Sunlight at a point, from the virtual shadow maps: 2 x 2 taps,
-// bilinearly weighted, at the level whose texels match the pixel. The
-// point moves off the surface along its normal and is compared with a
-// bias, both a couple of texels, which covers the two surfaces' levels of
-// detail differing. A tap in a page with no physical page sends the
-// lookup to the next level up.
+// sunlight at p from the virtual shadow maps: 2x2 taps, bilinear weights, at
+// the pixel's level. offset along the normal and biased a couple of texels,
+// covering both surfaces' lod error. a tap without a physical page sends the
+// lookup up a level.
 fn sunlight(p: vec3f, n: vec3f) -> f32 {
   if ((frame.flags & FLAG_SHADOWS) == 0u) { return 1.0; }
   for (var level = vsm_level_for(length(p - frame.origin.xyz)); level < VSM_LEVELS; level++) {
@@ -736,7 +710,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
   let sd = bitcast<f32>(sd_bits);
   var found = false;
   var software = false;
-  var z = 0.0;  // The depth drawn, reversed
+  var z = 0.0;  // depth drawn, reversed
   var vc = vec2u(0u);
   var tri = 0u;
   var id = 0u;
@@ -756,7 +730,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
 
   var color = sky(dir);
   if (!found && frame.debug_mode == 7u) {
-    color = vec3f(1.0, 0.0, 1.0);  // Holes: anything not drawn
+    color = vec3f(1.0, 0.0, 1.0);  // holes: nothing drawn
   } else if (!found) {
     if (dir.y < 0.0) {
       let t = -origin.y / dir.y;
@@ -778,7 +752,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let p0 = to_world(inst, cluster_position(c, grid, i0));
     let p1 = to_world(inst, cluster_position(c, grid, i1));
     let p2 = to_world(inst, cluster_position(c, grid, i2));
-    // The ray against the triangle's plane, for exact barycentrics.
+    // ray against the triangle's plane, for exact barycentrics.
     let e1 = p1 - p0;
     let e2 = p2 - p0;
     let pv = cross(dir, e2);
@@ -786,11 +760,11 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let inv = select(0.0, 1.0 / det, abs(det) > 1e-20);
     let tv = origin - p0;
     let qv = cross(tv, e1);
-    // Clamped: at a silhouette the triangle under a pixel center can be
-    // nearly edge-on, and the ray meets its plane far outside it.
+    // clamped: at a silhouette the triangle can be edge-on and the plane hit
+    // far outside.
     let bu = clamp(dot(tv, pv) * inv, 0.0, 1.0);
     let bv = clamp(dot(dir, qv) * inv, 0.0, 1.0 - bu);
-    // The distance from depth, which is exact, not from that plane.
+    // distance from depth, which is exact.
     let center = frame.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
     let forward = normalize(center.xyz / center.w - origin);
     let t = frame.near_z / z / dot(dir, forward);
@@ -798,9 +772,8 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let n1 = cluster_normal(c, i1);
     let n2 = cluster_normal(c, i2);
     var n = normalize(to_world_dir(inst, n0 * (1.0 - bu - bv) + n1 * bu + n2 * bv));
-    // Seen from behind (the inside of a fold, or through a hole in the
-    // scan): light the side we see, and leave the rim light off, which
-    // would outline every such sliver.
+    // from behind (inside a fold, through a scan hole): light the visible side,
+    // no rim light, which would outline every sliver.
     let behind = dot(n, dir) > 0.0;
     if (behind) { n = -n; }
 
@@ -825,13 +798,10 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
   textureStore(out_image, px, vec4f(srgb(aces(color)), 1.0));
 }
 
-// Temporal antialiasing, as in the viewer's taa.comp: every frame is drawn
-// with the projection nudged by a different sub-pixel offset, and each
-// pixel is blended with last frame's image (10% new), found by projecting
-// the surface under the pixel with last frame's camera. Last frame's color
-// is held to the range of this frame's 3 x 3 neighbourhood so that what
-// was hidden before cannot bleed in. The history is kept at 16 bits, as
-// 10% steps in 8 bits would stall short of the true value.
+// taa, as taa.comp: each frame jittered, each pixel blended 10% into last
+// frame's image, found by projecting its surface with last frame's camera,
+// clamped to this frame's 3x3 neighbourhood. history at 16 bits: 10% steps
+// stall in 8.
 @group(2) @binding(8) var shaded: texture_2d<f32>;
 @group(2) @binding(9) var history: texture_2d<f32>;
 @group(2) @binding(10) var history_sampler: sampler;
@@ -846,8 +816,8 @@ fn from_ycocg(c: vec3f) -> vec3f {
   return vec3f(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
 }
 
-// Last frame's image through a Catmull-Rom filter in five bilinear taps,
-// so a moving camera does not blur the history further every frame.
+// last frame's image through catmull-rom in five bilinear taps, so motion does
+// not blur history.
 fn history_at(uv: vec2f) -> vec3f {
   let size = vec2f(f32(frame.width), f32(frame.height));
   let p = uv * size;
@@ -901,7 +871,7 @@ fn taa(@builtin(global_invocation_id) gid: vec3u) {
       let center = frame.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
       let forward = normalize(center.xyz / center.w - origin);
       var p = origin + dir * (frame.near_z / z / dot(dir, forward));
-      // A moving surface was elsewhere last frame: through its instance.
+      // a moving surface was elsewhere last frame: through its instance.
       var instance = 0u;
       if (hd > 0.0 && hd >= bitcast<f32>(sd_bits)) {
         instance = hw_visible[textureLoad(hw_id, px, 0).x >> 7u].x;
@@ -914,10 +884,10 @@ fn taa(@builtin(global_invocation_id) gid: vec3u) {
     } else if (dir.y < 0.0) {
       prev = frame.prev_view_proj * vec4f(origin + dir * (-origin.y / dir.y), 1.0);
     } else {
-      prev = frame.prev_view_proj * vec4f(dir, 0.0);  // The sky: a direction, at infinity
+      prev = frame.prev_view_proj * vec4f(dir, 0.0);  // sky: a direction at infinity
     }
-    // The surface was found along the nudged ray; taking the nudge back
-    // out means a still camera reads its history at the pixel's center.
+    // found along the nudged ray; removing the nudge lets a still camera read
+    // history at pixel centres.
     let p = prev.xy / prev.w + frame.jitter;
     let uv = vec2f(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
     if (prev.w > 0.0 && all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0))) {

@@ -1,9 +1,8 @@
 #version 460
-// Writes a pass's indirect arguments, in rows of up to 65535 workgroups,
-// the most one dimension may hold. Step 0 sizes the cluster culling
-// dispatch: one workgroup per work item, and in pass 2 also one per 64
-// clusters pass 1 found hidden. Step 1 sizes the mesh shader draw and the
-// software rasterizer: one workgroup per cluster the pass found visible.
+// a pass's indirect arguments, in rows of at most 65535 workgroups. step 0:
+// cluster culling, a workgroup per work item, plus in pass 2 one per 64 hidden
+// clusters. step 1: mesh draw and software raster, a workgroup per visible
+// cluster.
 #include "common.glsl"
 
 layout(local_size_x = 1) in;
@@ -15,7 +14,7 @@ uvec3 rows(uint n) {
 void main() {
     const uint pass = push.pass;
     if (push.level == 3u) {
-        // After cell culling.
+        // after cell culling.
         if (pass == 0u) {
             instance_args[0] = uvec4(rows(visible_cell_count[0]), 0u);
             late_cell_args = uvec4(rows((late_cell_count + 63u) / 64u), 0u);
@@ -34,8 +33,8 @@ void main() {
             sw_pass_start[0] = 0u;
         }
     } else {
-        // The two ends of the list must not cross: past the point where
-        // they meet, clusters are dropped (and counted as an overflow).
+        // the list's two ends must not cross: past their meeting, clusters drop
+        // (counted as overflow).
         const uint hw_end = min(visible_count, frame.max_visible);
         const uint sw_end = min(sw_count, frame.max_visible - hw_end);
         pass_start[pass + 1u] = hw_end;

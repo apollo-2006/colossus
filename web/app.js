@@ -1,15 +1,14 @@
-// The demo page: loads the models, places a crowd of them, and flies a
-// camera over it with the WebGPU renderer.
+// the demo page: loads the models, places a crowd, flies a camera over it.
 import { fetchModel } from './geometry.js';
 import { FLAG_CONE, FLAG_FRUSTUM, FLAG_OCCLUSION, FLAG_SHADOWS, FLAG_SOFTWARE, FLAG_TAA, Renderer } from './renderer.js';
 
 const $ = (id) => document.getElementById(id);
 const MODELS = ['models/lucy', 'models/dragon'];
-const POOL_BYTES = 192 << 20;  // Pages streamed in; the rest stay on the server
+const POOL_BYTES = 192 << 20;  // streamed pages; the rest stay on the server
 
 const human = (v) => (v >= 1e12 ? `${(v / 1e12).toFixed(2)}T` : v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : `${v}`);
 
-// A small seeded generator, so the crowd is the same on every visit.
+// small seeded generator: the same crowd every visit.
 function random(seed) {
   let s = seed >>> 0;
   return () => {
@@ -23,7 +22,7 @@ function random(seed) {
 
 const GRID_SIDES = [1, 2, 3, 4, 6, 8, 10, 15, 20, 30, 45, 60, 100, 150, 200, 300, 450, 600, 800, 1000];
 
-// An n by n grid, models alternating, each turned and sized at random.
+// n x n grid, models alternating, turned and sized at random.
 export function crowd(n, models, spacing = 1.25) {
   const rand = random(7), materialRand = random(11), motionRand = random(13);
   const out = [];
@@ -33,13 +32,12 @@ export function crowd(n, models, spacing = 1.25) {
       const scale = n === 1 ? 1 : 0.85 + 0.3 * rand();
       const c = Math.cos(angle) * scale, s = Math.sin(angle) * scale;
       const tx = (x - (n - 1) / 2) * spacing, tz = (z - (n - 1) / 2) * -spacing;
-      // Mostly marble, some sandstone, bronze, gold and granite, as the
-      // native viewer mixes them (shade materials in compute.wgsl).
+      // mostly marble; some sandstone, bronze, gold, granite, as the viewer
+      // (materials in compute.wgsl).
       const material = n === 1 ? 1 : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5][Math.floor(materialRand() * 20)];
-      // A quarter of those in the middle 30 x 30 move (animate() in
-      // common.wgsl): bit 9 marks it, bit 8 picks the direction, the low 8
-      // bits the phase. Only the middle, so a million-strong crowd is not a
-      // quarter million moving shadows to redraw every frame.
+      // a quarter of the middle 30 x 30 move (animate() in common.wgsl): bit 9
+      // marks it, bit 8 the direction, low 8 bits the phase. only the middle: a
+      // million-strong crowd is not a quarter million moving shadows.
       const middle = Math.abs(x - (n - 1) / 2) < 15 && Math.abs(z - (n - 1) / 2) < 15;
       const anim = n > 1 && middle && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
       out.push({ model: (z * n + x) % models, scale, material, anim, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
@@ -77,7 +75,7 @@ async function main() {
   const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS | FLAG_OCCLUSION | FLAG_TAA, threshold: 1, mode: 0, swPixels: 32, motion: true };
   let frozen = null;
   const build = () => {
-    // The slider steps through grid sides, up to a million instances.
+    // the slider steps through grid sides, up to a million instances.
     const n = GRID_SIDES[Number($('grid').value)];
     renderer.setPlacements(crowd(n, models.length));
     $('grid-label').textContent = `${(n * n).toLocaleString('en-US')} instances`;
@@ -101,7 +99,7 @@ async function main() {
     frozen = $('freeze').checked ? { eye: [...camera.eye], forward: camera.forward, fov: camera.fov, near: camera.near } : null;
   };
 
-  // Drag to look, WASD (and Q, E) to fly, wheel for speed.
+  // drag to look, wasd (and q, e) to fly, wheel for speed.
   const keys = new Set();
   let speed = 1.5, dragging = false, last = [0, 0], idle = true;
   addEventListener('keydown', (e) => { if (!e.target.closest('input, select')) { keys.add(e.code); idle = false; } });
@@ -135,7 +133,7 @@ async function main() {
     if (keys.has('KeyQ')) move[1] -= 1;
     const boost = keys.has('ShiftLeft') ? 4 : 1;
     for (let k = 0; k < 3; k++) camera.eye[k] += move[k] * speed * boost * dt;
-    // Until someone takes over, drift slowly into the crowd and back.
+    // until someone takes over, drift into the crowd and back.
     if (idle) {
       camera.yaw += 0.04 * dt;
       camera.eye[2] -= Math.sin(now / 4000) * 0.15 * dt;

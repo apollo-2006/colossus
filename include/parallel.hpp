@@ -1,6 +1,6 @@
 #pragma once
-// parallel_for over [0, n): one worker per hardware thread, each taking the
-// next index from a shared counter, so uneven items balance themselves.
+// parallel_for over [0, n): a worker per hardware thread, each taking the next
+// index from a shared counter.
 #include <atomic>
 #include <thread>
 #include <vector>

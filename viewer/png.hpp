@@ -1,6 +1,6 @@
 #pragma once
-// Writes 8-bit RGB PNG files with no image library: a zlib stream of
-// stored (uncompressed) deflate blocks, which every reader accepts.
+// 8-bit rgb png writer without a library: a zlib stream of stored deflate
+// blocks, which every reader accepts.
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -18,7 +18,7 @@ inline uint32_t crc32(const uint8_t* p, size_t n, uint32_t crc = 0) {
 }
 
 inline bool write_rgb(const std::string& path, int w, int h, const std::vector<uint8_t>& rgb) {
-    std::vector<uint8_t> raw;  // Each row: filter byte 0, then the pixels
+    std::vector<uint8_t> raw;  // each row: filter byte 0, then pixels
     raw.reserve(size_t(h) * (1 + 3 * size_t(w)));
     for (int y = 0; y < h; ++y) {
         raw.push_back(0);
@@ -33,7 +33,7 @@ inline bool write_rgb(const std::string& path, int w, int h, const std::vector<u
         z.insert(z.end(), raw.begin() + at, raw.begin() + at + n);
         if (n == 0) break;
     }
-    uint32_t a = 1, b = 0;  // Adler-32
+    uint32_t a = 1, b = 0;  // adler-32
     for (uint8_t c : raw) { a = (a + c) % 65521; b = (b + a) % 65521; }
     for (int s = 24; s >= 0; s -= 8) z.push_back((((b << 16) | a) >> s) & 255);
 

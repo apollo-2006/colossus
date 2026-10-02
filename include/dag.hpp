@@ -1,52 +1,44 @@
 #pragma once
-// The cluster LOD hierarchy: a DAG of clusters in which every level is a
-// coarser copy of the one below, built so that any mix of levels joins up
-// without cracks.
+// the cluster lod hierarchy: a dag where each level is a coarser copy of the
+// one below, and any mix of levels joins without cracks.
 //
-// Building it, level by level:
-//   1. Partition the level's clusters into groups of about eight that share
-//      many edges.
-//   2. Lock every vertex a group shares with another group, merge each
-//      group's triangles and simplify them to half.
-//   3. Split the simplified triangles into new clusters: the next level.
-// Because group outlines are locked, a group simplified and a neighbouring
-// group not simplified still meet edge for edge. The next level's groups
-// are drawn differently, so a border locked at one level is free at the
-// next, and no seam survives more than one level.
+// per level:
+//   1. group clusters, about eight, by shared edges.
+//   2. lock vertices shared between groups; merge each group and simplify to
+//      half.
+//   3. split the result into clusters: the next level.
+// locked outlines meet edge for edge simplified or not. groups differ per
+// level, so no seam outlives a level.
 //
-// Choosing what to draw: each cluster stores the error of its own level and
-// of the coarser level made from its group, each with a bounding sphere.
-// Both are the same for every cluster of a group, and both only grow toward
-// the root, so the test
+// each cluster stores its own error and its parent group's, each with a sphere,
+// equal across a group and growing toward the root, so
 //
 //     own error on screen <= threshold < parent error on screen
 //
-// picks exactly one level along every path from a leaf to a root, and all
-// clusters of one group agree. Each cluster can be tested on its own, in any
-// order: a GPU thread per cluster, with no traversal.
+// picks exactly one level on every leaf to root path, and a group agrees. one
+// gpu thread per cluster, no traversal.
 #include "mesh.hpp"
 
 #include <cmath>
 #include <vector>
 
 struct lod_cluster {
-    std::vector<uint32_t> indices;  // Three per triangle, into lod_mesh::positions
-    sphere bounds;                  // Around this cluster's vertices: for culling
-    vec3 cone_axis;                 // Contains every face normal: see cone_cutoff
-    // Sine of the widest angle between cone_axis and a face normal: every
-    // triangle faces away from a viewer at unit direction d from the
-    // bounds' center when dot(d, axis) >= cone_cutoff + radius / distance.
-    // 1 turns the test off.
+    std::vector<uint32_t> indices;  // three per triangle, into lod_mesh::positions
+    sphere bounds;                  // around the vertices: for culling
+    vec3 cone_axis;                 // holds every face normal: see cone_cutoff
+    // sine of the widest angle from cone_axis to a face normal: all triangles
+    // face away from direction d (from the bounds' centre) when dot(d, axis) >=
+    // cone_cutoff + radius / distance. 1 disables.
     float cone_cutoff = 1;
 
-    sphere lod_bounds;  // Shared by every cluster made from the same group
+    sphere lod_bounds;  // same for every cluster of a group
     float lod_error = 0;
-    sphere parent_bounds;              // The group this cluster was simplified in
-    float parent_error = INFINITY;    // Infinite for a root: nothing coarser exists
+    sphere parent_bounds;              // the group it was simplified in
+    float parent_error = INFINITY;    // infinite for a root
     uint32_t level = 0;
-    uint32_t group = UINT32_MAX;       // Number of the group it was simplified in, if any
-    // Number of the group whose simplification made it: the finer clusters
-    // it stands for are that group's members. None for the leaves.
+    uint32_t group = UINT32_MAX;       // group it was simplified in, if any
+    // group whose simplification made it: the finer clusters it stands for.
+    // none for leaves.
     uint32_t creator = UINT32_MAX;
 };
 
@@ -57,13 +49,12 @@ struct lod_level_stats {
 
 struct lod_mesh {
     std::vector<vec3> positions, normals;
-    std::vector<lod_cluster> clusters;  // Level 0 first, then each level in turn
+    std::vector<lod_cluster> clusters;  // level 0, then each level
     std::vector<lod_level_stats> levels;
 };
 
-// Builds the hierarchy over a welded mesh. Logs one line per level if
-// verbose.
+// builds the hierarchy over a welded mesh. one log line per level if verbose.
 lod_mesh build_lod(const mesh& m, bool verbose);
 
-// Cone and bounds for a cluster's triangles.
+// cone and bounds of a cluster.
 void cluster_bounds(const std::vector<vec3>& positions, lod_cluster& c);

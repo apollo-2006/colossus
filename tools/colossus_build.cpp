@@ -1,11 +1,11 @@
-// colossus_build: reads a PLY or OBJ model, builds its cluster LOD hierarchy and
-// writes it as a .cgeo file for the viewer.
+// colossus_build: reads a ply or obj model, builds its cluster lod hierarchy,
+// writes a .cgeo for the viewer.
 //
-//   colossus_build models/lucy.ply models/lucy.cgeo --up-z
-//   colossus_build in.obj out.cgeo --check     also check every cut for cracks
-//   colossus_build in.ply out.cgeo --max-triangles 500000
-//                                          keep only the levels from the finest
-//                                          cut within 500k triangles up
+//     colossus_build models/lucy.ply models/lucy.cgeo --up-z
+//     colossus_build in.obj out.cgeo --check     also check every cut for cracks
+//     colossus_build in.ply out.cgeo --max-triangles 500000
+//                                            keep only the levels from the finest
+//                                            cut within 500k triangles up
 #include "geometry_file.hpp"
 #include "lod_check.hpp"
 #include "paged_file.hpp"

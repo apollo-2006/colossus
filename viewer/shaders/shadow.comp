@@ -1,9 +1,8 @@
 #version 460
-#define RAY_QUERY  // Only built, and only run, where the GPU has ray queries
-// Sun shadows at half resolution: one ray for each two by two pixels, from
-// the surface under its top-left pixel, stored with that surface's
-// distance so shade.comp can tell which neighbours it may borrow from.
-// Built only with ray queries.
+#define RAY_QUERY  // built and run only with ray queries
+// half resolution sun shadows: a ray per 2x2 pixels from the surface under the
+// top-left one, stored with its distance so shade.comp knows which neighbours
+// to borrow. ray queries only.
 #include "common.glsl"
 #include "surface.glsl"
 

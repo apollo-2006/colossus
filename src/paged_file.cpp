@@ -11,7 +11,7 @@ namespace {
 
 constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '6'};
 constexpr uint32_t grid_bits = 14;
-constexpr uint32_t grid_max = (1u << grid_bits) - 2;  // A step of rounding to spare
+constexpr uint32_t grid_max = (1u << grid_bits) - 2;  // a step of rounding to spare
 
 template <class T>
 void write_vec(std::ofstream& f, const std::vector<T>& v) {
@@ -36,8 +36,8 @@ float sign_not_zero(float v) { return v >= 0 ? 1.0f : -1.0f; }
 
 namespace {
 
-// Octahedral: onto |x| + |y| + |z| = 1, the lower half folded over, then
-// each of u and v from [-1, 1] to 11 bits.
+// octahedral: onto |x| + |y| + |z| = 1, lower half folded over, u and v from
+// [-1, 1] to 11 bits.
 uint32_t encode_normal(vec3 n) {
     const float l1 = std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
     float u = l1 > 0 ? n.x / l1 : 0, v = l1 > 0 ? n.y / l1 : 0;
@@ -63,8 +63,8 @@ vec3 decode_normal(const uint32_t* vertex) {
 }
 
 uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t) {
-    // As the shaders read it: the word the triangle starts in, and the next
-    // if it runs over.
+    // as the shaders read it: the triangle's word, and the next if it runs
+    // over.
     const uint32_t byte = 3 * t, at = c.triangle_offset + byte / 4, shift = (byte % 4) * 8;
     uint32_t v = page[at] >> shift;
     if (shift > 8) v |= page[at + 1] << (32 - shift);
@@ -73,7 +73,7 @@ uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t)
 
 vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* vertex) {
     const uint32_t x = vertex[0] & 0x3fff, y = (vertex[0] >> 14) & 0x3fff, z = (vertex[0] >> 28) | ((vertex[1] & 0x3ff) << 4);
-    // As the shaders compute it: integer grid point, then one multiply-add.
+    // as the shaders compute it: integer grid point, one multiply-add.
     return {g.grid_min.x + g.grid_step * float(c.origin[0] + x), g.grid_min.y + g.grid_step * float(c.origin[1] + y),
             g.grid_min.z + g.grid_step * float(c.origin[2] + z)};
 }
@@ -91,9 +91,9 @@ paged_geometry page(const geometry& g) {
     p.lod_bounds = g.lod_bounds;
     p.levels = g.levels;
 
-    // Page 0 is the roots; every group with members gets a page.
+    // page 0 holds the roots; every group with members gets a page.
     std::unordered_map<uint32_t, uint32_t> page_of_group;
-    std::vector<std::vector<uint32_t>> members(1);  // Cluster numbers per page
+    std::vector<std::vector<uint32_t>> members(1);  // cluster numbers per page
     for (uint32_t i = 0; i < g.clusters.size(); ++i) {
         const uint32_t group = g.clusters[i].group;
         uint32_t pg = 0;
@@ -105,7 +105,7 @@ paged_geometry page(const geometry& g) {
         members[pg].push_back(i);
     }
 
-    // The grid: fine enough that the largest cluster spans grid_max steps.
+    // grid fine enough that the largest cluster spans grid_max steps.
     vec3 lo(INFINITY, INFINITY, INFINITY);
     float largest = 0;
     for (const gpu_cluster& c : g.clusters) {
@@ -131,11 +131,11 @@ paged_geometry page(const geometry& g) {
         c.group = c.group == UINT32_MAX ? 0 : page_of_group.at(c.group);
         auto it = c.creator == UINT32_MAX ? page_of_group.end() : page_of_group.find(c.creator);
         c.creator = it == page_of_group.end() ? no_page : it->second;
-        // The finer page needs this one resident.
+        // the finer page needs this one resident.
         if (c.creator != no_page) deps[c.creator].push_back(c.group);
     }
 
-    // Each page: its clusters' vertices and triangles, in turn.
+    // each page: its clusters' vertices and triangles, in turn.
     std::vector<uint32_t> words;
     for (uint32_t pg = 0; pg < members.size(); ++pg) {
         page_info info{};
@@ -199,8 +199,7 @@ void save_paged(const paged_geometry& p, const std::string& path) {
     write_vec(f, p.pages);
     write_vec(f, p.deps);
     write_vec(f, p.levels);
-    // The page data last, 16-byte aligned, so a reader can map it or read
-    // pages straight from the file.
+    // page data last, 16-byte aligned, to map or read straight from the file.
     const uint64_t n = p.data.size() * 4;
     f.write(reinterpret_cast<const char*>(&n), sizeof n);
     while (f.tellp() % 16) f.put(0);
@@ -230,7 +229,7 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
     while (f.tellg() % 16) f.get();
     p.data_offset = static_cast<uint64_t>(f.tellg());
     if (!f) throw std::runtime_error(path + ": ends early");
-    // Every offset the shaders and the streamer follow is checked here.
+    // every offset the shaders and streamer follow is checked here.
     for (const page_info& pg : p.pages)
         if (pg.offset % 16 || pg.offset + pg.size > p.data_size || uint64_t(pg.dep_first) + pg.dep_count > p.deps.size())
             throw std::runtime_error(path + ": page out of range");

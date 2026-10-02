@@ -1,6 +1,6 @@
-// Tests for the builder, on procedural meshes so they need no downloads:
-// PLY and OBJ reading, welding, clustering limits, the simplifier's locks
-// and flips, the hierarchy's cracks at every cut, and the file round trip.
+// builder tests on procedural meshes (no downloads): ply and obj reading,
+// welding, cluster limits, simplifier locks and flips, cracks at every cut,
+// file round trip.
 #include "cluster.hpp"
 #include "dag.hpp"
 #include "geometry_file.hpp"
@@ -30,9 +30,8 @@ int failures = 0;
         }                                                                          \
     } while (0)
 
-// A sphere from a subdivided octahedron, its radius wobbled by a few
-// sines so the simplifier has detail to remove. Wound counterclockwise
-// from outside.
+// sphere from a subdivided octahedron, radius wobbled by a few sines for
+// detail. counterclockwise from outside.
 mesh bumpy_sphere(int subdivisions) {
     mesh m;
     m.positions = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
@@ -61,8 +60,7 @@ mesh bumpy_sphere(int subdivisions) {
     return m;
 }
 
-// The sphere with the triangles near a few points cut away: open borders,
-// as scans have.
+// the sphere with triangles near a few points cut away: borders, like scans.
 mesh holed_sphere(int subdivisions) {
     mesh m = bumpy_sphere(subdivisions);
     const vec3 holes[] = {{0.6f, 0.6f, 0.53f}, {-0.9f, 0.1f, 0.42f}, {0, -1, 0}};
@@ -74,11 +72,11 @@ mesh holed_sphere(int subdivisions) {
         if (!cut) kept.insert(kept.end(), &m.indices[t], &m.indices[t + 3]);
     }
     m.indices = std::move(kept);
-    weld(m);  // Drops the vertices the holes left unused
+    weld(m);  // drops vertices the holes left unused
     return m;
 }
 
-// A flat n by n grid of squares, two triangles each: all border.
+// flat n x n grid of squares, two triangles each: all border.
 mesh grid(int n) {
     mesh m;
     for (int y = 0; y <= n; ++y)
@@ -97,7 +95,7 @@ std::string temp_path(const char* name) {
 
 void test_ply_and_obj() {
     std::printf("PLY and OBJ reading\n");
-    // One square as two triangles, in each format; the OBJ as a quad.
+    // one square as two triangles in each format; the obj as a quad.
     const float v[4][3] = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}};
     const std::string head = "ply\nformat %s 1.0\ncomment test\nelement vertex 4\nproperty float x\nproperty float y\n"
                              "property float z\nproperty uchar intensity\nelement face 2\nproperty list uchar int vertex_indices\nend_header\n";
@@ -140,7 +138,7 @@ void test_ply_and_obj() {
 
 void test_weld() {
     std::printf("welding\n");
-    mesh m;  // Two triangles with their own copies of the shared edge, one repeated, one degenerate
+    mesh m;  // two triangles with their own copies of the shared edge, one repeated, one degenerate
     m.positions = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}};
     m.indices = {0, 1, 2, 3, 4, 5, 1, 2, 0, 0, 0, 1};
     weld(m);
@@ -171,15 +169,15 @@ void test_clusters() {
 
 void test_simplify() {
     std::printf("simplification\n");
-    const mesh m = grid(40);  // 3200 triangles, flat, with a border
+    const mesh m = grid(40);  // 3200 triangles, flat, bordered
     std::vector<uint8_t> locked(m.positions.size(), 0);
-    // Lock one row of vertices across the middle.
+    // lock a row of vertices across the middle.
     for (int x = 0; x <= 40; ++x) locked[20 * 41 + x] = 1;
     const simplify_result r = simplify(m.positions, m.indices, locked, 400);
     std::printf("  3200 -> %zu triangles, error %.3g\n", r.indices.size() / 3, r.error);
     CHECK(r.indices.size() / 3 <= 400);
-    // Flat, so nothing should be lost: the error is near zero, every
-    // triangle still faces up, and the area is unchanged.
+    // flat, so nothing lost: error near zero, all triangles face up, area
+    // unchanged.
     CHECK(r.error < 1e-4f);
     double area = 0;
     bool flipped = false;
@@ -190,10 +188,10 @@ void test_simplify() {
     }
     CHECK(!flipped);
     CHECK(std::abs(area - 1.0) < 1e-4);
-    // Every locked vertex is still used, still where it was.
+    // every locked vertex still used, still in place.
     std::set<uint32_t> used(r.indices.begin(), r.indices.end());
     for (int x = 0; x <= 40; ++x) CHECK(used.count(20 * 41 + x) == 1);
-    // The four corners cannot move: they are the only way to keep the outline.
+    // the four corners hold the outline: they cannot move.
     for (uint32_t corner : {0u, 40u, 40u * 41, 41u * 41 - 1}) CHECK(used.count(corner) == 1);
 }
 
@@ -222,17 +220,15 @@ void test_hierarchy(const char* name, const mesh& input) {
     CHECK(cracked == 0);
     CHECK(worst_area > 0.97);
 
-    // Paged and written, then read back: every cluster's vertices and
-    // triangles come out of its page as they went in, and every page's
-    // dependencies are coarser pages.
+    // paged, written, read back: every cluster's vertices and triangles come
+    // out of its page as they went in; dependencies are coarser pages.
     const paged_geometry paged = page(g);
     const std::string path = temp_path("test.cgeo");
     save_paged(paged, path);
     const paged_geometry back = load_paged(path, true);
     CHECK(back.clusters.size() == g.clusters.size() && back.pages.size() == paged.pages.size());
-    // Positions come back within half a grid step, normals within a fraction
-    // of a degree, and a vertex shared by clusters comes back bit for bit
-    // the same from each: quantizing must open no cracks.
+    // positions within half a grid step, normals within a fraction of a degree,
+    // shared vertices identical from every cluster: quantizing opens no cracks.
     size_t wrong = 0, mismatched = 0;
     float worst_normal = 1, worst_position = 0;
     std::map<uint32_t, vec3> seen;
@@ -257,7 +253,7 @@ void test_hierarchy(const char* name, const mesh& input) {
                 back.data_size / 1024.0, worst_position / back.grid_step, std::acos(std::min(1.0f, worst_normal)) * 57.2958f);
     CHECK(wrong == 0);
     CHECK(mismatched == 0);
-    CHECK(worst_position <= 0.88f * back.grid_step);  // Half a step on each axis
+    CHECK(worst_position <= 0.88f * back.grid_step);  // half a step per axis
     CHECK(worst_normal > 0.9999f);
     size_t bad_deps = 0;
     for (const gpu_cluster& c : back.clusters)

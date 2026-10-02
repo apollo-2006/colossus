@@ -1,12 +1,12 @@
 #version 460
-// Moves the shadow scene's moving instances: writes each entry of the
-// moving instances' top level (one per instance and shadow copy) the
-// instance's transform this frame, which main.cpp then refits.
+// moves the moving instances in the shadow scene: writes each entry of their
+// top level (one per instance and copy) this frame's transform; main.cpp
+// refits.
 #include "common.glsl"
 
 layout(local_size_x = 64) in;
-// VkAccelerationStructureInstanceKHR, 16 words: the 3x4 transform, then the
-// custom index (the instance, low 24 bits) and mask.
+// VkAccelerationStructureInstanceKHR, 16 words: 3x4 transform, then custom
+// index (instance, low 24 bits) and mask.
 layout(set = 0, binding = 23, scalar) buffer AsInstances { uint as_instances[]; };
 
 void main() {

@@ -26,7 +26,7 @@ float point_triangle_distance(vec3 p, vec3 a, vec3 b, vec3 c) {
 
 namespace {
 
-// Triangles binned in a uniform grid over their box, for nearest queries.
+// triangles binned in a grid over their box, for nearest queries.
 struct triangle_grid {
     const std::vector<vec3>& pos;
     const std::vector<uint32_t>& idx;
@@ -41,7 +41,7 @@ struct triangle_grid {
         for (uint32_t v : idx) { lo = min(lo, pos[v]); hi = max(hi, pos[v]); }
         const vec3 size = hi - lo;
         const float longest = std::max({size.x, size.y, size.z, 1e-20f});
-        // About two triangles a cell, at most 24 cells a side.
+        // about two triangles a cell, at most 24 cells a side.
         const int side = std::clamp(static_cast<int>(std::cbrt(idx.size() / 3 / 2.0)) + 1, 1, 24);
         cell = longest / side * 1.0001f;
         for (int a = 0; a < 3; ++a) n[a] = std::max(1, static_cast<int>(std::ceil(size[a] / cell)));
@@ -59,8 +59,8 @@ struct triangle_grid {
 
     int coord(float v, int a) const { return std::clamp(static_cast<int>((v - lo[a]) / cell), 0, n[a] - 1); }
 
-    // Distance to the nearest triangle: rings of cells outward from the
-    // point's, until the ring is farther than the best found.
+    // distance to the nearest triangle: rings of cells outward until a ring is
+    // farther than the best.
     float nearest(vec3 p) const {
         float best = INFINITY;
         int c[3];
@@ -81,8 +81,7 @@ struct triangle_grid {
     }
 };
 
-// Every vertex and every edge midpoint once (shared ones are shared by
-// about six and two triangles), and every triangle center.
+// every vertex and edge midpoint once, and every triangle centre.
 float one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, const triangle_grid& to) {
     std::vector<uint32_t> verts(from);
     std::sort(verts.begin(), verts.end());

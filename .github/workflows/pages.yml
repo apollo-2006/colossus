@@ -1,7 +1,7 @@
 name: demo
 
-# Builds the web demo's models from the Stanford scans and publishes web/
-# to GitHub Pages, so the live demo always runs the code in the repository.
+# builds the web models from the stanford scans and publishes web/ to github
+# pages, so the live demo runs the repository's code.
 on:
   push:
     branches: [main]
@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build the builder
         run: make -j"$(nproc)" colossus_build
-      # The scans are 380 MB from Stanford's server; keep them between runs.
+      # scans are 380 mb from stanford: cache them between runs.
       - uses: actions/cache@v4
         with:
           path: |

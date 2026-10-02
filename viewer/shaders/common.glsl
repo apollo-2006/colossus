@@ -1,13 +1,13 @@
-// Shared by every shader of the viewer: its resources, laid out as
-// viewer/main.cpp writes them, and the culling and LOD tests.
+// shared by every viewer shader: resources as main.cpp writes them, culling and
+// lod tests.
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
-// `group` is the page it lives in, `creator` the page of the finer clusters
-// it stands for, and the offsets are words into its page.
+// gpu_cluster (include/geometry_file.hpp) as paged: `group` is its page,
+// `creator` the page of the finer clusters it stands for, offsets are words
+// into its page.
 struct Cluster {
-    vec3 center;  // Culling bounds
+    vec3 center;  // culling bounds
     float radius;
     vec3 cone_axis;
     float cone_cutoff;
@@ -24,64 +24,64 @@ struct Cluster {
     uint level;
     uint group;
     uint creator;
-    uvec3 origin;  // Its corner on the model's grid
+    uvec3 origin;  // corner on the model's grid
 };
 
-// One loaded model: its clusters are clusters[first_cluster, + cluster_count).
+// a loaded model: clusters[first_cluster, + cluster_count).
 struct Mesh {
     uint first_cluster;
     uint cluster_count;
-    float shadow_error;  // How far the coarser copy that shadows are traced against strays
+    float shadow_error;  // how far the ray traced shadow copy strays
     uint pad1;
-    vec4 bounds;      // xyz center, w radius
-    vec4 lod_bounds;  // Contains every LOD sphere of the model
-    vec4 grid;        // Where positions snap: xyz grid point 0, w the step
+    vec4 bounds;      // xyz centre, w radius
+    vec4 lod_bounds;  // holds every lod sphere
+    vec4 grid;        // position snapping: xyz grid point 0, w step
 };
 
-// An instance: a model placed by a rotation, uniform scale and translation.
+// a model placed by rotation, uniform scale, translation.
 struct Instance {
-    vec4 rows[3];  // The 3x4 to-world transform, by rows
+    vec4 rows[3];  // 3x4 to-world, by rows
     uint mesh;
     float scale;
-    uint material;  // Into shade.comp's materials
-    uint anim;      // 0: still. Else moving (see animate()): phase in the low 8 bits, bit 8 turns it the other way
+    uint material;  // into shade.comp's materials
+    uint anim;      // 0: still. else moving (animate()): phase in low 8 bits, bit 8 reverses
 };
 
 layout(set = 0, binding = 0, scalar) uniform Frame {
     mat4 view_proj;
-    // Culling and LOD use their own camera, which can be frozen to watch
-    // them from outside.
-    vec4 cull_planes[5];  // World space: inside where dot(xyz, p) + w >= 0
+    // culling and lod use their own camera, which can freeze to watch from
+    // outside.
+    vec4 cull_planes[5];  // world space: inside where dot(xyz, p) + w >= 0
     vec4 cull_origin;
-    vec4 origin;          // The drawing camera
+    vec4 origin;          // drawing camera
     mat4 inv_view_proj;
     uint width, height;
     uint instance_count;
     uint flags;           // flag_* below
-    float lod_scale;      // Pixels per unit of size at distance 1: height / (2 tan(fov / 2))
-    float lod_threshold;  // Allowed error on screen, in pixels
+    float lod_scale;      // pixels per unit at distance 1: height / (2 tan(fov / 2))
+    float lod_threshold;  // allowed error on screen, pixels
     float near_z;
     uint debug_mode;
     uint max_work_items;
     uint max_visible;
-    float time;           // Seconds, for moving instances
-    uint frame_index;  // Counts from 1: stamps pages used and requested
-    // Occlusion culling: the depth pyramid (hzb) and the cameras it is
-    // tested from. Pass 1 tests against last frame's pyramid, from last
-    // frame's camera; pass 2 against this frame's, built after pass 1.
+    float time;           // seconds, for motion
+    uint frame_index;  // from 1: stamps pages used and requested
+    // occlusion: the depth pyramid (hzb) and its cameras. pass 1 tests last
+    // frame's pyramid from last frame's camera; pass 2 this frame's, built
+    // after pass 1.
     mat4 view;
     mat4 prev_view;
-    float p00, p11;  // Projection scale in x and y
+    float p00, p11;  // projection scale, x and y
     uint hzb_width, hzb_height, hzb_levels;
-    float sw_max_pixels;  // Clusters smaller than this on screen go to the software rasterizer
+    float sw_max_pixels;  // clusters smaller on screen go to the software rasterizer
     uint max_requests;
-    float scene_top;  // The highest point of any instance: no shadow ray need climb above it
-    float prev_time;      // Last frame's time
-    uint vsm_atlas_side;  // Physical pages a side of the virtual shadow map atlas (vsm.glsl)
-    vec4 shadow_lod_error;  // Each shadow copy's largest error over the models
-    mat4 prev_view_proj;    // Last frame's, without its sub-pixel offset: for taa.comp
-    uint taa_valid;         // Last frame's image fits this one
-    vec2 jitter;            // This frame's sub-pixel offset, in clip space
+    float scene_top;  // highest point of any instance: shadow rays stop above it
+    float prev_time;      // last frame's time
+    uint vsm_atlas_side;  // physical shadow pages a side (vsm.glsl)
+    vec4 shadow_lod_error;  // each shadow copy's largest error over the models
+    mat4 prev_view_proj;    // last frame's, unjittered: for taa.comp
+    uint taa_valid;         // last frame's image fits this one
+    vec2 jitter;            // this frame's sub-pixel offset, clip space
     uint pad15;
 } frame;
 
@@ -89,24 +89,24 @@ const uint flag_cone_culling = 1u;
 const uint flag_frustum_culling = 2u;
 const uint flag_wireframe = 4u;
 const uint flag_occlusion = 8u;
-const uint flag_prev_valid = 16u;  // Last frame's pyramid fits this frame
+const uint flag_prev_valid = 16u;  // last frame's pyramid fits this frame
 const uint flag_software_raster = 32u;
 const uint flag_shadows = 64u;
-const uint flag_full_res_shadows = 128u;  // Every pixel traces its own ray
+const uint flag_full_res_shadows = 128u;  // every pixel traces its own ray
 const uint flag_taa = 256u;
-const uint flag_vsm = 1024u;  // Shadows from the virtual shadow maps (vsm.glsl), not rays
-const uint flag_moving = 512u;  // Some instances move: shadow rays also test shadow_moving
+const uint flag_vsm = 1024u;  // virtual shadow maps (vsm.glsl), not rays
+const uint flag_moving = 512u;  // some instances move: rays also test shadow_moving
 
-// Which pass this is (0 or 1), and for the pyramid builder, which level.
+// pass (0 or 1), and the pyramid builder's level.
 layout(push_constant, scalar) uniform Push {
     uint pass;
     uint level;
 } push;
 
 layout(set = 0, binding = 1, scalar) readonly buffer Clusters { Cluster clusters[]; };
-// Streaming (viewer/streamer.hpp): where each page is in the pool (its
-// first word, or NO_PAGE), the pool, the frame each page was last drawn
-// from, and the pages asked for this frame, with their priority.
+// streaming (viewer/streamer.hpp): each page's place in the pool (first word,
+// or NO_PAGE), the pool, the frame each page was last drawn from, and this
+// frame's requests with priority.
 const uint NO_PAGE = 0xffffffffu;
 layout(set = 0, binding = 2, scalar) readonly buffer PageTable { uint page_table[]; };
 layout(set = 0, binding = 3, scalar) readonly buffer Pool { uint pool[]; };
@@ -118,9 +118,9 @@ layout(set = 0, binding = 5, scalar) buffer Requests {
 };
 layout(set = 0, binding = 19, scalar) buffer RequestStamp { uint request_stamp[]; };
 
-// A cluster's vertices and triangles, from its page at `base`. A vertex
-// is two words: 14-bit offsets from the cluster's corner on the model's
-// grid, and an 11 + 11 bit octahedral normal (include/paged_file.hpp).
+// a cluster's vertices and triangles from its page at `base`. a vertex is two
+// words: 14-bit offsets from the cluster's corner, and an 11 + 11 bit
+// octahedral normal (include/paged_file.hpp).
 vec3 cluster_position(uint base, Cluster c, vec4 grid, uint k) {
     const uint at = base + c.vertex_offset + 2u * k;
     const uint w0 = pool[at], w1 = pool[at + 1u];
@@ -136,8 +136,8 @@ vec3 cluster_normal(uint base, Cluster c, uint k) {
     return normalize(n);
 }
 
-// Triangles are three bytes each, packed end to end: the word one starts
-// in, and the next if it runs over.
+// triangles are three packed bytes: the start word, and the next if it runs
+// over.
 uint cluster_triangle(uint base, Cluster c, uint t) {
     const uint byte = 3u * t, at = base + c.triangle_offset + byte / 4u, shift = (byte % 4u) * 8u;
     uint v = pool[at] >> shift;
@@ -147,27 +147,25 @@ uint cluster_triangle(uint base, Cluster c, uint t) {
 layout(set = 0, binding = 6, scalar) readonly buffer Meshes { Mesh meshes[]; };
 layout(set = 0, binding = 7, scalar) readonly buffer Instances { Instance instances[]; };
 
-// A moving instance turns on the spot and drifts round a small circle,
-// both computed from the time, so a million of them cost no uploads. Its
-// transform last frame (load_prev_instance) is what last frame's depth
-// pyramid and image hold it at: occlusion pass 1 and taa.comp use it.
+// a moving instance turns on the spot and drifts round a small circle, from the
+// time: no uploads. its last frame transform (load_prev_instance) is where last
+// frame's pyramid and image have it.
 Instance animate(Instance inst, float t) {
     if (inst.anim == 0u) return inst;
     const float phase = float(inst.anim & 255u) * (6.2831853 / 256.0);
     const float turn = phase + t * ((inst.anim & 256u) != 0u ? -0.7 : 0.7);
     const float c = cos(turn), s = sin(turn);
     const vec2 drift = vec2(cos(phase + t * 0.9), sin(phase + t * 0.9)) * 0.2;
-    // The turn, about the instance's own vertical axis, applied after the
-    // placement: rows 0 and 2 of the linear part mix.
+    // turn about its own vertical axis, after placement: rows 0 and 2 of the
+    // linear part mix.
     const vec3 r0 = inst.rows[0].xyz, r2 = inst.rows[2].xyz;
     inst.rows[0] = vec4(c * r0 + s * r2, inst.rows[0].w + drift.x);
     inst.rows[2] = vec4(-s * r0 + c * r2, inst.rows[2].w + drift.y);
     return inst;
 }
 
-// Cells of up to 64 neighbouring instances, culled before their
-// instances (cell_cull.comp): a sphere around everything in the cell, and
-// the cell's instances, which are consecutive.
+// cells of up to 64 neighbouring instances, culled first (cell_cull.comp): a
+// sphere over all, consecutive instances.
 struct Cell {
     vec3 center;
     float radius;
@@ -176,8 +174,8 @@ struct Cell {
     uint pad0, pad1;
 };
 layout(set = 0, binding = 25, scalar) readonly buffer Cells { Cell cells[]; };
-// The cells pass 1 found hidden, for pass 2 (cell_list[0, late_cell_count)),
-// then each pass's cells found visible, from cells.length() * (1 + pass).
+// cells pass 1 hid, for pass 2 (cell_list[0, late_cell_count)), then each
+// pass's visible cells from cells.length() * (1 + pass).
 layout(set = 0, binding = 26, scalar) buffer CellLists {
     uint visible_cell_count[2];
     uint late_cell_count;
@@ -193,26 +191,24 @@ Instance load_prev_instance(uint i) {
     return animate(instances[i], frame.prev_time);
 }
 
-// Work for the task shaders: 64 clusters of one instance from first. Pass
-// 1's items are work[0, max_work_items), pass 2's the next max_work_items.
+// 64 clusters of one instance from first. pass 1's in work[0, max_work_items),
+// pass 2's next.
 struct WorkItem {
     uint instance;
-    uint first;  // Cluster number
+    uint first;  // cluster number
 };
 layout(set = 0, binding = 8, scalar) buffer WorkItems {
-    uint work_count[2];       // Per pass
+    uint work_count[2];       // per pass
     uint late_instance_count;
     uint late_cluster_count;
-    uint big_count[2];        // Per pass: instances left to expand.comp
+    uint big_count[2];        // per pass: instances for expand.comp
     uint pad5, pad6;
     WorkItem work[];
 };
 
-// What pass 1 found hidden behind last frame's depth, for pass 2 to test
-// again: whole instances, and single clusters (instance, cluster).
-// After the instance_count entries for hidden instances come each pass's
-// instances with many pieces of work, for expand.comp: instance, first
-// cluster and piece count, three words each (see big_instance()).
+// what pass 1 hid, for pass 2: whole instances, and (instance, cluster). after
+// instance_count entries, each pass's instances with many work items for
+// expand.comp: instance, first cluster, count, three words (big_instance()).
 layout(set = 0, binding = 14, scalar) buffer LateInstances { uint late_instances[]; };
 
 uint big_instance(uint pass, uint k) {
@@ -220,13 +216,13 @@ uint big_instance(uint pass, uint k) {
 }
 layout(set = 0, binding = 15, scalar) buffer LateClusters { uvec2 late_clusters[]; };
 
-// The depth pyramid: level 0 is half the screen, each texel the farthest
-// (smallest, depth being reversed) depth of the pixels it covers.
+// depth pyramid: level 0 half the screen, each texel the farthest (smallest,
+// reversed) depth it covers.
 layout(set = 0, binding = 16) uniform sampler2D hzb;
 
-// Every cluster drawn this frame, numbered: the visibility buffer stores
-// that number and a triangle. Clusters for the hardware rasterizer fill it
-// from the front, those for the software rasterizer from the back.
+// every cluster drawn this frame, numbered: the visibility buffer stores the
+// number and a triangle. hardware clusters fill from the front, software from
+// the back.
 layout(set = 0, binding = 9, scalar) buffer Visible {
     uint visible_count;
     uint sw_count;
@@ -238,9 +234,8 @@ uint sw_slot(uint k) {
     return frame.max_visible - 1u - k;
 }
 
-// Per pixel: depth (reversed, as float bits) above the visible cluster
-// number times 128 plus the triangle. An atomic max keeps the nearest, and
-// 0 means nothing was drawn.
+// per pixel: reversed depth bits above visible number * 128 + triangle. atomic
+// max keeps the nearest; 0 is nothing.
 layout(set = 0, binding = 10, scalar) buffer VisBuffer { uint64_t vis[]; };
 
 layout(set = 0, binding = 11, scalar) buffer Stats {
@@ -252,24 +247,23 @@ layout(set = 0, binding = 11, scalar) buffer Stats {
     uint work_overflow;
     uint visible_overflow;
     uint instances_occluded;
-    uint clusters_occluded;   // In pass 1; some come back in pass 2
-    uint clusters_late;       // Drawn in pass 2
-    uint clusters_software;   // Drawn by the software rasterizer
+    uint clusters_occluded;   // in pass 1; some come back in pass 2
+    uint clusters_late;       // drawn in pass 2
+    uint clusters_software;   // drawn by the software rasterizer
 } stats;
 
-// Indirect arguments for each pass, written by args.comp: the cluster
-// culling dispatch (x, y, z, and the number of work items), the mesh
-// shader draw (x, y, z, and the first visible cluster it draws), and the
-// software rasterizer's dispatch (x, y, z, and its first cluster).
+// indirect arguments per pass, from args.comp: cluster culling (x, y, z, work
+// items), mesh shader draw (x, y, z, first visible), software raster (x, y, z,
+// first cluster).
 layout(set = 0, binding = 12, scalar) buffer DrawArgs {
     uvec4 cull_args[2];
     uvec4 draw_args[2];
     uvec4 sw_args[2];
     uint pass_start[3];     // visible[pass_start[p], pass_start[p + 1]) is pass p's
-    uint sw_pass_start[3];  // The same, counted from the back
-    uvec4 late_cell_args;      // Pass 2's cell culling: a workgroup per 64 cells pass 1 hid
-    uvec4 instance_args[2];    // Instance culling: a workgroup per visible cell, and in pass 2 per 64 hidden instances
-    uvec4 big_args[2];         // expand.comp, per pass: a workgroup per instance with many pieces
+    uint sw_pass_start[3];  // same, from the back
+    uvec4 late_cell_args;      // pass 2 cell culling: a workgroup per 64 hidden cells
+    uvec4 instance_args[2];    // instance culling: a workgroup per visible cell, and in pass 2 per 64 hidden instances
+    uvec4 big_args[2];         // expand.comp per pass: a workgroup per big instance
 };
 
 vec3 to_world(Instance inst, vec3 p) {
@@ -277,8 +271,8 @@ vec3 to_world(Instance inst, vec3 p) {
                 dot(inst.rows[2].xyz, p) + inst.rows[2].w);
 }
 
-// The inverse of to_world: placements are a rotation and a uniform scale,
-// so the transpose over the scale squared.
+// inverse of to_world: rotation and uniform scale, so transpose over scale
+// squared.
 vec3 from_world(Instance inst, vec3 p) {
     const vec3 d = p - vec3(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
     const vec3 c0 = vec3(inst.rows[0].x, inst.rows[1].x, inst.rows[2].x);
@@ -297,17 +291,16 @@ bool sphere_in_frustum(vec3 c, float r) {
     return inside;
 }
 
-// How many pixels an error of world size `error` covers at the nearest
-// point of a sphere. Clusters of one group compute this from identical
-// numbers, so they always agree.
+// pixels an error of world size `error` covers at a sphere's nearest point. a
+// group computes it from identical numbers, so it agrees.
 float projected_error(vec3 center, float radius, float error) {
     const float d = length(center - frame.cull_origin.xyz) - radius;
     return error * frame.lod_scale / max(d, frame.near_z);
 }
 
-// The screen rectangle a sphere covers, in [0, 1] texture coordinates,
-// for a sphere in view space with z forward (Mara and McGuire 2013, as in
-// zeux's niagara). False if the sphere reaches the near plane.
+// screen rectangle of a view-space sphere (z forward) in [0, 1] texture
+// coordinates (mara and mcguire 2013, as in zeux's niagara). false if it
+// reaches the near plane.
 bool project_sphere(vec3 c, float r, out vec4 aabb) {
     if (c.z < r + frame.near_z) return false;
     const vec3 cr = c * r;
@@ -323,10 +316,9 @@ bool project_sphere(vec3 c, float r, out vec4 aabb) {
     return true;
 }
 
-// Whether a world-space sphere is certainly hidden: its nearest point is
-// farther than the farthest depth drawn anywhere in the rectangle it
-// covers. Pass 1 asks from last frame's camera, against last frame's
-// pyramid; pass 2 from this frame's.
+// whether a world-space sphere is surely hidden: nearest point farther than the
+// farthest depth in its rectangle. pass 1 from last frame's camera and pyramid,
+// pass 2 from this frame's.
 bool occluded(vec3 center, float radius) {
     if ((frame.flags & flag_occlusion) == 0u) return false;
     if (push.pass == 0u && (frame.flags & flag_prev_valid) == 0u) return false;
@@ -335,12 +327,11 @@ bool occluded(vec3 center, float radius) {
     c.z = -c.z;
     vec4 aabb;
     if (!project_sphere(c, radius, aabb)) return false;
-    // A pixel's margin: frames are drawn with a sub-pixel offset (taa.comp),
-    // which the projection above leaves out.
+    // a pixel's margin for the taa jitter, which the projection leaves out.
     const vec2 screen = vec2(frame.width, frame.height);
     const vec2 lo = max(clamp(aabb.xy, 0.0, 1.0) * screen - 1.0, vec2(0.0));
     const vec2 hi = min(clamp(aabb.zw, 0.0, 1.0) * screen + 0.5, screen - 0.5);
-    // The finest level at which the rectangle spans at most 2x2 texels.
+    // finest level where the rectangle spans at most 2x2 texels.
     int level = 0;
     ivec2 t0, t1;
     for (;; ++level) {
@@ -360,13 +351,11 @@ bool occluded(vec3 center, float radius) {
     return sphere_depth < far_depth;
 }
 
-// The LOD test with streaming. A cluster is drawn when its own error on
-// screen is within the threshold and its parent's is not, as before, or
-// when the finer clusters it stands for are not resident: then it is the
-// finest copy there is. It must be resident itself. Every page of finer
-// clusters is resident only while the pages of the clusters standing for
-// them are (viewer/streamer.hpp), so exactly one level is drawn along
-// every path. wants_finer: drawn only for want of finer clusters.
+// lod test with streaming: draw when own error is within the threshold and the
+// parent's is not, or when the finer clusters it stands for are not resident
+// (it is the finest copy). it must be resident. finer pages are resident only
+// while their stand-ins are (viewer/streamer.hpp), so one level per path.
+// wants_finer: drawn only for want of finer clusters.
 bool lod_test(Instance inst, Cluster c, out bool wants_finer, out float self_error) {
     const float s = inst.scale;
     self_error = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s);
@@ -377,14 +366,14 @@ bool lod_test(Instance inst, Cluster c, out bool wants_finer, out float self_err
     return page_table[c.group] != NO_PAGE && coarse_enough && (self_error <= frame.lod_threshold || !finer_resident);
 }
 
-// Asks the streamer for the finer clusters' page, once a frame.
+// asks for the finer clusters' page, once a frame.
 void request_finer(Cluster c, float priority) {
     if (atomicExchange(request_stamp[c.creator], frame.frame_index) == frame.frame_index) return;
     const uint k = atomicAdd(request_count, 1u);
     if (k < frame.max_requests) requests[k] = uvec2(c.creator, floatBitsToUint(priority));
 }
 
-const vec3 sun_dir = normalize(vec3(0.75, 0.5, 0.3));  // Toward the sun
+const vec3 sun_dir = normalize(vec3(0.75, 0.5, 0.3));  // toward the sun
 const vec3 sun_color = vec3(1.0, 0.92, 0.82) * 1.7;
 
 uint hash(uint x) {

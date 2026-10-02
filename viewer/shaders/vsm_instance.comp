@@ -1,8 +1,7 @@
 #version 460
-// Instance culling for the shadow pages: one invocation per instance, for
-// each level with pages to render that the instance's sphere reaches. The
-// level of detail is the camera's rule seen orthographically: a cluster's
-// error in texels of that level, against the same threshold.
+// instance culling for shadow pages: an invocation per instance, for each
+// rendering level its sphere reaches. the camera's lod rule, orthographic:
+// error in that level's texels against the same threshold.
 #include "common.glsl"
 #include "vsm.glsl"
 
@@ -17,7 +16,7 @@ void main() {
     const Mesh m = meshes[inst.mesh];
     const vec2 center = vsm_light_space(to_world(inst, m.bounds.xyz)).xy;
     const float radius = m.bounds.w * inst.scale;
-    // Still instances draw into the still layer, moving ones into the moving.
+    // still instances draw the still layer, moving ones the moving.
     const uint layer = inst.anim != 0u ? vsm_moving : vsm_still;
     uint levels = vsm_rendered_levels[layer];
     while (levels != 0u) {

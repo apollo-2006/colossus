@@ -1,24 +1,23 @@
-// The virtual shadow map passes (see vsm_common.wgsl), a module of their
-// own so their bind group stays small: WebGPU allows few storage buffers
-// per stage. Each frame: mark the pages pixels need, invalidate those
-// moving instances crossed, give needed pages physical pages, clear and
-// render the pages listed, from the hierarchy seen from the sun.
+// virtual shadow map passes (vsm_common.wgsl), a module of their own to keep
+// the bind group small. per frame: mark needed pages, invalidate what moving
+// instances crossed, assign physical pages, clear and render the listed ones
+// from the hierarchy seen from the sun.
 
 @group(1) @binding(0) var<storage, read_write> entries: array<atomic<u32>>;
 @group(1) @binding(1) var<storage, read_write> lists: array<atomic<u32>>;
 @group(1) @binding(2) var<storage, read_write> atlas: array<atomic<u32>>;
-// vwork: [0] work count, [1] big count, [2] visible count, then the work
-// items, the big instances and the visible clusters (see VW_*).
+// vwork: [0] work count, [1] big count, [2] visible count, then work items, big
+// instances, visible clusters (VW_*).
 @group(1) @binding(3) var<storage, read_write> vwork: array<atomic<u32>>;
 @group(1) @binding(4) var hw_depth: texture_depth_2d;
 @group(1) @binding(5) var<storage, read> sw_depth: array<u32>;
 @group(1) @binding(6) var<storage, read_write> stamps: array<atomic<u32>>;    // compute.wgsl's page_stamps
 @group(1) @binding(7) var<storage, read_write> request_words: array<atomic<u32>>;  // compute.wgsl's requests
-// The indirect arguments, bound only for the passes that write them: a
-// buffer cannot be written in a dispatch that reads it as arguments.
+// indirect arguments, bound only for the passes writing them: a dispatch cannot
+// write its argument buffer.
 @group(2) @binding(0) var<storage, read_write> vargs: array<u32>;
 
-const VA_INSTANCE = 0u;  // Into vargs
+const VA_INSTANCE = 0u;  // into vargs
 const VA_CLEAR = 4u;
 const VA_EXPAND = 8u;
 const VA_CULL = 12u;
@@ -59,7 +58,7 @@ fn touches(layer: u32, level: u32, center: vec2f, radius: f32) -> bool {
   return false;
 }
 
-// --- Marking: a pixel's surface from depth alone.
+// --- marking: a pixel's surface from depth alone.
 @compute @workgroup_size(8, 8)
 fn vsm_mark(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= frame.width || gid.y >= frame.height) { return; }
@@ -87,7 +86,7 @@ fn vsm_mark(@builtin(global_invocation_id) gid: vec3u) {
   }
 }
 
-// --- Allocation.
+// --- allocation.
 fn render(slot: u32, layer: u32) {
   atomicStore(&lists[VSM_RENDER + atomicAdd(&lists[3], 1u)], slot | (layer << 31u));
   let level = slot / (VSM_WINDOW * VSM_WINDOW);
@@ -127,7 +126,7 @@ fn invalidate(world_center: vec3f, radius: f32, lane: u32) {
   }
 }
 
-// A workgroup per moving instance: where it was, and where it is.
+// a workgroup per moving instance: where it was, where it is.
 @compute @workgroup_size(64)
 fn vsm_invalidate(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) lane: u32) {
   let g = wid.y * 65535u + wid.x;
@@ -194,7 +193,7 @@ fn vsm_alloc_assign(@builtin(global_invocation_id) gid: vec3u) {
   render_new(slot);
 }
 
-// --- Indirect arguments.
+// --- indirect arguments.
 fn rows(n: u32, at: u32) {
   vargs[at] = min(n, 65535u);
   vargs[at + 1u] = (n + 65534u) / 65535u;
@@ -217,7 +216,7 @@ fn vsm_args_cull() { rows(min(word(0), VSM_MAX_WORK), VA_CULL); }
 @compute @workgroup_size(1)
 fn vsm_args_raster() { rows(min(word(2), VSM_MAX_VISIBLE), VA_RASTER); }
 
-// --- Clearing: a workgroup per page and layer to render.
+// --- clearing: a workgroup per page and layer.
 @compute @workgroup_size(256)
 fn vsm_clear(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) lane: u32) {
   let k = wid.y * 65535u + wid.x;
@@ -229,8 +228,8 @@ fn vsm_clear(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index)
   }
 }
 
-// --- Culling: per instance, each level with pages to render in its layer;
-// errors in that level's texels.
+// --- culling: per instance, each rendering level of its layer; errors in that
+// level's texels.
 fn emit(at: u32, tagged: u32, first: u32) {
   atomicStore(&vwork[VW_WORK + 2u * at], tagged);
   atomicStore(&vwork[VW_WORK + 2u * at + 1u], first);
@@ -330,8 +329,8 @@ fn vsm_cluster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
   let center = vsm_light_space(to_world(inst, c.center)).xy;
   let radius = c.radius * inst.scale;
   if (!touches(layer, level, center, radius)) { return; }
-  // A stand-in, or not drawn because not loaded: the pages it reaches are
-  // rendered again next frame (the moving layer is anyway).
+  // a stand-in, or unloaded: its pages render again next frame (the moving
+  // layer does anyway).
   if ((wants_finer || !loaded) && layer == VSM_STILL) {
     let size = texel * f32(VSM_PAGE);
     let r = rendered_rect(layer, level);
@@ -353,9 +352,9 @@ fn vsm_cluster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
   }
 }
 
-// --- Rasterizing, as the viewer's vsm_raster.comp: texels of the level,
-// snapped to 1/16, edges from each triangle's corner, a top-left rule,
-// both sides drawn, an atomic max per texel in the page it falls in.
+// --- rasterizing, as vsm_raster.comp: level texels snapped to 1/16, edges from
+// each triangle's corner, top-left rule, both sides, atomic max per texel in
+// its page.
 var<workgroup> snapped: array<vec2i, 128>;
 var<workgroup> depth: array<f32, 128>;
 

@@ -1,8 +1,8 @@
-// The WebGPU renderer: the same pipeline as the Vulkan viewer, minus what
-// WebGPU lacks (see compute.wgsl). Per frame:
-//   instance_cull -> args_cull -> cluster_cull -> args_draw
-//   -> software raster (depth, then ids) and hardware raster
-//   -> shade -> blit to the canvas.
+// webgpu renderer: the vulkan viewer's pipeline minus what webgpu lacks (compute.wgsl). per
+// frame, twice for occlusion:
+//   instance_cull -> expand -> cluster_cull -> args_draw
+//   -> software raster (depth, then ids) and hardware raster -> depth pyramid
+// then shadow pages (vsm.wgsl) -> shade -> taa -> blit.
 import { frustumPlanes, invert, lookTo, mul, perspectiveReverseZ } from './math.js';
 import { Streamer } from './streamer.js';
 
@@ -10,7 +10,7 @@ const MAX_WORK = 1 << 20;
 const MAX_VISIBLE = 1 << 20;
 const MAX_REQUESTS = 1 << 13;
 const FRAME_BYTES = 608;
-const PASS_STRIDE = 256;  // Dynamic uniform offsets must be multiples of this
+const PASS_STRIDE = 256;  // dynamic uniform offsets must be multiples of this
 const MAX_HZB_LEVELS = 16;
 const STORAGE_BUFFERS_NEEDED = 16;
 // vsm_common.wgsl's and vsm.wgsl's sizes.
@@ -19,7 +19,7 @@ const VSM_WORK_WORDS = 2359300 + 2 * 1048576;  // VW_VISIBLE + 2 * VSM_MAX_VISIB
 const FLAG_MOVING = 256;
 
 export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOWS = 16, FLAG_OCCLUSION = 32;
-export const FLAG_TAA = 128;  // Read on the CPU only
+export const FLAG_TAA = 128;  // cpu only
 const FLAG_PREV_VALID = 64;
 
 async function source(name) {
@@ -33,9 +33,8 @@ export class Renderer {
     if (!navigator.gpu) return null;
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) return null;
-    // The culling passes that write indirect arguments bind 16 storage
-    // buffers to the compute stage; the default limit is 8, but desktop
-    // adapters allow 16.
+    // the argument-writing culling passes bind 16 storage buffers in compute; default limit
+    // 8, desktop adapters allow 16.
     if (adapter.limits.maxStorageBuffersPerShaderStage < STORAGE_BUFFERS_NEEDED)
       throw new Error(`this GPU allows ${adapter.limits.maxStorageBuffersPerShaderStage} storage buffers per shader stage; the demo needs ${STORAGE_BUFFERS_NEEDED}`);
     const timestamps = adapter.features.has('timestamp-query');
@@ -88,8 +87,8 @@ export class Renderer {
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
         { binding: 1, visibility: C, texture: { sampleType: 'uint' } },
         { binding: 2, visibility: C, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
-        { binding: 3, visibility: C, buffer: { type: 'read-only-storage' } },  // The shadow pages' entries
-        { binding: 4, visibility: C, buffer: { type: 'read-only-storage' } },  // And their atlas
+        { binding: 3, visibility: C, buffer: { type: 'read-only-storage' } },  // shadow page entries
+        { binding: 4, visibility: C, buffer: { type: 'read-only-storage' } },  // and their atlas
         { binding: 5, visibility: C, texture: { sampleType: 'unfilterable-float' } },
       ],
     });
@@ -144,9 +143,8 @@ export class Renderer {
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     });
-    // Virtual shadow maps (vsm_common.wgsl, vsm.wgsl): their passes bind
-    // the scene, the shadow pages and the streaming buffers they ask
-    // through; the passes writing indirect arguments also bind those.
+    // virtual shadow map passes bind the scene, the shadow pages and the streaming buffers
+    // they ask through; argument writers also bind the arguments.
     const rwStorage = (binding) => ({ binding, visibility: C, buffer: { type: 'storage' } });
     this.vsmLayout = d.createBindGroupLayout({
       entries: [rwStorage(0), rwStorage(1), rwStorage(2), rwStorage(3),
@@ -170,9 +168,8 @@ export class Renderer {
 
     const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
     this.frameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
-    // The shadow pages: every slot and physical page empty to begin with
-    // (all ones is VSM_NONE), the atlas's two layers, the culling's lists,
-    // and the indirect arguments.
+    // shadow pages: all slots and physical pages empty (all ones is VSM_NONE), the atlas's
+    // two layers, culling lists, indirect arguments.
     this.vsmEntries = d.createBuffer({ size: 4 * (VSM_PHYS + 2 * VSM_SIDE * VSM_SIDE), usage: S | CD });
     d.queue.writeBuffer(this.vsmEntries, 0, new Uint32Array(VSM_PHYS + 2 * VSM_SIDE * VSM_SIDE).fill(0xffffffff));
     this.vsmAtlas = d.createBuffer({ size: 2 * 4 * VSM_SIDE * VSM_SIDE * 128 * 128, usage: S });
@@ -180,18 +177,17 @@ export class Renderer {
     this.vsmArgs = d.createBuffer({ size: 80, usage: S | GPUBufferUsage.INDIRECT });
     this.vsmArgsGroup = d.createBindGroup({ layout: this.vsmArgsLayout, entries: [{ binding: 0, resource: { buffer: this.vsmArgs } }] });
     this.counters = d.createBuffer({ size: 96, usage: S | CD | CS });
-    // One entry per pass, then one per pyramid level: (pass, level).
+    // an entry per pass, then per pyramid level: (pass, level).
     this.passInfo = d.createBuffer({ size: PASS_STRIDE * (2 + MAX_HZB_LEVELS), usage: GPUBufferUsage.UNIFORM | CD });
     for (let k = 0; k < 2 + MAX_HZB_LEVELS; k++)
       d.queue.writeBuffer(this.passInfo, k * PASS_STRIDE, new Uint32Array([k < 2 ? k : 0, k < 2 ? 0 : k - 2, 0, 0]));
     this.hzbDummy = d.createTexture({ size: [1, 1], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING });
     this.prevValid = false;
-    this.work = d.createBuffer({ size: 2 * MAX_WORK * 8, usage: S });  // Per pass
+    this.work = d.createBuffer({ size: 2 * MAX_WORK * 8, usage: S });  // per pass
     this.hwVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
     this.swVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
-    // [0, 8) culling dispatches per pass, [8, 16) hardware draws, [16, 24)
-    // software dispatches, [24, 28) pass 2's instance culling and [28, 36)
-    // each pass's expand.
+    // [0, 8) culling per pass, [8, 16) hardware draws, [16, 24) software dispatches, [24,
+    // 28) pass 2 instance culling, [28, 36) expand per pass.
     this.args = d.createBuffer({ size: 144, usage: S | GPUBufferUsage.INDIRECT });
     this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 96, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
     this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
@@ -207,9 +203,8 @@ export class Renderer {
     this.gpuMs = null;
   }
 
-  // models: parsed .cgeo files. placements: {model, matrix (3x4 rows), scale}.
-  // models: from fetchModel() (geometry.js). Their pages stream into a
-  // pool of poolBytes as the views need them.
+  // models: from fetchModel() (geometry.js); pages stream into a pool of poolBytes as views
+  // need them.
   loadModels(models, poolBytes) {
     const d = this.device;
     const total = models.reduce((a, m) => ({ c: a.c + m.clusterCount, p: a.p + m.pages.length }), { c: 0, p: 0 });
@@ -222,8 +217,8 @@ export class Renderer {
       const dst = new Uint32Array(clusters, clusterBase * 112, m.clusterCount * 28);
       dst.set(new Uint32Array(m.clusters));
       for (let c = 0; c < m.clusterCount; c++) {
-        dst[28 * c + 23] += pageBase;                                       // Its page
-        if (dst[28 * c + 24] !== 0xffffffff) dst[28 * c + 24] += pageBase;  // The finer clusters' page
+        dst[28 * c + 23] += pageBase;                                       // its page
+        if (dst[28 * c + 24] !== 0xffffffff) dst[28 * c + 24] += pageBase;  // the finer clusters' page
       }
       m.pages.forEach((p, i) => pages.push({
         url: m.pagesUrl, offset: p.offset, size: p.size, pinned: i === 0,
@@ -249,16 +244,16 @@ export class Renderer {
     this.meshBuffer = upload(meshes);
     this.pageTable = d.createBuffer({ size: pages.length * 4, usage: S | CD });
     this.pool = d.createBuffer({ size: this.streamer.slotCount * this.streamer.slotBytes, usage: S | CD });
-    // Per page, the frame it was last drawn from, then the frame it was last asked for.
+    // per page: frame last drawn from, then frame last asked for.
     this.pageStamps = d.createBuffer({ size: pages.length * 8, usage: S | CD | CS });
     this.streamReadbacks = [0, 1, 2].map(() => ({
       buffer: d.createBuffer({ size: 16 + MAX_REQUESTS * 8 + pages.length * 4, usage: GPUBufferUsage.MAP_READ | CD }), busy: false,
     }));
-    this.workGroup = null;  // Remade with the new buffers on the next resize
+    this.workGroup = null;  // remade with the new buffers on the next resize
     this.width = this.height = 0;
   }
 
-  // placements: {model, matrix (3x4 rows), scale, material}.
+  // placements: {model, matrix (3x4 rows), scale, material, anim}.
   setPlacements(placements) {
     const d = this.device;
     const instances = new ArrayBuffer(Math.max(1, placements.length) * 64);
@@ -273,9 +268,9 @@ export class Renderer {
     });
     this.instanceCount = placements.length;
     this.late?.destroy();
-    // Hidden clusters, hidden instances, then each pass's big instances (two entries each).
+    // hidden clusters, hidden instances, then each pass's big instances (two entries each).
     this.late = d.createBuffer({ size: (MAX_VISIBLE + 5 * Math.max(1, placements.length)) * 8, usage: GPUBufferUsage.STORAGE });
-    this.workGroup = null;  // Remade with it on the next resize
+    this.workGroup = null;  // remade on the next resize
     this.vsmGroup = null;
     this.width = 0;
     this.instanceBuffer?.destroy();
@@ -288,8 +283,7 @@ export class Renderer {
           .map(([binding, buffer]) => ({ binding, resource: { buffer } }))],
     });
     this.sceneGroup = sceneGroup(this.frameBuffer);
-    // The shadow pages' lists end with the moving instances, for
-    // invalidating the pages they cross.
+    // the shadow pages' lists end with the moving instances, for invalidation.
     const moving = [];
     placements.forEach((p, i) => { if (p.anim) moving.push(i); });
     this.movingCount = moving.length;
@@ -306,14 +300,13 @@ export class Renderer {
     this.height = height;
     for (const x of [this.swBuffer, this.depthTexture, this.idTexture, this.image, this.shaded, ...(this.history ?? [])]) x?.destroy();
     this.vsmGroup = null;
-    // The software rasterizer's depth, then its triangle ids.
+    // software rasterizer depth, then triangle ids.
     this.swBuffer = d.createBuffer({ size: width * height * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const T = GPUTextureUsage;
     this.depthTexture = d.createTexture({ size: [width, height], format: 'depth32float', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
     this.idTexture = d.createTexture({ size: [width, height], format: 'r32uint', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
     this.image = d.createTexture({ size: [width, height], format: 'rgba8unorm', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING | T.COPY_SRC });
-    // Shading writes here; the antialiasing pass blends it into the history
-    // and writes the result to image, for the canvas.
+    // shading writes here; taa blends it into the history and writes image, for the canvas.
     this.shaded = d.createTexture({ size: [width, height], format: 'rgba8unorm', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING });
     this.history = [0, 1].map(() => d.createTexture({ size: [width, height], format: 'rgba16float', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING }));
     this.taaGroups = [0, 1].map((k) => d.createBindGroup({
@@ -332,8 +325,7 @@ export class Renderer {
         { binding: 9, resource: { buffer: this.passInfo, size: 16 } },
       ],
     });
-    // The depth pyramid: level 0 half the screen (rounded up), each level
-    // half the last, down to 1 x 1.
+    // depth pyramid: level 0 half the screen (rounded up), halving to 1x1.
     this.hzb?.destroy();
     const hw = Math.ceil(width / 2), hh = Math.ceil(height / 2);
     this.hzbLevels = Math.min(MAX_HZB_LEVELS, Math.floor(Math.log2(Math.max(hw, hh))) + 1);
@@ -371,8 +363,7 @@ export class Renderer {
     const aspect = width / height;
     const proj = perspectiveReverseZ(camera.fov, aspect, camera.near);
     const unjittered = mul(proj, lookTo(camera.eye, camera.forward, [0, 1, 0]));
-    // Temporal antialiasing: nudge the projection by a sub-pixel offset,
-    // the Halton (2, 3) sequence over eight frames; clip.xy += offset * w.
+    // taa: sub-pixel offset, halton (2, 3) over eight frames; clip.xy += offset * w.
     const taa = (settings.flags & FLAG_TAA) !== 0 && settings.mode === 0;
     const viewProj = new Float32Array(unjittered);
     let jitter = [0, 0];
@@ -388,7 +379,7 @@ export class Renderer {
     const cullViewProj = mul(perspectiveReverseZ(cull.fov, aspect, cull.near), lookTo(cull.eye, cull.forward, [0, 1, 0]));
     const shadows = (settings.flags & FLAG_SHADOWS) !== 0;
     this.frameIndex++;
-    // Time, for moving instances: it stands still while motion is off.
+    // time, for motion: stands still while motion is off.
     const now = performance.now() / 1000;
     const prevTime = this.time;
     if (this.lastNow !== undefined && settings.motion) this.time += now - this.lastNow;
@@ -414,8 +405,7 @@ export class Renderer {
     ff.set([...cull.eye, 1], 52);
     ff.set([...camera.eye, 1], 56);
     fu[60] = width; fu[61] = height; fu[62] = this.instanceCount;
-    // Occlusion from the drawing camera says nothing about what a frozen
-    // culling camera would see.
+    // depth from the drawing camera says nothing about a frozen culling camera.
     let flags = settings.flags;
     if (cull !== camera) flags &= ~FLAG_OCCLUSION;
     if (this.prevValid) flags |= FLAG_PREV_VALID;
@@ -434,8 +424,8 @@ export class Renderer {
     fu[73] = MAX_REQUESTS;
     d.queue.writeBuffer(this.frameBuffer, 0, f);
 
-    // Streaming: what the GPU asked for and drew from, a few frames ago,
-    // and the pages that have arrived since.
+    // streaming: what the gpu asked for and drew from a few frames ago, and pages arrived
+    // since.
     const uploads = this.streamer.service(this.frameIndex, this.wanted, settings.threshold);
     this.wanted = [];
     for (const u of uploads) d.queue.writeBuffer(this.pool, u.slot * this.streamer.slotBytes, u.data);
@@ -443,8 +433,8 @@ export class Renderer {
 
     const enc = d.createCommandEncoder();
     const ts = (begin, end) => (this.timestamps ? { timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: begin, endOfPassWriteIndex: end } } : {});
-    // Culls one pass: instances, then clusters, then the compute
-    // rasterizer's share; the hardware draw follows in its own render pass.
+    // culls a pass: instances, clusters, the compute rasterizer's share; the hardware draw
+    // follows in a render pass.
     const cullPass = (scene, p, timestamps, software = true) => {
       const cp = enc.beginComputePass(timestamps);
       cp.setBindGroup(0, scene);
@@ -490,9 +480,8 @@ export class Renderer {
     enc.clearBuffer(this.counters);
     enc.clearBuffer(this.requests, 0, 16);
     enc.clearBuffer(this.swBuffer, 0, width * height * 4);
-    // Pass 1: what last frame's depth does not hide. Then the pyramid from
-    // what it drew, and pass 2: what pass 1 thought hidden but is not.
-    // Then the pyramid again, for next frame's pass 1.
+    // pass 1: what last frame's depth does not hide. then a pyramid from it, and pass 2:
+    // what pass 1 wrongly hid. then the pyramid again, for next frame.
     for (let p = 0; p < 2; p++) {
       cullPass(this.sceneGroup, p, p === 0 ? ts(0, 1) : {});
       const rp = enc.beginRenderPass({
@@ -510,10 +499,8 @@ export class Renderer {
 
     this.shadowsTimed = shadows;
     if (shadows) {
-      // The shadow pages: mark what pixels need, invalidate what moving
-      // instances crossed, give needed pages physical pages, then clear
-      // and render those listed. Each step's results are the next's input,
-      // and WebGPU orders dispatches in a pass.
+      // shadow pages: mark, invalidate, assign physical pages, clear, render. webgpu orders
+      // dispatches within a pass.
       if (!this.vsmGroup) {
         this.vsmGroup = d.createBindGroup({
           layout: this.vsmLayout,
@@ -533,7 +520,7 @@ export class Renderer {
       const run = (name, x, y = 1) => { vp.setPipeline(this.vsm[name]); vp.dispatchWorkgroups(x, y); };
       const indirect = (name, offset) => { vp.setPipeline(this.vsm[name]); vp.dispatchWorkgroupsIndirect(this.vsmArgs, offset); };
       run('mark', Math.ceil(width / 8), Math.ceil(height / 8));
-      // (Nothing moves while the clock stands still.)
+      // (nothing moves while the clock stands still.)
       if (this.movingCount && time !== prevTime) run('invalidate', Math.min(this.movingCount, 65535), Math.ceil(this.movingCount / 65535));
       run('alloc_slots', VSM_SLOTS / 64);
       run('alloc_phys', VSM_SIDE * VSM_SIDE / 64);
@@ -578,11 +565,10 @@ export class Renderer {
       enc.copyBufferToBuffer(this.requests, 0, sb.buffer, 0, 16 + MAX_REQUESTS * 8);
       enc.copyBufferToBuffer(this.pageStamps, 0, sb.buffer, 16 + MAX_REQUESTS * 8, this.pageStamps.size / 2);
     }
-    // Statistics and timings come back a few frames late, into whichever
-    // readback buffer is free.
+    // stats and timings return a few frames late, into a free readback buffer.
     const rb = this.readbacks.find((x) => !x.busy);
     if (rb) {
-      // The shadow pages rendered and their clusters, into the counters' spare words.
+      // shadow pages rendered and their clusters, into the counters' spare words.
       if (shadows) {
         enc.copyBufferToBuffer(this.vsmLists, 12, this.counters, 88, 4);
         enc.copyBufferToBuffer(this.vsmWork, 8, this.counters, 92, 4);
@@ -631,7 +617,7 @@ export class Renderer {
     }
   }
 
-  // The shaded image as RGBA bytes, for tests.
+  // shaded image as rgba bytes, for tests.
   async readPixels() {
     const d = this.device;
     const bytesPerRow = Math.ceil(this.width * 4 / 256) * 256;

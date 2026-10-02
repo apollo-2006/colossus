@@ -1,9 +1,7 @@
 #version 460
-// Builds one level of the depth pyramid. Level 0 reads depth from the
-// visibility buffer, two pixels by two; each level after reads the one
-// before. A texel keeps the farthest depth it covers (the smallest, depth
-// being reversed), and an empty pixel counts as infinitely far, so nothing
-// is ever hidden behind a gap.
+// one depth pyramid level. level 0 reads the visibility buffer, 2x2 pixels;
+// later levels read the last. texels keep the farthest (smallest, reversed)
+// depth; empty pixels count as infinitely far, so nothing hides behind a gap.
 #include "common.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;

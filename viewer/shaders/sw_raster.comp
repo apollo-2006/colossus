@@ -1,37 +1,32 @@
 #version 460
-// The software rasterizer: one workgroup per small cluster, one invocation
-// per vertex and then per triangle. Each invocation walks its triangle's
-// bounding box and writes depth and triangle into the visibility buffer
-// with the same 64-bit atomic max as the hardware path, so the two mix
-// freely and the nearest wins.
+// software rasterizer: a workgroup per small cluster, an invocation per vertex
+// then per triangle. each walks its triangle's box and writes depth and
+// triangle into the visibility buffer with the hardware path's 64-bit atomic
+// max, so the two mix.
 //
-// Vertices are snapped to 1/256 pixel, as the hardware does (8 subpixel
-// bits), and edges follow a top-left rule, so neighbouring triangles share
-// every pixel center exactly once. Edge functions are measured from the
-// triangle's own corner, which keeps them in 32 bits: clusters sent here
-// are under 64 pixels, so a coordinate is under 2^14 and a product under
-// 2^28. (RDNA has no 64-bit integer multiply; the first version, in 64
-// bits, was slower than the hardware rasterizer at every size.)
+// vertices snap to 1/256 pixel like the hardware, and a top-left rule gives
+// each shared pixel centre to one triangle. edge functions are relative to the
+// triangle's corner, staying 32-bit: clusters here are under 64 pixels,
+// coordinates under 2^14, products under 2^28. (rdna has no 64-bit multiply;
+// the 64-bit version lost at every size.)
 //
-// Before its atomic, each pixel reads the buffer and skips the atomic if
-// something nearer is already there: the same job early depth testing does
-// for the hardware path. The read can be stale, but only ever farther than
-// the truth, so it never skips a write that should happen.
+// each pixel reads before its atomic and skips it if something nearer is there,
+// like early depth. a stale read is only ever farther, so no needed write is
+// skipped.
 #extension GL_EXT_shader_atomic_int64 : require
 #include "common.glsl"
 
 layout(local_size_x = 128) in;
 
-shared ivec2 screen[128];  // Snapped, in 1/256 pixel
-shared float depth[128];   // Reversed: near_z / w
+shared ivec2 screen[128];  // snapped, 1/256 pixel
+shared float depth[128];   // reversed: near_z / w
 
 int edge(ivec2 a, ivec2 b, ivec2 p) {
     return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 }
 
-// Top-left rule, y down: an edge running up (or flat and running right, in
-// this winding) owns the pixels on it; the others leave them to their
-// neighbours.
+// top-left rule, y down: an edge running up (or flat, running right, in this
+// winding) owns its pixels.
 bool owns_edge(ivec2 a, ivec2 b) {
     const ivec2 d = b - a;
     return d.y < 0 || (d.y == 0 && d.x > 0);
@@ -62,7 +57,7 @@ void main() {
     uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
     ivec2 a = screen[i0], b = screen[i1], d = screen[i2];
     float za = depth[i0], zb = depth[i1], zd = depth[i2];
-    // From here on, positions are relative to the box's corner pixel.
+    // positions now relative to the box's corner pixel.
     const ivec2 lo_abs = max((min(a, min(b, d)) - 128 + 255) >> 8, ivec2(0));
     const ivec2 hi = min((max(a, max(b, d)) - 128) >> 8, ivec2(frame.width, frame.height) - 1) - lo_abs;
     if (any(lessThan(hi, ivec2(0)))) return;
@@ -72,16 +67,16 @@ void main() {
     d -= origin;
     int area = edge(a, b, d);
     if (area == 0) return;
-    // Both sides are drawn (scans have holes): put every triangle in one
-    // winding, so the edge functions are positive inside.
+    // both sides drawn (scans have holes): one winding, edge functions positive
+    // inside.
     if (area < 0) {
         const ivec2 tmp = b; b = d; d = tmp;
         const float tz = zb; zb = zd; zd = tz;
         area = -area;
     }
 
-    // Edge functions at the first pixel center, and their steps. Pixels on
-    // an edge the triangle does not own are moved just outside by a bias.
+    // edge functions at the first pixel centre, and steps. pixels on edges not
+    // owned are biased just outside.
     const ivec2 p0 = ivec2(128);
     const int bias0 = owns_edge(b, d) ? 0 : -1;
     const int bias1 = owns_edge(d, a) ? 0 : -1;
@@ -98,8 +93,8 @@ void main() {
         const uint row = uint(lo_abs.y + y) * frame.width + uint(lo_abs.x);
         for (int x = 0; x <= hi.x; ++x) {
             if ((w0 | w1 | w2) >= 0) {
-                // The depth is affine in screen space: weight the corners by
-                // the edge functions (without their bias).
+                // depth is affine on screen: corners weighted by the unbiased
+                // edge functions.
                 const float z = (float(w0 - bias0) * za + float(w1 - bias1) * zb + float(w2 - bias2) * zd) * inv_area;
                 const uint64_t value = (uint64_t(floatBitsToUint(z)) << 32) | id;
                 if (value > vis[row + uint(x)]) atomicMax(vis[row + uint(x)], value);
