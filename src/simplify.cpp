@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <queue>
 
 namespace {
@@ -251,4 +252,69 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
             for (int k = 0; k < 3; ++k) out.indices.push_back(verts[tri[3 * t + k]]);
     out.error = static_cast<float>(std::sqrt(worst));
     return out;
+}
+
+simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
+                                 size_t target_triangles) {
+    // Open edges (used by one triangle) and so border vertices.
+    std::vector<std::pair<uint32_t, uint32_t>> edges;
+    for (size_t t = 0; t < indices.size(); t += 3)
+        for (int c = 0; c < 3; ++c) {
+            const uint32_t a = indices[t + c], b = indices[t + (c + 1) % 3];
+            edges.push_back({std::min(a, b), std::max(a, b)});
+        }
+    std::sort(edges.begin(), edges.end());
+    std::unordered_map<uint32_t, bool> border;  // Every vertex used, and whether it is on the border
+    for (uint32_t v : indices) border[v] = false;
+    for (size_t k = 0; k < edges.size();) {
+        size_t j = k;
+        while (j < edges.size() && edges[j] == edges[k]) ++j;
+        if (j - k == 1) border[edges[k].first] = border[edges[k].second] = true;
+        k = j;
+    }
+    vec3 lo = positions[indices[0]], hi = lo;
+    for (const auto& [v, b] : border) {
+        lo = min(lo, positions[v]);
+        hi = max(hi, positions[v]);
+    }
+    const vec3 size = hi - lo;
+    const float extent = std::max(size.x, std::max(size.y, size.z));
+
+    simplify_result r;
+    for (int cells = 64; cells >= 1; cells = cells * 3 / 4) {
+        const float step = extent / cells * 1.0001f + 1e-12f;
+        auto cell_of = [&](uint32_t v) {
+            const vec3 q = (positions[v] - lo) * (1 / step);
+            return uint64_t(q.x) | uint64_t(q.y) << 21 | uint64_t(q.z) << 42;
+        };
+        // Each cell's vertex: a border vertex if it has one, then the one
+        // nearest the mean of its vertices.
+        struct cell { vec3 sum{0, 0, 0}; uint32_t count = 0; bool border = false; };
+        std::unordered_map<uint64_t, cell> grid;
+        for (const auto& [v, b] : border) {
+            cell& c = grid[cell_of(v)];
+            c.sum += positions[v];
+            ++c.count;
+            c.border |= b;
+        }
+        std::unordered_map<uint64_t, std::pair<uint32_t, float>> pick;
+        for (const auto& [v, b] : border) {
+            const uint64_t k = cell_of(v);
+            const cell& c = grid[k];
+            if (c.border && !b) continue;
+            const float d = length(positions[v] - c.sum * (1.0f / float(c.count)));
+            auto it = pick.find(k);
+            if (it == pick.end() || d < it->second.second || (d == it->second.second && v < it->second.first)) pick[k] = {v, d};
+        }
+        std::vector<uint32_t> out;
+        for (size_t t = 0; t < indices.size(); t += 3) {
+            const uint32_t a = pick[cell_of(indices[t])].first, b = pick[cell_of(indices[t + 1])].first,
+                           c = pick[cell_of(indices[t + 2])].first;
+            if (a == b || b == c || a == c) continue;
+            out.insert(out.end(), {a, b, c});
+        }
+        r.indices = std::move(out);
+        if (r.indices.size() / 3 <= target_triangles || cells == 1) break;
+    }
+    return r;
 }

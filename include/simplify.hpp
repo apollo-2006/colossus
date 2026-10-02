@@ -30,3 +30,17 @@ struct simplify_result {
 // perpendicular to its triangle, make that cost what it moves the outline.
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
                          const std::vector<uint8_t>& locked, size_t target_triangles);
+
+// Vertex clustering (Rossignac and Borrel): every vertex moves to one
+// vertex of the cell it falls in on a grid, made coarser until at most
+// target_triangles remain, and triangles that collapse are dropped. It
+// ignores topology, so it gets anywhere, which edge collapses cannot once
+// a mesh is a few hundred triangles of thin parts and hole rims; the LOD
+// builder uses it only for the last levels, where nothing else depends on
+// the outline. Two things keep the result crack-free in the builder's
+// sense: duplicate triangles are kept, so every edge keeps the parity of
+// its use count (a closed surface stays closed), and a cell with a vertex
+// on an open border keeps one, so open edges still end on the border.
+// The result's error is 0: measure it.
+simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
+                                 size_t target_triangles);

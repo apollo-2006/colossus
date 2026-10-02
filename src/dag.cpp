@@ -21,6 +21,10 @@ constexpr uint32_t max_levels = 48;
 // its quadric estimate is tried again more gently (see build_lod).
 constexpr float outlier_ratio = 4.0f;
 constexpr size_t min_group_triangles = 64;
+// The hierarchy goes on until a single cluster of at most this many
+// triangles is left: every instance draws at least its root, so a crowd
+// stretching to the horizon draws this many per speck.
+constexpr size_t root_triangles = 32;
 
 // Groups the clusters (numbers into all) into sets of about group_target
 // that share as many edges as possible.
@@ -239,7 +243,7 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
             stats.triangles += out.clusters[c].indices.size() / 3;
             stats.max_error = std::max(stats.max_error, out.clusters[c].lod_error);
         }
-        if (level.size() <= 1 || depth + 1 >= max_levels) {
+        if ((level.size() <= 1 && stats.triangles <= root_triangles) || depth + 1 >= max_levels) {
             out.levels.push_back(stats);
             if (verbose)
                 std::printf("  level %2u: %8zu clusters %10zu triangles  (root)\n", depth, stats.clusters, stats.triangles);
@@ -272,6 +276,11 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 bounds = merge(bounds, cl.lod_bounds);
             }
             const size_t tris = merged.size() / 3;
+            // The last group, all that is left of the model: nothing
+            // borders it, so when edge collapses get stuck (thin parts
+            // and hole rims, a few hundred triangles from the end),
+            // vertex clustering takes over.
+            const bool last = groups.size() == 1;
             // Errors add: the new level is this far from this one, which is
             // child_error from the original. How far is measured, not the
             // simplifier's quadric estimate, which is a mean and typically
@@ -287,11 +296,13 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
             // entirely (the dragon's worst three groups at level 0 were
             // these, measuring 6 to 0.4 percent of its size). They stay as
             // they are, roots at full detail, which costs a few triangles.
-            if (tris < min_group_triangles) {
+            if (tris < min_group_triangles && !last) {
                 stuck[g] = 1;
                 return;
             }
             simplify_result s = simplify(out.positions, merged, locked, tris / 2);
+            if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && last)
+                s = cluster_vertices(out.positions, merged, std::max<size_t>(tris / 2, 1));
             if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) {
                 stuck[g] = 1;
                 return;
