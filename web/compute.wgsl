@@ -8,7 +8,7 @@
 //   triangle in one atomic. It runs twice instead, first keeping the
 //   nearest depth per pixel with a 32-bit atomic max, then writing the
 //   triangle wherever its depth is the one that won.
-// * No ray queries, so no shadows.
+// * No ray queries: shadows come from virtual shadow maps (vsm.wgsl).
 //
 // The hardware and software results are kept apart and shade() takes the
 // nearer of the two at each pixel.
@@ -52,8 +52,9 @@ struct PassInfo {
 @group(2) @binding(0) var hw_depth: texture_depth_2d;
 @group(2) @binding(1) var hw_id: texture_2d<u32>;
 @group(2) @binding(2) var out_image: texture_storage_2d<rgba8unorm, write>;
-@group(2) @binding(3) var shadow_map: texture_depth_2d;
-@group(2) @binding(4) var shadow_sampler: sampler_comparison;
+// The virtual shadow maps (vsm_common.wgsl), for shading to read.
+@group(2) @binding(3) var<storage, read> vsm_entries: array<u32>;
+@group(2) @binding(4) var<storage, read> vsm_atlas: array<u32>;
 // The depth pyramid: level 0 half the screen, each texel the farthest
 // (smallest, depth being reversed) depth drawn over the pixels it covers.
 @group(2) @binding(5) var hzb: texture_2d<f32>;
@@ -256,10 +257,7 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
       atomicAdd(&counters.instances_visible, 1u);
       let lc = to_world(inst, m.lod_bounds.xyz);
       let d = max(length(lc - frame.cull_origin.xyz) - m.lod_bounds.w * inst.scale, frame.near_z);
-      // Orthographic (the shadow pass): an error's size does not depend on
-      // distance.
-      var limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
-      if (frame.ortho_scale > 0.0) { limit = frame.lod_threshold / (inst.scale * frame.ortho_scale); }
+      let limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
       var lo = 0u;
       var hi = m.cluster_count;
       while (lo < hi) {
@@ -428,13 +426,11 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       if (draw) {
         atomicAdd(&wg_triangles, c.triangle_count);
         atomicStore(&page_stamps[c.group], frame.frame_index);
-        // Pages are asked for by the view, not the shadow map: shadows
-        // draw from whatever the view has loaded.
-        if (lod.wants_finer && (frame.flags & FLAG_SHADOW_PASS) == 0u) { request_finer(c, lod.self_error); }
+        if (lod.wants_finer) { request_finer(c, lod.self_error); }
         // The sphere's size on screen, roughly; clusters reaching the
         // near plane always go to the hardware, which clips.
         let d = length(center - frame.origin.xyz) - r;
-        software = (frame.flags & FLAG_SOFTWARE) != 0u && (frame.flags & FLAG_SHADOW_PASS) == 0u && d > frame.near_z * 2.0 &&
+        software = (frame.flags & FLAG_SOFTWARE) != 0u && d > frame.near_z * 2.0 &&
                    2.0 * r * frame.lod_scale / d < frame.sw_max_pixels;
       }
     }
@@ -683,24 +679,39 @@ fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32) -> vec3f {
          m.albedo * m.metallic * ambient * 0.5;
 }
 
-// Sunlight at a point, from the shadow map: 3 x 3 comparisons, each
-// filtered over four texels. The point moves off the surface along its
-// normal by a texel and a half, and toward the sun by the drawn cluster's
-// error, so a surface does not shadow itself. Outside the map, lit.
-fn sunlight(p: vec3f, n: vec3f, error: f32) -> f32 {
+// Sunlight at a point, from the virtual shadow maps: 2 x 2 taps,
+// bilinearly weighted, at the level whose texels match the pixel. The
+// point moves off the surface along its normal and is compared with a
+// bias, both a couple of texels, which covers the two surfaces' levels of
+// detail differing. A tap in a page with no physical page sends the
+// lookup to the next level up.
+fn sunlight(p: vec3f, n: vec3f) -> f32 {
   if ((frame.flags & FLAG_SHADOWS) == 0u) { return 1.0; }
-  let q = p + n * frame.shadow_texel * 1.5 + SUN_DIR * error;
-  let clip = frame.shadow_view_proj * vec4f(q, 1.0);
-  let uv = vec2f(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
-  if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || clip.z > 1.0) { return 1.0; }
-  let texel = 1.0 / vec2f(textureDimensions(shadow_map));
-  var lit = 0.0;
-  for (var y = -1; y <= 1; y++) {
-    for (var x = -1; x <= 1; x++) {
-      lit += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f(f32(x), f32(y)) * texel, clip.z - 1e-4);
+  for (var level = vsm_level_for(length(p - frame.origin.xyz)); level < VSM_LEVELS; level++) {
+    let texel = vsm_texel(level);
+    let lp = vsm_light_space(p + n * (2.0 * texel));
+    let f = lp.xy / texel - 0.5;
+    let base = vec2i(floor(f));
+    let w = f - vec2f(base);
+    var lit = 0.0;
+    var complete = true;
+    for (var k = 0; k < 4; k++) {
+      let at = base + vec2i(k & 1, k >> 1u);
+      let page = at >> vec2u(7u);
+      if (!vsm_in_window(level, page)) { complete = false; break; }
+      let slot = vsm_slot(level, page);
+      let phys = vsm_entries[4u * slot + 1u];
+      if (phys == VSM_NONE || vsm_entries[4u * slot] != vsm_tag(page)) { complete = false; break; }
+      let in_page = vec2u(at & vec2i(i32(VSM_PAGE) - 1));
+      var stored = vsm_atlas[vsm_atlas_index(phys, in_page, VSM_STILL)];
+      if ((frame.flags & FLAG_MOVING) != 0u) { stored = max(stored, vsm_atlas[vsm_atlas_index(phys, in_page, VSM_MOVING)]); }
+      let open = stored == 0u || vsm_unsortable(stored) <= lp.z + 1.5 * texel;
+      let weight = select(1.0 - w.x, w.x, (k & 1) != 0) * select(1.0 - w.y, w.y, (k >> 1u) != 0);
+      lit += select(0.0, weight, open);
     }
+    if (complete) { return lit; }
   }
-  return lit / 9.0;
+  return 1.0;
 }
 
 fn aces(x: vec3f) -> vec3f {
@@ -753,7 +764,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       let cell = abs(fract(hit.xz * 0.5) - 0.5);
       let line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
       let ground = mix(vec3f(0.42, 0.4, 0.37), vec3f(0.33, 0.31, 0.29), line) *
-                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0), 0.0) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45);
+                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0)) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45);
       color = mix(ground, color, 1.0 - exp(-t * 0.012));
     }
   } else {
@@ -806,7 +817,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       default: {}
     }
     let hit = origin + dir * t;
-    let lit = select(0.0, sunlight(hit, n, c.lod_error * inst.scale), dot(n, SUN_DIR) > 0.0);
+    let lit = select(0.0, sunlight(hit, n), dot(n, SUN_DIR) > 0.0);
     color = shade_material(m, n, -dir, lit);
     if (!behind) { color += pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic); }
     color = mix(color, sky(dir), 1.0 - exp(-t * 0.012));

@@ -3,7 +3,7 @@
 //   instance_cull -> args_cull -> cluster_cull -> args_draw
 //   -> software raster (depth, then ids) and hardware raster
 //   -> shade -> blit to the canvas.
-import { frustumPlanes, invert, lookTo, mul, orthographic, perspectiveReverseZ } from './math.js';
+import { frustumPlanes, invert, lookTo, mul, perspectiveReverseZ } from './math.js';
 import { Streamer } from './streamer.js';
 
 const MAX_WORK = 1 << 20;
@@ -12,12 +12,13 @@ const MAX_REQUESTS = 1 << 13;
 const FRAME_BYTES = 608;
 const PASS_STRIDE = 256;  // Dynamic uniform offsets must be multiples of this
 const MAX_HZB_LEVELS = 16;
-const STORAGE_BUFFERS_NEEDED = 14;
-const SHADOW_SIZE = 2048;
-const SHADOW_HALF = 8;  // The shadow map covers 16 x 16 units in front of the camera
-const SUN_DIR = [0.75, 0.5, 0.3].map((x) => x / Math.hypot(0.75, 0.5, 0.3));
+const STORAGE_BUFFERS_NEEDED = 16;
+// vsm_common.wgsl's and vsm.wgsl's sizes.
+const VSM_SIDE = 32, VSM_PHYS = 49152, VSM_HEADER = 872, VSM_MOVING_LIST = 62312, VSM_SLOTS = 12288;
+const VSM_WORK_WORDS = 2359300 + 2 * 1048576;  // VW_VISIBLE + 2 * VSM_MAX_VISIBLE
+const FLAG_MOVING = 256;
 
-export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOW_PASS = 8, FLAG_SHADOWS = 16, FLAG_OCCLUSION = 32;
+export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOWS = 16, FLAG_OCCLUSION = 32;
 export const FLAG_TAA = 128;  // Read on the CPU only
 const FLAG_PREV_VALID = 64;
 
@@ -32,8 +33,9 @@ export class Renderer {
     if (!navigator.gpu) return null;
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) return null;
-    // The culling passes bind 14 storage buffers to the compute stage; the
-    // default limit is 8, but desktop adapters allow at least 16.
+    // The culling passes that write indirect arguments bind 16 storage
+    // buffers to the compute stage; the default limit is 8, but desktop
+    // adapters allow 16.
     if (adapter.limits.maxStorageBuffersPerShaderStage < STORAGE_BUFFERS_NEEDED)
       throw new Error(`this GPU allows ${adapter.limits.maxStorageBuffersPerShaderStage} storage buffers per shader stage; the demo needs ${STORAGE_BUFFERS_NEEDED}`);
     const timestamps = adapter.features.has('timestamp-query');
@@ -55,10 +57,11 @@ export class Renderer {
     r.context = canvas?.getContext('webgpu');
     r.format = navigator.gpu.getPreferredCanvasFormat();
     r.context?.configure({ device, format: r.format, alphaMode: 'opaque' });
-    const common = await source('common.wgsl');
+    const common = await source('common.wgsl') + await source('vsm_common.wgsl');
     r.computeModule = device.createShaderModule({ code: common + await source('compute.wgsl') });
+    r.vsmModule = device.createShaderModule({ code: common + await source('vsm.wgsl') });
     r.rasterModule = device.createShaderModule({ code: common + await source('raster.wgsl') });
-    for (const m of [r.computeModule, r.rasterModule]) {
+    for (const m of [r.computeModule, r.rasterModule, r.vsmModule]) {
       const info = await m.getCompilationInfo();
       const errors = info.messages.filter((x) => x.type === 'error');
       if (errors.length) throw new Error(errors.map((e) => `${e.lineNum}:${e.linePos} ${e.message}`).join('\n'));
@@ -85,8 +88,8 @@ export class Renderer {
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
         { binding: 1, visibility: C, texture: { sampleType: 'uint' } },
         { binding: 2, visibility: C, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
-        { binding: 3, visibility: C, texture: { sampleType: 'depth' } },
-        { binding: 4, visibility: C, sampler: { type: 'comparison' } },
+        { binding: 3, visibility: C, buffer: { type: 'read-only-storage' } },  // The shadow pages' entries
+        { binding: 4, visibility: C, buffer: { type: 'read-only-storage' } },  // And their atlas
         { binding: 5, visibility: C, texture: { sampleType: 'unfilterable-float' } },
       ],
     });
@@ -141,17 +144,24 @@ export class Renderer {
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     });
-    // The shadow map: casters' depth from the sun, drawn from the same
-    // visible list, by a second run of the culling with the sun's camera.
-    this.shadowRaster = d.createRenderPipeline({
-      layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.rasterLayout] }),
-      vertex: { module: this.rasterModule, entryPoint: 'shadow_vs' },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    // Virtual shadow maps (vsm_common.wgsl, vsm.wgsl): their passes bind
+    // the scene, the shadow pages and the streaming buffers they ask
+    // through; the passes writing indirect arguments also bind those.
+    const rwStorage = (binding) => ({ binding, visibility: C, buffer: { type: 'storage' } });
+    this.vsmLayout = d.createBindGroupLayout({
+      entries: [rwStorage(0), rwStorage(1), rwStorage(2), rwStorage(3),
+        { binding: 4, visibility: C, texture: { sampleType: 'depth' } },
+        { binding: 5, visibility: C, buffer: { type: 'read-only-storage' } }, rwStorage(6), rwStorage(7)],
     });
-    this.shadowMap = d.createTexture({ size: [SHADOW_SIZE, SHADOW_SIZE], format: 'depth32float',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
-    this.shadowSampler = d.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
+    this.vsmArgsLayout = d.createBindGroupLayout({ entries: [rwStorage(0)] });
+    const vsmPipeline = (entryPoint, args = false) => d.createComputePipeline({
+      layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.vsmLayout, ...(args ? [this.vsmArgsLayout] : [])] }),
+      compute: { module: this.vsmModule, entryPoint },
+    });
+    this.vsm = {};
+    for (const e of ['mark', 'invalidate', 'alloc_slots', 'alloc_phys', 'alloc_assign', 'clear', 'instance', 'expand', 'cluster', 'raster'])
+      this.vsm[e] = vsmPipeline(`vsm_${e}`);
+    for (const e of ['args_alloc', 'args_expand', 'args_cull', 'args_raster']) this.vsm[e] = vsmPipeline(`vsm_${e}`, true);
     this.blit = d.createRenderPipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [d.createBindGroupLayout({ entries: [] }), this.blitLayout] }),
       vertex: { module: this.rasterModule, entryPoint: 'blit_vs' },
@@ -160,7 +170,15 @@ export class Renderer {
 
     const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
     this.frameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
-    this.shadowFrameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
+    // The shadow pages: every slot and physical page empty to begin with
+    // (all ones is VSM_NONE), the atlas's two layers, the culling's lists,
+    // and the indirect arguments.
+    this.vsmEntries = d.createBuffer({ size: 4 * (VSM_PHYS + 2 * VSM_SIDE * VSM_SIDE), usage: S | CD });
+    d.queue.writeBuffer(this.vsmEntries, 0, new Uint32Array(VSM_PHYS + 2 * VSM_SIDE * VSM_SIDE).fill(0xffffffff));
+    this.vsmAtlas = d.createBuffer({ size: 2 * 4 * VSM_SIDE * VSM_SIDE * 128 * 128, usage: S });
+    this.vsmWork = d.createBuffer({ size: 4 * VSM_WORK_WORDS, usage: S | CD | CS });
+    this.vsmArgs = d.createBuffer({ size: 80, usage: S | GPUBufferUsage.INDIRECT });
+    this.vsmArgsGroup = d.createBindGroup({ layout: this.vsmArgsLayout, entries: [{ binding: 0, resource: { buffer: this.vsmArgs } }] });
     this.counters = d.createBuffer({ size: 96, usage: S | CD | CS });
     // One entry per pass, then one per pyramid level: (pass, level).
     this.passInfo = d.createBuffer({ size: PASS_STRIDE * (2 + MAX_HZB_LEVELS), usage: GPUBufferUsage.UNIFORM | CD });
@@ -175,7 +193,7 @@ export class Renderer {
     // software dispatches, [24, 28) pass 2's instance culling and [28, 36)
     // each pass's expand.
     this.args = d.createBuffer({ size: 144, usage: S | GPUBufferUsage.INDIRECT });
-    this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
+    this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 96, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
     this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
     this.frameIndex = 0;
     this.time = 0;
@@ -258,6 +276,7 @@ export class Renderer {
     // Hidden clusters, hidden instances, then each pass's big instances (two entries each).
     this.late = d.createBuffer({ size: (MAX_VISIBLE + 5 * Math.max(1, placements.length)) * 8, usage: GPUBufferUsage.STORAGE });
     this.workGroup = null;  // Remade with it on the next resize
+    this.vsmGroup = null;
     this.width = 0;
     this.instanceBuffer?.destroy();
     this.instanceBuffer = d.createBuffer({ size: instances.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
@@ -269,7 +288,15 @@ export class Renderer {
           .map(([binding, buffer]) => ({ binding, resource: { buffer } }))],
     });
     this.sceneGroup = sceneGroup(this.frameBuffer);
-    this.shadowSceneGroup = sceneGroup(this.shadowFrameBuffer);
+    // The shadow pages' lists end with the moving instances, for
+    // invalidating the pages they cross.
+    const moving = [];
+    placements.forEach((p, i) => { if (p.anim) moving.push(i); });
+    this.movingCount = moving.length;
+    this.vsmLists?.destroy();
+    this.vsmLists = d.createBuffer({ size: 4 * (VSM_MOVING_LIST + Math.max(1, moving.length)),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    if (moving.length) d.queue.writeBuffer(this.vsmLists, 4 * VSM_MOVING_LIST, new Uint32Array(moving));
   }
 
   resize(width, height) {
@@ -278,6 +305,7 @@ export class Renderer {
     this.width = width;
     this.height = height;
     for (const x of [this.swBuffer, this.depthTexture, this.idTexture, this.image, this.shaded, ...(this.history ?? [])]) x?.destroy();
+    this.vsmGroup = null;
     // The software rasterizer's depth, then its triangle ids.
     this.swBuffer = d.createBuffer({ size: width * height * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const T = GPUTextureUsage;
@@ -323,8 +351,8 @@ export class Renderer {
     this.imageGroup = d.createBindGroup({
       layout: this.imageLayout,
       entries: [{ binding: 0, resource: this.depthTexture.createView() }, { binding: 1, resource: this.idTexture.createView() },
-        { binding: 2, resource: this.shaded.createView() }, { binding: 3, resource: this.shadowMap.createView() },
-        { binding: 4, resource: this.shadowSampler }, { binding: 5, resource: this.hzb.createView() }],
+        { binding: 2, resource: this.shaded.createView() }, { binding: 3, resource: { buffer: this.vsmEntries } },
+        { binding: 4, resource: { buffer: this.vsmAtlas } }, { binding: 5, resource: this.hzb.createView() }],
     });
     this.argsGroup = d.createBindGroup({ layout: this.argsLayout, entries: [{ binding: 0, resource: { buffer: this.args } }] });
     this.rasterGroup = d.createBindGroup({
@@ -358,12 +386,6 @@ export class Renderer {
       }
     }
     const cullViewProj = mul(perspectiveReverseZ(cull.fov, aspect, cull.near), lookTo(cull.eye, cull.forward, [0, 1, 0]));
-    // The sun's camera: orthographic, over a square of the ground in front
-    // of the camera, looking down the sun's direction.
-    const ahead = [camera.eye[0] + camera.forward[0] * SHADOW_HALF * 0.7, 0, camera.eye[2] + camera.forward[2] * SHADOW_HALF * 0.7];
-    const reach = 40;
-    const sunEye = ahead.map((x, k) => x + SUN_DIR[k] * reach);
-    const sunViewProj = mul(orthographic(SHADOW_HALF, 0, 2 * reach), lookTo(sunEye, SUN_DIR.map((x) => -x), [0, 1, 0]));
     const shadows = (settings.flags & FLAG_SHADOWS) !== 0;
     this.frameIndex++;
     // Time, for moving instances: it stands still while motion is off.
@@ -372,30 +394,8 @@ export class Renderer {
     if (this.lastNow !== undefined && settings.motion) this.time += now - this.lastNow;
     this.lastNow = now;
     const time = this.time;
-    if (shadows) {
-      const sf = new ArrayBuffer(FRAME_BYTES);
-      const sff = new Float32Array(sf), sfu = new Uint32Array(sf);
-      sff.set(sunViewProj, 0);
-      frustumPlanes(sunViewProj).forEach((p, k) => sff.set(p, 32 + 4 * k));
-      // Far behind the sun's camera, so the cone test sees parallel rays.
-      sff.set([...ahead.map((x, k) => x + SUN_DIR[k] * 1e4), 1], 52);
-      sff.set([...sunEye, 1], 56);
-      sfu[60] = SHADOW_SIZE; sfu[61] = SHADOW_SIZE; sfu[62] = this.instanceCount;
-      sfu[63] = FLAG_FRUSTUM | FLAG_CONE | FLAG_SHADOW_PASS;
-      // Error allowed, in shadow map texels: the lookup filters over three
-      // by three, and eight texels looks the same as one at a seventh of
-      // the cost (0.17 ms against 2.4 for 900 instances).
-      sff[64] = 1; sff[65] = 8; sff[66] = 1e-3;
-      sfu[68] = MAX_WORK; sfu[69] = MAX_VISIBLE;
-      sfu[72] = this.frameIndex; sfu[73] = MAX_REQUESTS;
-      sff[71] = time; sff[151] = prevTime;
-      sff[92] = SHADOW_SIZE / (2 * SHADOW_HALF);  // ortho_scale: texels per unit
-      d.queue.writeBuffer(this.shadowFrameBuffer, 0, sf);
-    }
     const f = new ArrayBuffer(FRAME_BYTES);
     const ff = new Float32Array(f), fu = new Uint32Array(f);
-    ff.set(sunViewProj, 76);
-    ff[93] = 2 * SHADOW_HALF / SHADOW_SIZE;  // shadow_texel
     const view = lookTo(camera.eye, camera.forward, [0, 1, 0]);
     ff.set(view, 96);
     ff.set(this.prevValid ? this.prevView : view, 112);
@@ -419,6 +419,7 @@ export class Renderer {
     let flags = settings.flags;
     if (cull !== camera) flags &= ~FLAG_OCCLUSION;
     if (this.prevValid) flags |= FLAG_PREV_VALID;
+    if (this.movingCount) flags |= FLAG_MOVING;
     fu[63] = flags;
     this.prevValid = true;
     ff[64] = height / (2 * Math.tan(camera.fov / 2));
@@ -486,21 +487,6 @@ export class Renderer {
       }
       hp.end();
     };
-    if (shadows) {
-      // Cull with the sun's camera (one pass, no occlusion) and draw the
-      // casters' depth, then the view starts over with the same lists.
-      enc.clearBuffer(this.counters);
-      cullPass(this.shadowSceneGroup, 0, {}, false);
-      const sp = enc.beginRenderPass({
-        colorAttachments: [],
-        depthStencilAttachment: { view: this.shadowMap.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 },
-      });
-      sp.setPipeline(this.shadowRaster);
-      sp.setBindGroup(0, this.shadowSceneGroup);
-      sp.setBindGroup(1, this.rasterGroup, [0]);
-      sp.drawIndirect(this.args, 32);
-      sp.end();
-    }
     enc.clearBuffer(this.counters);
     enc.clearBuffer(this.requests, 0, 16);
     enc.clearBuffer(this.swBuffer, 0, width * height * 4);
@@ -520,6 +506,48 @@ export class Renderer {
       rp.drawIndirect(this.args, 32 + p * 16);
       rp.end();
       buildHzb();
+    }
+
+    this.shadowsTimed = shadows;
+    if (shadows) {
+      // The shadow pages: mark what pixels need, invalidate what moving
+      // instances crossed, give needed pages physical pages, then clear
+      // and render those listed. Each step's results are the next's input,
+      // and WebGPU orders dispatches in a pass.
+      if (!this.vsmGroup) {
+        this.vsmGroup = d.createBindGroup({
+          layout: this.vsmLayout,
+          entries: [
+            ...[[0, this.vsmEntries], [1, this.vsmLists], [2, this.vsmAtlas], [3, this.vsmWork], [5, this.swBuffer], [6, this.pageStamps],
+              [7, this.requests]].map(([binding, buffer]) => ({ binding, resource: { buffer } })),
+            { binding: 4, resource: this.depthTexture.createView() },
+          ],
+        });
+      }
+      enc.clearBuffer(this.vsmLists, 0, 4 * VSM_HEADER);
+      enc.clearBuffer(this.vsmWork, 0, 16);
+      const vp = enc.beginComputePass(ts(6, 7));
+      vp.setBindGroup(0, this.sceneGroup);
+      vp.setBindGroup(1, this.vsmGroup);
+      vp.setBindGroup(2, this.vsmArgsGroup);
+      const run = (name, x, y = 1) => { vp.setPipeline(this.vsm[name]); vp.dispatchWorkgroups(x, y); };
+      const indirect = (name, offset) => { vp.setPipeline(this.vsm[name]); vp.dispatchWorkgroupsIndirect(this.vsmArgs, offset); };
+      run('mark', Math.ceil(width / 8), Math.ceil(height / 8));
+      // (Nothing moves while the clock stands still.)
+      if (this.movingCount && time !== prevTime) run('invalidate', Math.min(this.movingCount, 65535), Math.ceil(this.movingCount / 65535));
+      run('alloc_slots', VSM_SLOTS / 64);
+      run('alloc_phys', VSM_SIDE * VSM_SIDE / 64);
+      run('alloc_assign', VSM_SLOTS / 64);
+      run('args_alloc', 1);
+      indirect('clear', 16);
+      indirect('instance', 0);
+      run('args_expand', 1);
+      indirect('expand', 32);
+      run('args_cull', 1);
+      indirect('cluster', 48);
+      run('args_raster', 1);
+      indirect('raster', 64);
+      vp.end();
     }
 
     let pass;
@@ -553,11 +581,18 @@ export class Renderer {
     // Statistics and timings come back a few frames late, into whichever
     // readback buffer is free.
     const rb = this.readbacks.find((x) => !x.busy);
-    if (rb) enc.copyBufferToBuffer(this.counters, 0, rb.buffer, 0, 64);
+    if (rb) {
+      // The shadow pages rendered and their clusters, into the counters' spare words.
+      if (shadows) {
+        enc.copyBufferToBuffer(this.vsmLists, 12, this.counters, 88, 4);
+        enc.copyBufferToBuffer(this.vsmWork, 8, this.counters, 92, 4);
+      }
+      enc.copyBufferToBuffer(this.counters, 0, rb.buffer, 0, 96);
+    }
     const tb = this.timestamps && this.timeReadbacks.find((x) => !x.busy);
     if (tb) {
-      enc.resolveQuerySet(this.querySet, 0, 6, this.queryResolve, 0);
-      enc.copyBufferToBuffer(this.queryResolve, 0, tb.buffer, 0, 48);
+      enc.resolveQuerySet(this.querySet, 0, 8, this.queryResolve, 0);
+      enc.copyBufferToBuffer(this.queryResolve, 0, tb.buffer, 0, 64);
     }
     d.queue.submit([enc.finish()]);
     if (sb) {
@@ -580,7 +615,7 @@ export class Renderer {
         rb.busy = false;
         this.stats = {
           work: u[0] + u[1], hw: u[2], sw: u[3], instances: u[4], tested: u[5], triangles: u[6], overflow: u[7],
-          hiddenLastFrame: u[9], instancesOccluded: u[10], late: u[11],
+          hiddenLastFrame: u[9], instancesOccluded: u[10], late: u[11], shadowPages: u[22], shadowClusters: u[23],
         };
       });
     }
@@ -591,7 +626,7 @@ export class Renderer {
         tb.buffer.unmap();
         tb.busy = false;
         const ms = (a, b) => Number(t[b] - t[a]) / 1e6;
-        this.gpuMs = { cull: ms(0, 1), raster: ms(2, 3), shade: ms(4, 5), total: ms(0, 5) };
+        this.gpuMs = { cull: ms(0, 1), raster: ms(2, 3), shade: ms(4, 5), total: ms(0, 5), shadows: this.shadowsTimed ? ms(6, 7) : 0 };
       });
     }
   }

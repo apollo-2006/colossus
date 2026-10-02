@@ -24,11 +24,9 @@ struct Frame {
   max_requests: u32,
   pad0: u32,
   pad1: u32,
-  shadow_view_proj: mat4x4f,  // World to the shadow map's clip space
-  // Over 0 for the shadow pass: the sun's camera is orthographic, and an
-  // error covers error * ortho_scale shadow map texels wherever it is.
-  ortho_scale: f32,
-  shadow_texel: f32,  // A shadow map texel's size in world units
+  unused0: mat4x4f,  // Held the old shadow map's camera; kept so the layout stands
+  unused1: f32,
+  unused2: f32,
   pad2: u32,
   pad3: u32,
   // Occlusion culling: the depth pyramid's cameras. Pass 1 tests against
@@ -97,7 +95,6 @@ struct Instance {
 const FLAG_CONE = 1u;
 const FLAG_FRUSTUM = 2u;
 const FLAG_SOFTWARE = 4u;
-const FLAG_SHADOW_PASS = 8u;  // Culling and drawing for the shadow map
 const FLAG_SHADOWS = 16u;
 const FLAG_OCCLUSION = 32u;
 const FLAG_PREV_VALID = 64u;  // Last frame's pyramid fits this frame
@@ -199,7 +196,6 @@ fn sphere_in_frustum(c: vec3f, r: f32) -> bool {
 // point of a sphere. Clusters of one group compute this from identical
 // numbers, so they always agree.
 fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
-  if (frame.ortho_scale > 0.0) { return error * frame.ortho_scale; }
   let d = length(center - frame.cull_origin.xyz) - radius;
   return error * frame.lod_scale / max(d, frame.near_z);
 }

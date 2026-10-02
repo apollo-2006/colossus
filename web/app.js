@@ -36,9 +36,12 @@ export function crowd(n, models, spacing = 1.25) {
       // Mostly marble, some sandstone, bronze, gold and granite, as the
       // native viewer mixes them (shade materials in compute.wgsl).
       const material = n === 1 ? 1 : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5][Math.floor(materialRand() * 20)];
-      // A quarter of them move (animate() in common.wgsl): bit 9 marks
-      // it, bit 8 picks the direction, the low 8 bits the phase.
-      const anim = n > 1 && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
+      // A quarter of those in the middle 30 x 30 move (animate() in
+      // common.wgsl): bit 9 marks it, bit 8 picks the direction, the low 8
+      // bits the phase. Only the middle, so a million-strong crowd is not a
+      // quarter million moving shadows to redraw every frame.
+      const middle = Math.abs(x - (n - 1) / 2) < 15 && Math.abs(z - (n - 1) / 2) < 15;
+      const anim = n > 1 && middle && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
       out.push({ model: (z * n + x) % models, scale, material, anim, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
     }
   return out;
@@ -150,11 +153,12 @@ async function main() {
     if (now - shown > 250 && renderer.stats) {
       const s = renderer.stats, g = renderer.gpuMs;
       $('frame').textContent = g ? `${g.total.toFixed(2)} ms GPU` : `${(cpuMs / frames).toFixed(1)} ms a frame`;
-      $('breakdown').textContent = g ? `cull and compute raster ${g.cull.toFixed(2)}, hardware raster ${g.raster.toFixed(2)}, shading ${g.shade.toFixed(2)}` : '';
+      $('breakdown').textContent = g ? `cull and compute raster ${g.cull.toFixed(2)}, hardware raster ${g.raster.toFixed(2)}, shadow pages ${g.shadows.toFixed(2)}, shading ${g.shade.toFixed(2)}` : '';
       $('triangles').textContent = human(s.triangles);
       $('clusters').textContent = `${human(s.hw + s.sw)} (${human(s.sw)} in compute)`;
       $('instances').textContent = `${s.instances.toLocaleString('en-US')} of ${renderer.instanceCount.toLocaleString('en-US')}`;
       $('hidden').textContent = `${human(s.hiddenLastFrame)} clusters, ${s.instancesOccluded.toLocaleString('en-US')} instances`;
+      $('shadow-pages').textContent = `${s.shadowPages} drawn this frame (${human(s.shadowClusters)} clusters)`;
       $('size').textContent = `${w} x ${h}`;
       const st = renderer.streamer.stats;
       $('pages').textContent = `${st.resident} pages, ${(st.bytes / 1e6).toFixed(0)} MB fetched${st.inFlight ? ' (streaming)' : ''}`;

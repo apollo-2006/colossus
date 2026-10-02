@@ -63,16 +63,3 @@ fn blit_vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
 fn blit_fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
   return textureLoad(shaded, vec2i(p.xy), 0);
 }
-
-// The shadow map's casters: positions only, for depth.
-@vertex
-fn shadow_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
-  let v = hw_visible[counters.pass_start[0] + ii];
-  let c = clusters[v.y];
-  let tri = vi / 3u;
-  if (tri >= c.triangle_count) { return vec4f(2.0, 2.0, 2.0, 1.0); }
-  let inst = load_instance(v.x);
-  let packed = cluster_triangle(c, tri);
-  let p = cluster_position(c, meshes[inst.mesh].grid, (packed >> (8u * (vi % 3u))) & 255u);
-  return frame.view_proj * vec4f(to_world(inst, p), 1.0);
-}
