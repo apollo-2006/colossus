@@ -30,7 +30,16 @@ const server = createServer((req, res) => {
   if (path.endsWith('/')) path += 'index.html';
   try {
     const body = readFileSync(join(root, path));
-    res.writeHead(200, { 'content-type': types[extname(path)] || 'application/octet-stream', 'content-length': body.length });
+    const type = types[extname(path)] || 'application/octet-stream';
+    // Range requests, as GitHub Pages serves them: the demo streams pages.
+    const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+    if (range) {
+      const start = Number(range[1]), end = Math.min(Number(range[2]), body.length - 1);
+      res.writeHead(206, { 'content-type': type, 'content-length': end - start + 1, 'content-range': `bytes ${start}-${end}/${body.length}` });
+      res.end(body.subarray(start, end + 1));
+      return;
+    }
+    res.writeHead(200, { 'content-type': type, 'content-length': body.length });
     res.end(body);
   } catch { res.writeHead(404); res.end(); }
 });

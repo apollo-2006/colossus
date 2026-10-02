@@ -20,6 +20,10 @@ struct Frame {
   max_visible: u32,
   sw_max_pixels: f32,
   time: f32,
+  frame_index: u32,   // Counts from 1: stamps pages used and requested
+  max_requests: u32,
+  pad0: u32,
+  pad1: u32,
 }
 
 // include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
@@ -73,8 +77,9 @@ const FLAG_SOFTWARE = 4u;
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
-// Every page is loaded on the web: the page table holds each one's first
-// word in the pool.
+// Pages stream into the pool (web/streamer.js): the page table holds each
+// one's first word there, or NO_PAGE.
+const NO_PAGE = 0xffffffffu;
 @group(0) @binding(2) var<storage, read> page_table: array<u32>;
 @group(0) @binding(3) var<storage, read> pool: array<u32>;
 @group(0) @binding(6) var<storage, read> meshes: array<Mesh>;

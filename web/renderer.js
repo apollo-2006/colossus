@@ -4,10 +4,12 @@
 //   -> software raster (depth, then ids) and hardware raster
 //   -> shade -> blit to the canvas.
 import { frustumPlanes, invert, lookTo, mul, perspectiveReverseZ } from './math.js';
+import { Streamer } from './streamer.js';
 
 const MAX_WORK = 1 << 20;
 const MAX_VISIBLE = 1 << 20;
-const FRAME_BYTES = 288;
+const MAX_REQUESTS = 1 << 13;
+const FRAME_BYTES = 304;
 
 export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4;
 
@@ -60,7 +62,7 @@ export class Renderer {
       entries: [{ binding: 0, visibility: C | V | F, buffer: { type: 'uniform' } },
         ...[1, 2, 3, 6, 7].map((b) => ro(b, C | V))],
     });
-    this.workLayout = d.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5].map(rw) });
+    this.workLayout = d.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6, 7, 8].map(rw) });
     this.imageLayout = d.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
@@ -108,6 +110,9 @@ export class Renderer {
     this.swVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
     this.args = d.createBuffer({ size: 48, usage: S | GPUBufferUsage.INDIRECT });
     this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
+    this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
+    this.frameIndex = 0;
+    this.wanted = [];
     if (this.timestamps) {
       this.querySet = d.createQuerySet({ type: 'timestamp', count: 8 });
       this.queryResolve = d.createBuffer({ size: 64, usage: GPUBufferUsage.QUERY_RESOLVE | CS });
@@ -118,24 +123,27 @@ export class Renderer {
   }
 
   // models: parsed .cgeo files. placements: {model, matrix (3x4 rows), scale}.
-  loadScene(models, placements) {
+  // models: from fetchModel() (geometry.js). Their pages stream into a
+  // pool of poolBytes as the views need them.
+  loadModels(models, poolBytes) {
     const d = this.device;
-    const totals = models.reduce((a, m) => ({ c: a.c + m.clusterCount, p: a.p + m.pageTable.length, w: a.w + m.data.length }),
-      { c: 0, p: 0, w: 0 });
-    const clusters = new ArrayBuffer(totals.c * 112);
-    const pageTable = new Uint32Array(totals.p);
-    const pool = new Uint32Array(totals.w);
+    const total = models.reduce((a, m) => ({ c: a.c + m.clusterCount, p: a.p + m.pages.length }), { c: 0, p: 0 });
+    const clusters = new ArrayBuffer(total.c * 112);
     const meshes = new ArrayBuffer(models.length * 64);
-    let clusterBase = 0, pageBase = 0, wordBase = 0;
+    const pages = [];
+    let clusterBase = 0;
     models.forEach((m, k) => {
+      const pageBase = pages.length;
       const dst = new Uint32Array(clusters, clusterBase * 112, m.clusterCount * 28);
       dst.set(new Uint32Array(m.clusters));
       for (let c = 0; c < m.clusterCount; c++) {
-        dst[28 * c + 23] += pageBase;                                   // Its page
+        dst[28 * c + 23] += pageBase;                                       // Its page
         if (dst[28 * c + 24] !== 0xffffffff) dst[28 * c + 24] += pageBase;  // The finer clusters' page
       }
-      for (let p = 0; p < m.pageTable.length; p++) pageTable[pageBase + p] = m.pageTable[p] + wordBase;
-      pool.set(m.data, wordBase);
+      m.pages.forEach((p, i) => pages.push({
+        url: m.pagesUrl, offset: p.offset, size: p.size, pinned: i === 0,
+        deps: p.deps.map((x) => x + pageBase), children: p.children.map((x) => x + pageBase),
+      }));
       const mu = new Uint32Array(meshes, k * 64, 4), mf = new Float32Array(meshes, k * 64 + 16, 12);
       mu[0] = clusterBase;
       mu[1] = m.clusterCount;
@@ -143,43 +151,54 @@ export class Renderer {
       mf.set(m.lodBounds, 4);
       mf.set(m.grid, 8);
       clusterBase += m.clusterCount;
-      pageBase += m.pageTable.length;
-      wordBase += m.data.length;
     });
+    this.models = models;
+    this.streamer = new Streamer(pages, poolBytes);
+    const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
+    const upload = (data) => {
+      const b = d.createBuffer({ size: Math.max(16, Math.ceil(data.byteLength / 4) * 4), usage: S | CD });
+      d.queue.writeBuffer(b, 0, data);
+      return b;
+    };
+    this.clusterBuffer = upload(clusters);
+    this.meshBuffer = upload(meshes);
+    this.pageTable = d.createBuffer({ size: pages.length * 4, usage: S | CD });
+    this.pool = d.createBuffer({ size: this.streamer.slotCount * this.streamer.slotBytes, usage: S | CD });
+    this.pageUsed = d.createBuffer({ size: pages.length * 4, usage: S | CD | CS });
+    this.requestStamp = d.createBuffer({ size: pages.length * 4, usage: S | CD });
+    this.streamReadbacks = [0, 1, 2].map(() => ({
+      buffer: d.createBuffer({ size: 16 + MAX_REQUESTS * 8 + pages.length * 4, usage: GPUBufferUsage.MAP_READ | CD }), busy: false,
+    }));
+    this.workGroup = null;  // Remade with the new buffers on the next resize
+    this.width = this.height = 0;
+  }
+
+  // placements: {model, matrix (3x4 rows), scale, material}.
+  setPlacements(placements) {
+    const d = this.device;
     const instances = new ArrayBuffer(Math.max(1, placements.length) * 64);
     this.fullDetail = 0;
     placements.forEach((p, i) => {
       new Float32Array(instances, i * 64, 12).set(p.matrix);
       new Uint32Array(instances, i * 64 + 48, 1)[0] = p.model;
       new Float32Array(instances, i * 64 + 52, 1)[0] = p.scale;
-      this.fullDetail += models[p.model].leafTriangles;
+      new Uint32Array(instances, i * 64 + 56, 1)[0] = p.material ?? 0;
+      this.fullDetail += this.models[p.model].leafTriangles;
     });
     this.instanceCount = placements.length;
-
-    // The geometry only changes when the models do; the instances whenever
-    // the crowd does.
-    const upload = (data) => {
-      const b = d.createBuffer({ size: Math.max(16, Math.ceil(data.byteLength / 4) * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-      d.queue.writeBuffer(b, 0, data);
-      return b;
-    };
-    if (this.loadedModels !== models) {
-      for (const b of this.geometryBuffers || []) b.destroy();
-      this.geometryBuffers = [clusters, pageTable, pool, meshes].map(upload);
-      this.loadedModels = models;
-    }
     this.instanceBuffer?.destroy();
-    this.instanceBuffer = upload(instances);
-    const [bClusters, bTable, bPool, bMeshes] = this.geometryBuffers;
+    this.instanceBuffer = d.createBuffer({ size: instances.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(this.instanceBuffer, 0, instances);
     this.sceneGroup = d.createBindGroup({
       layout: this.sceneLayout,
       entries: [{ binding: 0, resource: { buffer: this.frameBuffer } },
-        ...[1, 2, 3, 6, 7].map((binding) => ({ binding, resource: { buffer: { 1: bClusters, 2: bTable, 3: bPool, 6: bMeshes, 7: this.instanceBuffer }[binding] } }))],
+        ...[[1, this.clusterBuffer], [2, this.pageTable], [3, this.pool], [6, this.meshBuffer], [7, this.instanceBuffer]]
+          .map(([binding, buffer]) => ({ binding, resource: { buffer } }))],
     });
   }
 
   resize(width, height) {
-    if (width === this.width && height === this.height) return;
+    if (width === this.width && height === this.height && this.workGroup) return;
     const d = this.device;
     this.width = width;
     this.height = height;
@@ -192,8 +211,8 @@ export class Renderer {
     this.image = d.createTexture({ size: [width, height], format: 'rgba8unorm', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING | T.COPY_SRC });
     this.workGroup = d.createBindGroup({
       layout: this.workLayout,
-      entries: [this.counters, this.work, this.hwVisible, this.swVisible, this.swDepthBuffer, this.swIdBuffer]
-        .map((buffer, binding) => ({ binding, resource: { buffer } })),
+      entries: [this.counters, this.work, this.hwVisible, this.swVisible, this.swDepthBuffer, this.swIdBuffer, this.pageUsed,
+        this.requests, this.requestStamp].map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     this.imageGroup = d.createBindGroup({
       layout: this.imageLayout,
@@ -229,10 +248,20 @@ export class Renderer {
     fu[68] = MAX_WORK; fu[69] = MAX_VISIBLE;
     ff[70] = settings.swPixels;
     ff[71] = performance.now() / 1000;
+    fu[72] = ++this.frameIndex;
+    fu[73] = MAX_REQUESTS;
     d.queue.writeBuffer(this.frameBuffer, 0, f);
+
+    // Streaming: what the GPU asked for and drew from, a few frames ago,
+    // and the pages that have arrived since.
+    const uploads = this.streamer.service(this.frameIndex, this.wanted, settings.threshold);
+    this.wanted = [];
+    for (const u of uploads) d.queue.writeBuffer(this.pool, u.slot * this.streamer.slotBytes, u.data);
+    d.queue.writeBuffer(this.pageTable, 0, this.streamer.table);
 
     const enc = d.createCommandEncoder();
     enc.clearBuffer(this.counters);
+    enc.clearBuffer(this.requests, 0, 16);
     enc.clearBuffer(this.swDepthBuffer);
     const ts = (begin, end) => (this.timestamps ? { timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: begin, endOfPassWriteIndex: end } } : {});
 
@@ -285,6 +314,11 @@ export class Renderer {
       bp.end();
     }
 
+    const sb = this.streamReadbacks.find((x) => !x.busy);
+    if (sb) {
+      enc.copyBufferToBuffer(this.requests, 0, sb.buffer, 0, 16 + MAX_REQUESTS * 8);
+      enc.copyBufferToBuffer(this.pageUsed, 0, sb.buffer, 16 + MAX_REQUESTS * 8, this.pageUsed.size);
+    }
     // Statistics and timings come back a few frames late, into whichever
     // readback buffer is free.
     const rb = this.readbacks.find((x) => !x.busy);
@@ -295,6 +329,18 @@ export class Renderer {
       enc.copyBufferToBuffer(this.queryResolve, 0, tb.buffer, 0, 48);
     }
     d.queue.submit([enc.finish()]);
+    if (sb) {
+      sb.busy = true;
+      sb.buffer.mapAsync(GPUMapMode.READ).then(() => {
+        const u = new Uint32Array(sb.buffer.getMappedRange().slice(0));
+        sb.buffer.unmap();
+        sb.busy = false;
+        this.streamer.noteUsed(u.subarray(4 + MAX_REQUESTS * 2));
+        const n = Math.min(u[0], MAX_REQUESTS);
+        const f32 = new Float32Array(u.buffer);
+        for (let k = 0; k < n; k++) this.wanted.push([u[4 + 2 * k], f32[4 + 2 * k + 1]]);
+      });
+    }
     if (rb) {
       rb.busy = true;
       rb.buffer.mapAsync(GPUMapMode.READ).then(() => {

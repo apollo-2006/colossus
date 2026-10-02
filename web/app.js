@@ -4,7 +4,8 @@ import { fetchModel } from './geometry.js';
 import { FLAG_CONE, FLAG_FRUSTUM, FLAG_SOFTWARE, Renderer } from './renderer.js';
 
 const $ = (id) => document.getElementById(id);
-const MODELS = ['models/lucy.cgeo.gz', 'models/dragon.cgeo.gz'];
+const MODELS = ['models/lucy', 'models/dragon'];
+const POOL_BYTES = 192 << 20;  // Pages streamed in; the rest stay on the server
 
 const human = (v) => (v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : `${v}`);
 
@@ -22,7 +23,7 @@ function random(seed) {
 
 // An n by n grid, models alternating, each turned and sized at random.
 export function crowd(n, models, spacing = 1.25) {
-  const rand = random(7);
+  const rand = random(7), materialRand = random(11);
   const out = [];
   for (let z = 0; z < n; z++)
     for (let x = 0; x < n; x++) {
@@ -30,7 +31,10 @@ export function crowd(n, models, spacing = 1.25) {
       const scale = n === 1 ? 1 : 0.85 + 0.3 * rand();
       const c = Math.cos(angle) * scale, s = Math.sin(angle) * scale;
       const tx = (x - (n - 1) / 2) * spacing, tz = (z - (n - 1) / 2) * -spacing;
-      out.push({ model: (z * n + x) % models, scale, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
+      // Mostly marble, some sandstone, bronze, gold and granite, as the
+      // native viewer mixes them (shade materials in compute.wgsl).
+      const material = n === 1 ? 1 : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5][Math.floor(materialRand() * 20)];
+      out.push({ model: (z * n + x) % models, scale, material, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
     }
   return out;
 }
@@ -60,12 +64,13 @@ async function main() {
     $('loading').textContent = `loading models: ${(g / 1e6).toFixed(1)}${t ? ` of ${(t / 1e6).toFixed(1)}` : ''} MB`;
   })));
   $('loading').remove();
+  renderer.loadModels(models, Math.min(POOL_BYTES, renderer.device.limits.maxStorageBufferBindingSize));
 
   const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE, threshold: 1, mode: 0, swPixels: 32 };
   let frozen = null;
   const build = () => {
     const n = Number($('grid').value);
-    renderer.loadScene(models, crowd(n, models.length));
+    renderer.setPlacements(crowd(n, models.length));
     $('grid-label').textContent = `${n * n} instances`;
     $('full').textContent = human(renderer.fullDetail);
   };
@@ -140,6 +145,8 @@ async function main() {
       $('clusters').textContent = `${human(s.hw + s.sw)} (${human(s.sw)} in compute)`;
       $('instances').textContent = `${s.instances} of ${renderer.instanceCount}`;
       $('size').textContent = `${w} x ${h}`;
+      const st = renderer.streamer.stats;
+      $('pages').textContent = `${st.resident} pages, ${(st.bytes / 1e6).toFixed(0)} MB fetched${st.inFlight ? ' (streaming)' : ''}`;
       shown = now;
       frames = 0;
       cpuMs = 0;

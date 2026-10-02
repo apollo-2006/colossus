@@ -33,6 +33,45 @@ struct Counters {
 @group(2) @binding(0) var hw_depth: texture_depth_2d;
 @group(2) @binding(1) var hw_id: texture_2d<u32>;
 @group(2) @binding(2) var out_image: texture_storage_2d<rgba8unorm, write>;
+// Streaming: the frame each page was last drawn from, the pages asked for
+// this frame (page, priority as float bits), and when each was last asked.
+struct Requests {
+  count: atomic<u32>,
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
+  list: array<vec2u>,
+}
+@group(1) @binding(6) var<storage, read_write> page_used: array<u32>;
+@group(1) @binding(7) var<storage, read_write> requests: Requests;
+@group(1) @binding(8) var<storage, read_write> request_stamp: array<atomic<u32>>;
+
+// The LOD test with streaming, as viewer/shaders/common.glsl's: a cluster
+// is drawn when it is the right level, or when the finer clusters it
+// stands for are not resident; it must be resident itself.
+struct Lod {
+  draw: bool,
+  wants_finer: bool,
+  self_error: f32,
+}
+
+fn lod_test(inst: Instance, c: Cluster) -> Lod {
+  let s = inst.scale;
+  var r: Lod;
+  r.self_error = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s);
+  let coarse_enough = projected_error(to_world(inst, c.parent_center), c.parent_radius * s, c.parent_error * s) > frame.lod_threshold;
+  let finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
+  r.wants_finer = r.self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
+  r.draw = page_table[c.group] != NO_PAGE && coarse_enough && (r.self_error <= frame.lod_threshold || !finer_resident);
+  return r;
+}
+
+fn request_finer(c: Cluster, priority: f32) {
+  if (atomicExchange(&request_stamp[c.creator], frame.frame_index) == frame.frame_index) { return; }
+  let k = atomicAdd(&requests.count, 1u);
+  if (k < frame.max_requests) { requests.list[k] = vec2u(c.creator, bitcast<u32>(priority)); }
+}
+
 // The indirect arguments: [0, 3) the cluster culling dispatch, [4, 8) the
 // hardware draw, [8, 11) the software rasterizer's dispatch. Bound only
 // for the two passes that write them: a dispatch may not both read a
@@ -134,9 +173,8 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       atomicAdd(&wg_tested, 1u);
       let c = clusters[cluster_id];
       let s = inst.scale;
-      let tau = frame.lod_threshold;
-      draw = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s) <= tau &&
-             projected_error(to_world(inst, c.parent_center), c.parent_radius * s, c.parent_error * s) > tau;
+      let lod = lod_test(inst, c);
+      draw = lod.draw;
       let center = to_world(inst, c.center);
       let r = c.radius * s;
       if (draw && (frame.flags & FLAG_FRUSTUM) != 0u) { draw = sphere_in_frustum(center, r); }
@@ -147,6 +185,8 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       }
       if (draw) {
         atomicAdd(&wg_triangles, c.triangle_count);
+        page_used[c.group] = frame.frame_index;
+        if (lod.wants_finer) { request_finer(c, lod.self_error); }
         // The sphere's size on screen, roughly; clusters reaching the
         // near plane always go to the hardware, which clips.
         let d = length(center - frame.origin.xyz) - r;

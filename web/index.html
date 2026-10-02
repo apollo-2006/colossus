@@ -21,6 +21,7 @@
     <dt>clusters drawn</dt><dd id="clusters">...</dd>
     <dt>instances seen</dt><dd id="instances">...</dd>
     <dt>image</dt><dd id="size">...</dd>
+    <dt>streamed in</dt><dd id="pages">...</dd>
   </dl>
   <label>crowd <span id="grid-label"></span>
     <input id="grid" type="range" min="1" max="64" value="30"></label>
@@ -41,9 +42,10 @@
   <label class="check"><input id="cone" type="checkbox" checked> normal cone culling</label>
   <label class="check"><input id="freeze" type="checkbox"> freeze culling, then fly out</label>
   <p class="help">Drag to look, WASD to fly, Q and E down and up, wheel for speed.</p>
-  <p class="help">Models are trimmed to 400k triangles at their finest for the web; the
+  <p class="help">Each model is 4M triangles at its finest. Only their outlines load up front; the rest
+    streams in, page by page, as you look closer. The
     <a href="https://github.com/apollo-2006/colossus">native viewer</a> draws all 28M of Lucy's, with mesh
-    shaders, occlusion culling and ray traced shadows. Lucy and the dragon: Stanford 3D Scanning Repository.</p>
+    shaders and ray traced shadows. Lucy and the dragon: Stanford 3D Scanning Repository.</p>
 </aside>
 <script type="module" src="app.js"></script>
 </body>
