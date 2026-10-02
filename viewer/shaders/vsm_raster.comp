@@ -157,7 +157,7 @@ void main() {
     const uvec2 v = vsm_visible[k];
     const uint instance = v.x & 0xffffffu, level = (v.x >> 24) & 15u, layer = v.x >> 28;
     const Instance inst = load_instance(instance);
-    const Cluster c = clusters[v.y];
+    const Cluster c = load_cluster(v.y);
     const uint t = gl_LocalInvocationIndex;
     const float texel = vsm_texel(level);
     if (t == 0u) together_count = 0u;

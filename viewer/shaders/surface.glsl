@@ -45,7 +45,7 @@ Surface surface_at(uvec2 px) {
     s.id = uint(v & 0xffffffffu);
     s.vc = visible[s.id >> 7];
     const Instance inst = load_instance(s.vc.x);
-    const Cluster c = clusters[s.vc.y];
+    const Cluster c = load_cluster(s.vc.y);
     const uint base = page_table[c.group];
     const uint packed = cluster_triangle(base, c, s.id & 127u);
     const uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;

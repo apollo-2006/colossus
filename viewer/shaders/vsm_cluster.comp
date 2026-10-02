@@ -18,7 +18,7 @@ void main() {
     const Mesh m = meshes[inst.mesh];
     const uint cluster = w.y + gl_LocalInvocationIndex;
     if (cluster >= m.first_cluster + m.cluster_count) return;
-    const Cluster c = clusters[cluster];
+    const Cluster c = load_cluster(cluster);
     const float texel = vsm_texel(level);
     const float self_error = c.lod_error * inst.scale / texel;
     const bool coarse_enough = c.parent_error * inst.scale / texel > frame.lod_threshold;

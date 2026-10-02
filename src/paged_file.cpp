@@ -1,6 +1,7 @@
 #include "paged_file.hpp"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -9,7 +10,7 @@
 
 namespace {
 
-constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '7'};
+constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '8'};
 constexpr uint32_t grid_bits = 14;
 constexpr uint32_t grid_max = (1u << grid_bits) - 2;  // a step of rounding to spare
 
@@ -83,17 +84,87 @@ uint32_t width(const gpu_cluster& c, int field) { return (c.level >> (8 + 4 * fi
 
 }  // namespace
 
-vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k) {
-    const uint32_t bx = width(c, 0), by = width(c, 1), bz = width(c, 2);
-    const uint64_t at = uint64_t(k) * (bx + by + bz + 22) + bx + by + bz;
-    const uint32_t uv = read_bits(page + c.vertex_offset, at, 22);
-    const float u = float(uv & 2047) / 2047 * 2 - 1, v = float(uv >> 11) / 2047 * 2 - 1;
+namespace {
+
+vec3 decode_octahedral(uint32_t uv) {
+    const float u = float(uv & 2047) / 2047 * 2 - 1, v = float((uv >> 11) & 2047) / 2047 * 2 - 1;
     vec3 n(u, v, 1 - std::abs(u) - std::abs(v));
     if (n.z < 0) {
         n.x = (1 - std::abs(v)) * sign_not_zero(u);
         n.y = (1 - std::abs(u)) * sign_not_zero(v);
     }
     return normalize(n);
+}
+
+}  // namespace
+
+vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k) {
+    const uint32_t bx = width(c, 0), by = width(c, 1), bz = width(c, 2);
+    const uint64_t at = uint64_t(k) * (bx + by + bz + 22) + bx + by + bz;
+    return decode_octahedral(read_bits(page + c.vertex_offset, at, 22));
+}
+
+packed_cluster pack_cluster(const gpu_cluster& c) {
+    packed_cluster p{};
+    std::memcpy(p.center, c.center, sizeof p.center);
+    p.radius = c.radius;
+    p.cone = 1023u << 22;  // no cone
+    if (c.cone_cutoff < 1) {
+        const vec3 axis = normalize(vec3(c.cone_axis[0], c.cone_axis[1], c.cone_axis[2]));
+        const uint32_t uv = encode_normal(axis);
+        // raised by the axis's rounding (a test against the rounded axis is off by at most
+        // that), then rounded up.
+        const float cutoff = c.cone_cutoff + length(axis - decode_octahedral(uv)) + 1e-6f;
+        const float steps = std::ceil((cutoff + 1) * 0.5f * 1023);
+        if (steps < 1023) p.cone = uv | static_cast<uint32_t>(std::max(steps, 0.0f)) << 22;
+    }
+    if (c.vertex_offset > 0xffff || c.triangle_offset > 0xffff) throw std::logic_error("page too long to pack offsets");
+    p.offsets = c.vertex_offset | c.triangle_offset << 16;
+    if (c.level >> 24 || c.vertex_count > 255 || c.triangle_count > 255) throw std::logic_error("cluster too large to pack");
+    p.level = c.level | c.vertex_count << 24;
+    p.group = c.group;
+    p.creator = c.creator;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (c.origin[axis] >> 24) throw std::logic_error("grid too fine to pack");
+        p.origin[axis] = c.origin[axis];
+    }
+    p.origin[0] |= c.triangle_count << 24;
+    return p;
+}
+
+gpu_cluster unpack_cluster(const packed_cluster& p, const std::vector<page_bounds>& shared_bounds) {
+    gpu_cluster c{};
+    std::memcpy(c.center, p.center, sizeof c.center);
+    c.radius = p.radius;
+    const uint32_t steps = p.cone >> 22;
+    const vec3 axis = steps == 1023 ? vec3(0, 0, 1) : decode_octahedral(p.cone);
+    c.cone_axis[0] = axis.x;
+    c.cone_axis[1] = axis.y;
+    c.cone_axis[2] = axis.z;
+    c.cone_cutoff = float(steps) / 1023 * 2 - 1;
+    c.vertex_offset = p.offsets & 0xffff;
+    c.triangle_offset = p.offsets >> 16;
+    c.level = p.level & 0xffffff;
+    c.vertex_count = p.level >> 24;
+    c.group = p.group;
+    c.creator = p.creator;
+    for (int axis = 0; axis < 3; ++axis) c.origin[axis] = p.origin[axis] & 0xffffff;
+    c.triangle_count = p.origin[0] >> 24;
+    const page_bounds& parent = shared_bounds.at(p.group);
+    std::memcpy(c.parent_center, parent.center, sizeof c.parent_center);
+    c.parent_radius = parent.radius;
+    c.parent_error = parent.error;
+    if (p.creator == no_page) {
+        std::memcpy(c.lod_center, p.center, sizeof c.lod_center);
+        c.lod_radius = p.radius;
+        c.lod_error = 0;
+    } else {
+        const page_bounds& lod = shared_bounds.at(p.creator);
+        std::memcpy(c.lod_center, lod.center, sizeof c.lod_center);
+        c.lod_radius = lod.radius;
+        c.lod_error = lod.error;
+    }
+    return c;
 }
 
 uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t) {
@@ -225,6 +296,29 @@ paged_geometry page(const geometry& g) {
         p.data.insert(p.data.end(), words.begin(), words.end());
     }
     p.data_size = uint64_t(p.data.size()) * 4;
+
+    // what each page's clusters share: their parent bounds and error, the same as the lod
+    // bounds and error of the clusters made from them (src/dag.cpp). checked, so packing
+    // loses none of it.
+    p.shared_bounds.assign(p.pages.size(), page_bounds{{0, 0, 0}, -1, -1});
+    p.shared_bounds[0] = {{p.bounds.center.x, p.bounds.center.y, p.bounds.center.z}, p.bounds.radius, FLT_MAX};
+    auto share = [&](uint32_t page, const float* center, float radius, float error) {
+        page_bounds& b = p.shared_bounds[page];
+        if (b.radius < 0) b = {{center[0], center[1], center[2]}, radius, error};
+        else if (std::memcmp(b.center, center, sizeof b.center) != 0 || b.radius != radius || b.error != error)
+            throw std::logic_error("a group's clusters disagree on their bounds");
+    };
+    for (const gpu_cluster& c : p.clusters) {
+        if (c.group != 0) share(c.group, c.parent_center, c.parent_radius, c.parent_error);
+        if (c.creator != no_page) share(c.creator, c.lod_center, c.lod_radius, c.lod_error);
+    }
+    for (const page_bounds& b : p.shared_bounds)
+        if (b.radius < 0) throw std::logic_error("a page without bounds");
+    p.packed.reserve(p.clusters.size());
+    for (gpu_cluster& c : p.clusters) {
+        p.packed.push_back(pack_cluster(c));
+        c = unpack_cluster(p.packed.back(), p.shared_bounds);
+    }
     return p;
 }
 
@@ -236,7 +330,8 @@ void save_paged(const paged_geometry& p, const std::string& path) {
                          p.lod_bounds.center.x, p.lod_bounds.center.y, p.lod_bounds.center.z, p.lod_bounds.radius,
                          p.grid_min.x,          p.grid_min.y,          p.grid_min.z,          p.grid_step};
     f.write(reinterpret_cast<const char*>(b), sizeof b);
-    write_vec(f, p.clusters);
+    write_vec(f, p.packed);
+    write_vec(f, p.shared_bounds);
     write_vec(f, p.pages);
     write_vec(f, p.deps);
     write_vec(f, p.levels);
@@ -262,10 +357,17 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
     p.lod_bounds = {{b[4], b[5], b[6]}, b[7]};
     p.grid_min = {b[8], b[9], b[10]};
     p.grid_step = b[11];
-    read_vec(f, p.clusters);
+    read_vec(f, p.packed);
+    read_vec(f, p.shared_bounds);
     read_vec(f, p.pages);
     read_vec(f, p.deps);
     read_vec(f, p.levels);
+    if (p.shared_bounds.size() != p.pages.size()) throw std::runtime_error(path + ": page bounds out of range");
+    for (const packed_cluster& c : p.packed)
+        if (c.group >= p.pages.size() || (c.creator != no_page && c.creator >= p.pages.size()))
+            throw std::runtime_error(path + ": cluster out of range");
+    p.clusters.reserve(p.packed.size());
+    for (const packed_cluster& c : p.packed) p.clusters.push_back(unpack_cluster(c, p.shared_bounds));
     f.read(reinterpret_cast<char*>(&p.data_size), sizeof p.data_size);
     while (f.tellg() % 16) f.get();
     p.data_offset = static_cast<uint64_t>(f.tellg());

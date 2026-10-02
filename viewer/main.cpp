@@ -173,7 +173,7 @@ struct gpu_frame {
     float prev_view_proj[16];
     uint32_t taa_valid;
     float jitter[2];
-    uint32_t pad15;
+    uint32_t page_count;  // where the page table's shared bounds start
 };
 struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
@@ -280,7 +280,8 @@ struct shadow_mesh {
 };
 
 struct scene {
-    std::vector<gpu_cluster> clusters;  // every model's, page numbers made global
+    std::vector<packed_cluster> clusters;  // every model's, page numbers made global
+    std::vector<page_bounds> shared_bounds;  // per global page
     std::vector<stream_page> pages;
     std::vector<uint32_t> deps;         // global page numbers
     std::vector<uint32_t> children;     // global page numbers, for prefetch
@@ -414,11 +415,12 @@ void make_scene(const options& opt, scene& s) {
         m.lod_bounds[2] = g.lod_bounds.center.z; m.lod_bounds[3] = g.lod_bounds.radius;
         m.grid[0] = g.grid_min.x; m.grid[1] = g.grid_min.y; m.grid[2] = g.grid_min.z; m.grid[3] = g.grid_step;
         s.meshes.push_back(m);
-        for (gpu_cluster c : g.clusters) {
+        for (packed_cluster c : g.packed) {
             c.group += page_base;
             if (c.creator != no_page) c.creator += page_base;
             s.clusters.push_back(c);
         }
+        s.shared_bounds.insert(s.shared_bounds.end(), g.shared_bounds.begin(), g.shared_bounds.end());
     }
 
     std::mt19937 rng(7), material_rng(11), motion_rng(13);
@@ -761,6 +763,7 @@ public:
         fr.prev_time = history_valid_ ? prev_time_ : fr.time;
         if (sc_.moving) fr.flags |= flag_moving;
         fr.vsm_atlas_side = vsm_side_;
+        fr.page_count = static_cast<uint32_t>(sc_.pages.size());
 
         prev_time_ = fr.time;
         // taa: each frame's projection nudged by a sub-pixel offset (halton 2, 3 over eight
@@ -1260,7 +1263,11 @@ private:
         clusters_ = ctx_.upload(sc_.clusters, ssbo);
         const VkBufferUsageFlags dst = VK_BUFFER_USAGE_TRANSFER_DST_BIT, src = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         const uint64_t pages = sc_.pages.size();
-        page_table_ = ctx_.make_buffer(pages * 4, ssbo | dst, false);
+        // the page table (rewritten each frame), then each page's shared bounds (common.glsl).
+        std::vector<uint32_t> table(pages, UINT32_MAX);
+        table.resize(pages + sc_.shared_bounds.size() * 5);
+        std::memcpy(table.data() + pages, sc_.shared_bounds.data(), sc_.shared_bounds.size() * sizeof(page_bounds));
+        page_table_ = ctx_.upload(table, ssbo | dst);
         pool_buffer_ = ctx_.make_buffer(streamer_.pool_bytes(), ssbo | dst, false);
         page_used_ = ctx_.make_buffer(pages * 4, ssbo | src | dst, false);
         request_stamp_ = ctx_.make_buffer(pages * 4, ssbo | dst, false);

@@ -5,7 +5,7 @@
 
 // gpu_cluster (include/geometry_file.hpp) as paged: `group` is its page,
 // `creator` the page of the finer clusters it stands for, offsets are words
-// into its page.
+// into its page. load_cluster() unpacks it.
 struct Cluster {
     vec3 center;  // culling bounds
     float radius;
@@ -25,6 +25,18 @@ struct Cluster {
     uint group;
     uint creator;
     uvec3 origin;  // corner on the model's grid
+};
+
+// as stored: packed_cluster (include/paged_file.hpp).
+struct PackedCluster {
+    vec3 center;
+    float radius;
+    uint cone;     // axis u (11) | v (11) << 11 | cutoff (10) << 22
+    uint offsets;  // vertex_offset | triangle_offset << 16
+    uint level;    // level word | vertex_count << 24
+    uint group;
+    uint creator;
+    uint origin[3];  // 24 bits each, origin[0] | triangle_count << 24
 };
 
 // a loaded model: clusters[first_cluster, + cluster_count).
@@ -82,7 +94,7 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     mat4 prev_view_proj;    // last frame's, unjittered: for taa.comp
     uint taa_valid;         // last frame's image fits this one
     vec2 jitter;            // this frame's sub-pixel offset, clip space
-    uint pad15;
+    uint page_count;  // page_table's entries; its shared bounds follow
 } frame;
 
 const uint flag_cone_culling = 1u;
@@ -105,12 +117,64 @@ layout(push_constant, scalar) uniform Push {
     uint level;
 } push;
 
-layout(set = 0, binding = 1, scalar) readonly buffer Clusters { Cluster clusters[]; };
+layout(set = 0, binding = 1, scalar) readonly buffer Clusters { PackedCluster packed_clusters[]; };
 // streaming (viewer/streamer.hpp): each page's place in the pool (first word,
 // or NO_PAGE), the pool, the frame each page was last drawn from, and this
 // frame's requests with priority.
 const uint NO_PAGE = 0xffffffffu;
+// after the frame.page_count entries, each page's shared bounds: centre, radius, error
+// (include/paged_file.hpp's page_bounds).
 layout(set = 0, binding = 2, scalar) readonly buffer PageTable { uint page_table[]; };
+
+vec3 decode_octahedral(uint uv) {
+    const vec2 e = vec2(float(uv & 2047u), float((uv >> 11) & 2047u)) / 2047.0 * 2.0 - 1.0;
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+// page p's shared bounds: xyz centre, w radius; error through page_error().
+vec4 page_sphere(uint p) {
+    const uint at = frame.page_count + 5u * p;
+    return uintBitsToFloat(uvec4(page_table[at], page_table[at + 1u], page_table[at + 2u], page_table[at + 3u]));
+}
+float page_error(uint p) { return uintBitsToFloat(page_table[frame.page_count + 5u * p + 4u]); }
+
+// for the binary searches over a model's clusters (sorted by it).
+float cluster_parent_error(uint i) { return page_error(packed_clusters[i].group); }
+
+Cluster load_cluster(uint i) {
+    const PackedCluster p = packed_clusters[i];
+    Cluster c;
+    c.center = p.center;
+    c.radius = p.radius;
+    const uint steps = p.cone >> 22;
+    c.cone_axis = steps == 1023u ? vec3(0.0, 0.0, 1.0) : decode_octahedral(p.cone);
+    c.cone_cutoff = float(steps) / 1023.0 * 2.0 - 1.0;
+    c.vertex_offset = p.offsets & 0xffffu;
+    c.triangle_offset = p.offsets >> 16;
+    c.level = p.level & 0xffffffu;
+    c.vertex_count = p.level >> 24;
+    c.group = p.group;
+    c.creator = p.creator;
+    c.origin = uvec3(p.origin[0] & 0xffffffu, p.origin[1], p.origin[2]);
+    c.triangle_count = p.origin[0] >> 24;
+    const vec4 parent = page_sphere(p.group);
+    c.parent_center = parent.xyz;
+    c.parent_radius = parent.w;
+    c.parent_error = page_error(p.group);
+    if (p.creator == NO_PAGE) {
+        c.lod_center = p.center;
+        c.lod_radius = p.radius;
+        c.lod_error = 0.0;
+    } else {
+        const vec4 lod = page_sphere(p.creator);
+        c.lod_center = lod.xyz;
+        c.lod_radius = lod.w;
+        c.lod_error = page_error(p.creator);
+    }
+    return c;
+}
 layout(set = 0, binding = 3, scalar) readonly buffer Pool { uint pool[]; };
 layout(set = 0, binding = 4, scalar) buffer PageUsed { uint page_used[]; };
 layout(set = 0, binding = 5, scalar) buffer Requests {
@@ -147,11 +211,7 @@ vec3 cluster_position(uint base, Cluster c, vec4 grid, uint k) {
 vec3 cluster_normal(uint base, Cluster c, uint k) {
     const uvec4 b = cluster_widths(c);
     const uint xyz = b.x + b.y + b.z;
-    const uint uv = read_bits(base + c.vertex_offset, k * (xyz + 22u) + xyz, 22u);
-    const vec2 e = vec2(float(uv & 2047u), float(uv >> 11)) / 2047.0 * 2.0 - 1.0;
-    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
-    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
-    return normalize(n);
+    return decode_octahedral(read_bits(base + c.vertex_offset, k * (xyz + 22u) + xyz, 22u));
 }
 
 // triangle t as a | b << 8 | c << 16.

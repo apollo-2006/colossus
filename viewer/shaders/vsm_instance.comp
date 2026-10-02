@@ -27,7 +27,7 @@ void main() {
         uint lo = 0, hi = m.cluster_count;
         while (lo < hi) {
             const uint mid = (lo + hi) / 2;
-            if (clusters[m.first_cluster + mid].parent_error > limit) hi = mid;
+            if (cluster_parent_error(m.first_cluster + mid) > limit) hi = mid;
             else lo = mid + 1;
         }
         const uint chunks = (m.cluster_count - lo + 63u) / 64u;

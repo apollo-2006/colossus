@@ -18,7 +18,7 @@ void main() {
     }
     const uvec2 v = visible[vid];
     const Instance inst = load_instance(v.x);
-    const Cluster c = clusters[v.y];
+    const Cluster c = load_cluster(v.y);
     SetMeshOutputsEXT(c.vertex_count, c.triangle_count);
 
     const uint k = gl_LocalInvocationIndex;

@@ -33,7 +33,7 @@ void main() {
         cluster_id = w.first + lane;
         if (cluster_id < m.first_cluster + m.cluster_count) {
             tested = true;
-            const Cluster c = clusters[cluster_id];
+            const Cluster c = load_cluster(cluster_id);
             const float s = inst.scale;
             draw = lod_test(inst, c, wants_finer, self_error);
             const vec3 center = to_world(inst, c.center);
@@ -62,14 +62,14 @@ void main() {
             instance_id = ic.x;
             cluster_id = ic.y;
             const Instance inst = load_instance(instance_id);
-            const Cluster c = clusters[cluster_id];
+            const Cluster c = load_cluster(cluster_id);
             draw = !occluded(to_world(inst, c.center), c.radius * inst.scale);
             hidden = !draw;
             if (draw) lod_test(inst, c, wants_finer, self_error);
         }
     }
     if (draw) {
-        const Cluster c = clusters[cluster_id];
+        const Cluster c = load_cluster(cluster_id);
         triangles = c.triangle_count;
         // streaming: page in use; this cluster would rather be unloaded finer
         // ones.
@@ -97,7 +97,7 @@ void main() {
     bool software = false;
     if (draw && (frame.flags & flag_software_raster) != 0u) {
         const Instance inst = load_instance(instance_id);
-        const Cluster c = clusters[cluster_id];
+        const Cluster c = load_cluster(cluster_id);
         vec3 vc = (frame.view * vec4(to_world(inst, c.center), 1.0)).xyz;
         vc.z = -vc.z;
         vec4 aabb;

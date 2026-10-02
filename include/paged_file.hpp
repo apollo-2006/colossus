@@ -17,6 +17,9 @@
 //
 // shared vertices snap to the same grid point in each cluster: no cracks.
 //
+// clusters are stored packed (packed_cluster, 48 bytes): what a group's clusters
+// share, their bounds and errors, is stored once per page (page_bounds).
+//
 // pages are the unit of streaming. page 0 holds the roots, always resident. a
 // page's dependencies hold the coarser copy of its surface, and it is resident
 // only while they are, so a cluster can always stand in for missing finer ones:
@@ -38,14 +41,44 @@ static_assert(sizeof(page_info) == 24);
 
 constexpr uint32_t no_page = UINT32_MAX;
 
+// a cluster as stored and uploaded: gpu_cluster less what its pages share. its lod bounds and
+// error are its creator page's page_bounds (a leaf's: its own sphere, error 0), its parent's
+// its own page's. the rest packs:
+//
+//   cone     axis octahedral u (11) | v (11) << 11 | cutoff (10) << 22: the cutoff rounded up
+//            and raised by how far the axis rounded, so it never culls more than the exact
+//            cone. cutoff 1 (1023): no cone.
+//   offsets  vertex_offset | triangle_offset << 16, words into the page
+//   level    the level word above | vertex_count << 24
+//   origin   24 bits each, origin[0] | triangle_count << 24
+struct packed_cluster {
+    float center[3];  // culling bounds
+    float radius;
+    uint32_t cone, offsets, level, group, creator;
+    uint32_t origin[3];
+};
+static_assert(sizeof(packed_cluster) == 48);
+
+// what a page's clusters share: their parent bounds and error, which are also the lod bounds
+// and error of the clusters made from them. page 0, the roots', has an infinite error.
+struct page_bounds {
+    float center[3];
+    float radius;
+    float error;
+};
+static_assert(sizeof(page_bounds) == 20);
+
 struct paged_geometry {
     sphere bounds, lod_bounds;
     vec3 grid_min;      // grid point (0, 0, 0)
     float grid_step = 0;
     // by parent error. `group` is the cluster's page, `creator` the page of the
     // finer clusters it stands for (no_page for a leaf); vertex_offset and
-    // triangle_offset are words into the page.
+    // triangle_offset are words into the page. unpacked from packed and
+    // shared_bounds: exactly what the file holds.
     std::vector<gpu_cluster> clusters;
+    std::vector<packed_cluster> packed;
+    std::vector<page_bounds> shared_bounds;  // per page
     std::vector<page_info> pages;
     std::vector<uint32_t> deps;
     std::vector<lod_level_stats> levels;
@@ -62,6 +95,9 @@ paged_geometry page(const geometry& g);
 void save_paged(const paged_geometry& p, const std::string& path);
 // reads a .cgeo; page data only if with_data.
 paged_geometry load_paged(const std::string& path, bool with_data);
+
+packed_cluster pack_cluster(const gpu_cluster& c);
+gpu_cluster unpack_cluster(const packed_cluster& p, const std::vector<page_bounds>& shared_bounds);
 
 // a paged cluster's level, its widths masked off.
 inline uint32_t cluster_level(const gpu_cluster& c) { return c.level & 0xff; }

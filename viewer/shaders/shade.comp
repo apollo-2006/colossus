@@ -145,7 +145,7 @@ void main() {
         color = used == vsm_levels ? vec3(1.0, 0.0, 1.0) : level_color(used * 2u) * (0.3 + 0.7 * lit);
     } else if (s.kind == surface_object) {
         const Instance inst = load_instance(s.vc.x);
-        const Cluster c = clusters[s.vc.y];
+        const Cluster c = load_cluster(s.vc.y);
         const uint vid = s.id >> 7;
         Material m = materials[min(inst.material, 5u)];
         if (frame.debug_mode != 0u) m = Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0);
