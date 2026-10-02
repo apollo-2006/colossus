@@ -1,0 +1,24 @@
+#version 460
+// The pieces of work of instances with many, for the shadow pages: a
+// workgroup each (see expand.comp).
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 64) in;
+
+shared uint base;
+shared uint count;
+
+void main() {
+    const uint k = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (k >= min(vsm_big_count, vsm_big_capacity)) return;
+    const uvec2 e = vsm_work[frame.max_work_items + 2u * k];
+    if (gl_LocalInvocationIndex == 0u) {
+        const uint chunks = vsm_work[frame.max_work_items + 2u * k + 1u].x;
+        const uint b = atomicAdd(vsm_work_count, chunks);
+        base = b;
+        count = b < frame.max_work_items ? min(chunks, frame.max_work_items - b) : 0u;
+    }
+    barrier();
+    for (uint c = gl_LocalInvocationIndex; c < count; c += 64u) vsm_work[base + c] = uvec2(e.x, e.y + 64u * c);
+}

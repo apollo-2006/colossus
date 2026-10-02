@@ -11,6 +11,7 @@
 // traces its own ray where they do not (see sunlight()).
 #include "common.glsl"
 #include "surface.glsl"
+#include "vsm.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D out_image;
@@ -63,8 +64,9 @@ vec2 to_pixel(vec3 world) {
 // no neighbour is at this distance (silhouettes). So shadow edges keep
 // full resolution, and only they cost a ray.
 float sunlight(uvec2 px, Surface s) {
-#ifdef RAY_QUERY
     if ((frame.flags & flag_shadows) == 0u) return 1.0;
+    if ((frame.flags & flag_vsm) != 0u) return s.kind == surface_sky ? 1.0 : vsm_shadow(s.hit, s.n, s.t);
+#ifdef RAY_QUERY
     if ((frame.flags & flag_full_res_shadows) != 0u) return trace_surface(s);
     const uvec2 size = shadow_size();
     const uvec2 base = px / 2u;
@@ -126,6 +128,13 @@ void main() {
         const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) *
                             (sun_color * max(sun_dir.y, 0.0) * 0.6 * sunlight(px, s) + sky(vec3(0, 1, 0)) * 0.45);
         color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
+    }
+    if (s.kind != surface_sky && frame.debug_mode == 8u) {
+        // Shadow levels: the virtual shadow map level each pixel reads, dark
+        // where it is in shadow; magenta where no level had its pages.
+        uint used = vsm_levels;
+        const float lit = vsm_lookup(s.hit, s.n, s.t, used);
+        color = used == vsm_levels ? vec3(1.0, 0.0, 1.0) : level_color(used * 2u) * (0.3 + 0.7 * lit);
     } else if (s.kind == surface_object) {
         const Instance inst = load_instance(s.vc.x);
         const Cluster c = clusters[s.vc.y];

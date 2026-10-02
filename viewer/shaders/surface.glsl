@@ -4,8 +4,6 @@
 // distance comes from the depth drawn. Pixels with nothing drawn are the
 // ground, or the sky.
 
-const vec3 sun_dir = normalize(vec3(0.75, 0.5, 0.3));
-const vec3 sun_color = vec3(1.0, 0.92, 0.82) * 1.7;
 
 const uint surface_sky = 0u, surface_ground = 1u, surface_object = 2u;
 

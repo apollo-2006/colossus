@@ -1,0 +1,120 @@
+#version 460
+// Rasterizes clusters into the shadow pages being rendered: one workgroup
+// per cluster, one invocation per vertex and then per triangle, as in
+// sw_raster.comp. Coordinates are texels of the cluster's level, snapped
+// to 1/16, and edge functions are measured from each triangle's corner;
+// a triangle over 1024 texels across would overflow them and is left out
+// (none come near). Each covered texel is looked up in the page it falls
+// in, and kept if that page is being rendered; depth is written with an
+// atomic max, nearest the sun winning. Both sides are drawn. A triangle
+// whose box reaches no page being rendered is skipped outright: a moving
+// statue reaches hundreds of pages on the finest level, and only those a
+// pixel on screen needs are rendered.
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 128) in;
+
+shared ivec2 snapped[128];  // Texels, in 1/16
+shared float depth[128];
+
+int edge(ivec2 a, ivec2 b, ivec2 p) {
+    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+}
+
+bool owns_edge(ivec2 a, ivec2 b) {
+    const ivec2 d = b - a;
+    return d.y < 0 || (d.y == 0 && d.x > 0);
+}
+
+void setup_and_small() {
+    const uint k = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (k >= min(vsm_visible_count, frame.max_visible)) return;
+    const uvec2 v = vsm_visible[k];
+    const uint instance = v.x & 0xffffffu, level = (v.x >> 24) & 15u, layer = v.x >> 28;
+    const Instance inst = load_instance(instance);
+    const Cluster c = clusters[v.y];
+    const uint t = gl_LocalInvocationIndex;
+    const float texel = vsm_texel(level);
+    if (t < c.vertex_count) {
+        const vec3 p = vsm_light_space(to_world(inst, cluster_position(page_table[c.group], c, meshes[inst.mesh].grid, t)));
+        snapped[t] = ivec2(round(p.xy / texel * 16.0));
+        depth[t] = p.z;
+    }
+    barrier();
+    if (t >= c.triangle_count) return;
+
+    const uint packed = cluster_triangle(page_table[c.group], c, t);
+    const uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
+    ivec2 a = snapped[i0], b = snapped[i1], d = snapped[i2];
+    float za = depth[i0], zb = depth[i1], zd = depth[i2];
+    // Texel centers are at n + 0.5: the box of centers inside.
+    const ivec2 lo_abs = (min(a, min(b, d)) - 8 + 15) >> 4;
+    const ivec2 hi_abs = (max(a, max(b, d)) - 8) >> 4;
+    if (any(greaterThan(lo_abs, hi_abs)) || any(greaterThan(hi_abs - lo_abs, ivec2(1023)))) return;
+    const ivec2 origin = lo_abs * 16;
+    a -= origin;
+    b -= origin;
+    d -= origin;
+    int area = edge(a, b, d);
+    if (area == 0) return;
+    if (area < 0) {
+        const ivec2 tmp = b; b = d; d = tmp;
+        const float tz = zb; zb = zd; zd = tz;
+        area = -area;
+    }
+    // Most triangles fall within one page or two; if none of the pages the
+    // box reaches is being rendered, there is nothing to do.
+    const ivec2 page_lo = lo_abs >> 7, page_hi = hi_abs >> 7;
+    bool any_page = false;
+    for (int py = page_lo.y; py <= page_hi.y && !any_page; ++py)
+        for (int px = page_lo.x; px <= page_hi.x && !any_page; ++px)
+            any_page = vsm_in_window(level, ivec2(px, py)) && vsm_renders(layer, vsm_slot(level, ivec2(px, py)));
+    if (!any_page) return;
+    const ivec2 p0 = ivec2(8);
+    const int bias0 = owns_edge(b, d) ? 0 : -1;
+    const int bias1 = owns_edge(d, a) ? 0 : -1;
+    const int bias2 = owns_edge(a, b) ? 0 : -1;
+    int row0 = edge(b, d, p0) + bias0, row1 = edge(d, a, p0) + bias1, row2 = edge(a, b, p0) + bias2;
+    const int dx0 = (d.y - b.y) * -16, dy0 = (d.x - b.x) * 16;
+    const int dx1 = (a.y - d.y) * -16, dy1 = (a.x - d.x) * 16;
+    const int dx2 = (b.y - a.y) * -16, dy2 = (b.x - a.x) * 16;
+    const float inv_area = 1.0 / float(area);
+    const ivec2 hi = hi_abs - lo_abs;
+    for (int y = 0; y <= hi.y; ++y) {
+        int w0 = row0, w1 = row1, w2 = row2;
+        // The page this row is in changes only every vsm_page texels.
+        uint phys = vsm_none;
+        int page_x = 0x7fffffff;
+        for (int x = 0; x <= hi.x; ++x) {
+            if ((w0 | w1 | w2) >= 0) {
+                const ivec2 at = lo_abs + ivec2(x, y);
+                const ivec2 page = at >> 7;
+                if (page.x != page_x) {
+                    page_x = page.x;
+                    phys = vsm_none;
+                    if (vsm_in_window(level, page)) {
+                        const uint slot = vsm_slot(level, page);
+                        if (vsm_renders(layer, slot)) phys = vsm_entries[slot].phys;
+                    }
+                }
+                if (phys != vsm_none) {
+                    const float z = (float(w0 - bias0) * za + float(w1 - bias1) * zb + float(w2 - bias2) * zd) * inv_area;
+                    const uint index = vsm_atlas_index(phys, uvec2(at & ivec2(int(vsm_page) - 1)), layer);
+                    const uint value = vsm_sortable(z);
+                    if (value > vsm_atlas[index]) atomicMax(vsm_atlas[index], value);
+                }
+            }
+            w0 += dx0;
+            w1 += dx1;
+            w2 += dx2;
+        }
+        row0 += dy0;
+        row1 += dy1;
+        row2 += dy2;
+    }
+}
+
+void main() {
+    setup_and_small();
+}

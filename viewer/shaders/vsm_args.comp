@@ -1,0 +1,25 @@
+#version 460
+// Indirect arguments for the shadow page passes, after each step
+// (push.level): 0 after allocation, 1 after instance culling, 2 after
+// expansion, 3 after cluster culling.
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 1) in;
+
+uvec4 rows(uint n) {
+    return uvec4(min(n, 65535u), (n + 65534u) / 65535u, 1u, 0u);
+}
+
+void main() {
+    if (push.level == 0u) {
+        vsm_instance_args = rows((vsm_rendered_levels[0] | vsm_rendered_levels[1]) != 0u ? (frame.instance_count + 63u) / 64u : 0u);
+        vsm_clear_args = rows(vsm_render_count);
+    } else if (push.level == 1u) {
+        vsm_expand_args = rows(min(vsm_big_count, vsm_big_capacity));
+    } else if (push.level == 2u) {
+        vsm_cull_args = rows(min(vsm_work_count, frame.max_work_items));
+    } else {
+        vsm_raster_args = rows(min(vsm_visible_count, frame.max_visible));
+    }
+}

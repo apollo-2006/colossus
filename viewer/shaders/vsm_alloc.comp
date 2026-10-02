@@ -1,0 +1,118 @@
+#version 460
+// Gives the needed shadow pages physical pages, in three steps (push.level):
+//
+// 0. Per slot: a page the window has moved off loses its physical page. A
+//    needed page that is resident is touched, and rendered again if
+//    something invalidated it; one that is not is requested.
+// 1. Per physical page: those no needed page uses are listed, free ones
+//    first, then those still holding a page from an earlier frame.
+// 2. Per request: the next listed physical page, taken from its old page
+//    if it had one. Requests beyond the list get nothing this frame, and
+//    shading falls back to a coarser level.
+//
+// Every page given a physical page, or invalidated, is listed to render.
+//
+// Before them, step 3, a workgroup per moving instance: it invalidates
+// every resident page its sphere reaches, where it was last frame (to
+// clear its old shadow) and where it is now. A sphere reaches a few
+// hundred pages over the finer levels, so the workgroup shares them out.
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 64) in;
+
+// Bounds per level, kept as unsigned maxima so a zeroed buffer means empty:
+// x and y store (1 << 21) - (page + (1 << 20)), z and w page + (1 << 20).
+void render(uint slot, uint layer) {
+    vsm_list[3u * vsm_slots + atomicAdd(vsm_render_count, 1u)] = slot | (layer << 31);
+    const uint level = slot / (vsm_window * vsm_window);
+    const ivec2 page = vsm_slot_page(slot);
+    atomicOr(vsm_render_mask[vsm_mask_word(layer, slot)], 1u << (slot % vsm_window));
+    atomicOr(vsm_rendered_levels[layer], 1u << level);
+    const ivec2 biased = page + (1 << 20);
+    const uint r = layer * vsm_levels + level;
+    atomicMax(vsm_render_rect[r].x, (1 << 21) - biased.x);
+    atomicMax(vsm_render_rect[r].y, (1 << 21) - biased.y);
+    atomicMax(vsm_render_rect[r].z, biased.x);
+    atomicMax(vsm_render_rect[r].w, biased.y);
+}
+
+// A new page: both layers (the moving one only if anything moves).
+void render_new(uint slot) {
+    render(slot, vsm_still);
+    if ((frame.flags & flag_moving) != 0u) render(slot, vsm_moving);
+}
+
+void invalidate(vec3 world_center, float radius, uint lane) {
+    const vec2 center = vsm_light_space(world_center).xy;
+    const ivec2 window = ivec2(vsm_window / 2u);
+    for (uint level = 0u; level < vsm_levels; ++level) {
+        const float size = vsm_texel(level) * float(vsm_page);
+        const ivec2 c = vsm_center(level);
+        const ivec2 lo = max(ivec2(floor((center - radius) / size)), c - window);
+        const ivec2 hi = min(ivec2(floor((center + radius) / size)), c + window - 1);
+        if (any(greaterThan(lo, hi))) continue;
+        const uint width = uint(hi.x - lo.x + 1), count = width * uint(hi.y - lo.y + 1);
+        for (uint k = lane; k < count; k += 64u) {
+            const ivec2 page = lo + ivec2(k % width, k / width);
+            const uint slot = vsm_slot(level, page);
+            if (vsm_entries[slot].phys != vsm_none && vsm_entries[slot].tag == vsm_tag(page))
+                atomicOr(vsm_entries[slot].flags, vsm_dirty);
+        }
+    }
+}
+
+void main() {
+    const uint k = gl_GlobalInvocationID.y * 65535u * 64u + gl_GlobalInvocationID.x;
+    const uint pages = frame.vsm_atlas_side * frame.vsm_atlas_side;
+    if (push.level == 3u) {
+        const uint group = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+        if (group >= moving_instances.length()) return;
+        const uint i = moving_instances[group];
+        const Instance now = load_instance(i), then = load_prev_instance(i);
+        const Mesh m = meshes[now.mesh];
+        invalidate(to_world(then, m.bounds.xyz), m.bounds.w * now.scale, gl_LocalInvocationIndex);
+        invalidate(to_world(now, m.bounds.xyz), m.bounds.w * now.scale, gl_LocalInvocationIndex);
+    } else if (push.level == 0u) {
+        if (k >= vsm_slots) return;
+        const VsmEntry e = vsm_entries[k];
+        const uint tag = vsm_tag(vsm_slot_page(k));
+        const bool resident = e.phys != vsm_none && e.tag == tag;
+        if (e.phys != vsm_none && !resident) {
+            vsm_phys[e.phys].owner = vsm_none;
+            vsm_entries[k].phys = vsm_none;
+        }
+        if (e.needed != frame.frame_index) return;
+        if (resident) {
+            vsm_phys[e.phys].last_used = frame.frame_index;
+            if (e.flags != 0u) {
+                vsm_entries[k].flags = 0u;
+                if ((e.flags & vsm_provisional) != 0u) render(k, vsm_still);
+                if ((e.flags & vsm_dirty) != 0u) render(k, vsm_moving);
+            }
+        } else {
+            vsm_list[atomicAdd(vsm_request_count, 1u)] = k;
+        }
+    } else if (push.level == 1u) {
+        if (k >= pages) return;
+        const VsmPhys p = vsm_phys[k];
+        if (p.last_used == frame.frame_index) return;
+        if (p.owner == vsm_none) vsm_list[vsm_slots + atomicAdd(vsm_unowned_count, 1u)] = k;
+        else vsm_list[2u * vsm_slots + atomicAdd(vsm_evictable_count, 1u)] = k;
+    } else {
+        if (k >= vsm_request_count) return;
+        const uint unowned = vsm_unowned_count;
+        if (k >= unowned + vsm_evictable_count) {
+            atomicAdd(vsm_overflow, 1u);
+            return;
+        }
+        const uint p = k < unowned ? vsm_list[vsm_slots + k] : vsm_list[2u * vsm_slots + k - unowned];
+        // The old page was not needed this frame, so nothing else touches it.
+        const uint old = vsm_phys[p].owner;
+        if (old != vsm_none) vsm_entries[old].phys = vsm_none;
+        const uint slot = vsm_list[k];
+        vsm_entries[slot] = VsmEntry(vsm_tag(vsm_slot_page(slot)), p, frame.frame_index, 0u);
+        vsm_phys[p] = VsmPhys(slot, frame.frame_index);
+        render_new(slot);
+    }
+}

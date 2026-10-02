@@ -1,0 +1,49 @@
+#version 460
+// Instance culling for the shadow pages: one invocation per instance, for
+// each level with pages to render that the instance's sphere reaches. The
+// level of detail is the camera's rule seen orthographically: a cluster's
+// error in texels of that level, against the same threshold.
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 64) in;
+
+const uint big_pieces = 16u;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.y * 65535u * 64u + gl_GlobalInvocationID.x;
+    if (i >= frame.instance_count) return;
+    const Instance inst = load_instance(i);
+    const Mesh m = meshes[inst.mesh];
+    const vec2 center = vsm_light_space(to_world(inst, m.bounds.xyz)).xy;
+    const float radius = m.bounds.w * inst.scale;
+    // Still instances draw into the still layer, moving ones into the moving.
+    const uint layer = inst.anim != 0u ? vsm_moving : vsm_still;
+    uint levels = vsm_rendered_levels[layer];
+    while (levels != 0u) {
+        const uint level = findLSB(levels);
+        levels &= levels - 1u;
+        if (!vsm_touches(layer, level, center, radius)) continue;
+        const float limit = frame.lod_threshold * vsm_texel(level) / inst.scale;
+        uint lo = 0, hi = m.cluster_count;
+        while (lo < hi) {
+            const uint mid = (lo + hi) / 2;
+            if (clusters[m.first_cluster + mid].parent_error > limit) hi = mid;
+            else lo = mid + 1;
+        }
+        const uint chunks = (m.cluster_count - lo + 63u) / 64u;
+        if (chunks == 0u) continue;
+        const uint tagged = i | (level << 24) | (layer << 28);
+        if (chunks > big_pieces) {
+            const uint b = atomicAdd(vsm_big_count, 1u);
+            if (b >= vsm_big_capacity) continue;
+            const uint at = frame.max_work_items + 2u * b;
+            vsm_work[at] = uvec2(tagged, m.first_cluster + lo);
+            vsm_work[at + 1u] = uvec2(chunks, 0u);
+            continue;
+        }
+        const uint base = atomicAdd(vsm_work_count, chunks);
+        for (uint c = 0u; c < chunks && base + c < frame.max_work_items; ++c)
+            vsm_work[base + c] = uvec2(tagged, m.first_cluster + lo + 64u * c);
+    }
+}

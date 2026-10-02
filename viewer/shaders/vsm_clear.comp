@@ -1,0 +1,16 @@
+#version 460
+// Empties the layers of physical pages about to be rendered: a workgroup
+// per page and layer.
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    const uint k = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (k >= vsm_render_count) return;
+    const uint entry = vsm_list[3u * vsm_slots + k];
+    const uint phys = vsm_entries[entry & 0x7fffffffu].phys;
+    for (uint t = gl_LocalInvocationIndex; t < vsm_page * vsm_page; t += 256u)
+        vsm_atlas[vsm_atlas_index(phys, uvec2(t % vsm_page, t / vsm_page), entry >> 31)] = 0u;
+}

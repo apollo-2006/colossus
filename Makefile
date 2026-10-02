@@ -22,12 +22,14 @@ colossus_build: tools/colossus_build.cpp $(LIB_OBJS)
 SHADERS = $(wildcard viewer/shaders/*.comp viewer/shaders/*.task viewer/shaders/*.mesh viewer/shaders/*.frag)
 SPIRV = $(patsubst viewer/shaders/%,$(OBJ_DIR)/shaders/%.inc,$(SHADERS))
 
-$(OBJ_DIR)/shaders/%.inc: viewer/shaders/% viewer/shaders/common.glsl
+SHADER_INCLUDES = $(wildcard viewer/shaders/*.glsl)
+
+$(OBJ_DIR)/shaders/%.inc: viewer/shaders/% $(SHADER_INCLUDES)
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -O -mfmt=num -o $@ $<
 
 # shade.comp a second time, tracing shadows with ray queries.
-$(OBJ_DIR)/shaders/shade_rt.comp.inc: viewer/shaders/shade.comp viewer/shaders/common.glsl
+$(OBJ_DIR)/shaders/shade_rt.comp.inc: viewer/shaders/shade.comp $(SHADER_INCLUDES)
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -DRAY_QUERY -O -mfmt=num -o $@ $<
 

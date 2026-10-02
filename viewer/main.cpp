@@ -39,6 +39,30 @@
 
 namespace {
 
+const uint32_t vsm_mark_spv[] = {
+#include "vsm_mark.comp.inc"
+};
+const uint32_t vsm_alloc_spv[] = {
+#include "vsm_alloc.comp.inc"
+};
+const uint32_t vsm_clear_spv[] = {
+#include "vsm_clear.comp.inc"
+};
+const uint32_t vsm_args_spv[] = {
+#include "vsm_args.comp.inc"
+};
+const uint32_t vsm_instance_spv[] = {
+#include "vsm_instance.comp.inc"
+};
+const uint32_t vsm_expand_spv[] = {
+#include "vsm_expand.comp.inc"
+};
+const uint32_t vsm_cluster_spv[] = {
+#include "vsm_cluster.comp.inc"
+};
+const uint32_t vsm_raster_spv[] = {
+#include "vsm_raster.comp.inc"
+};
 const uint32_t cell_cull_spv[] = {
 #include "cell_cull.comp.inc"
 };
@@ -83,10 +107,14 @@ const uint32_t hzb_spv[] = {
 };
 
 constexpr uint32_t frames_in_flight = 2;
+// vsm.glsl's sizes.
+constexpr uint32_t vsm_levels = 12, vsm_window = 32, vsm_page = 128, vsm_slots = vsm_levels * vsm_window * vsm_window;
+constexpr uint32_t vsm_lists_header = 8 + 8 * vsm_levels + 2 * vsm_levels * vsm_window, vsm_big_capacity = 65536;
 constexpr uint32_t max_work_items = 1u << 22;
 constexpr uint32_t max_visible = 1u << 22;  // Leaves 7 bits for the triangle in a 32-bit id... and 3 to spare
-constexpr const char* mode_names[] = {"shaded", "clusters", "triangles", "LOD level", "groups", "instances", "holes", "rasterizer"};
-constexpr uint32_t mode_count = 8;
+constexpr const char* mode_names[] = {"shaded", "clusters", "triangles", "LOD level", "groups", "instances", "holes", "rasterizer",
+                                      "shadow levels"};
+constexpr uint32_t mode_count = 9;
 
 // Laid out as viewer/shaders/common.glsl declares them (scalar layout).
 struct gpu_mesh {
@@ -139,7 +167,7 @@ struct gpu_frame {
     uint32_t max_requests;
     float scene_top;
     float prev_time;
-    uint32_t pad12;
+    uint32_t vsm_atlas_side;
     float shadow_lod_error[4];
     float prev_view_proj[16];
     uint32_t taa_valid;
@@ -150,6 +178,8 @@ struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
     uint32_t work_overflow, visible_overflow;
     uint32_t instances_occluded, clusters_occluded, clusters_late, clusters_software;
+    uint32_t vsm_rendered, vsm_overflow;  // Copied from vsm.glsl's lists, not counted by the shaders
+    uint32_t vsm_work, vsm_big, vsm_visible;
 };
 // common.glsl's DrawArgs, for its size and where pass 2's instance
 // culling arguments sit.
@@ -168,7 +198,8 @@ struct gpu_push {
 
 constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
                    flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64, flag_full_res_shadows = 128, flag_taa = 256,
-                   flag_moving = 512;  // Some instances move: see animate() in common.glsl
+                   flag_moving = 512,  // Some instances move: see animate() in common.glsl
+                   flag_vsm = 1024;    // Shadows from virtual shadow maps (vsm.glsl), not rays
 // Shadows are traced against cuts of each model, the finest within each of
 // these budgets: rays from far surfaces use the coarser ones (see
 // trace_surface() in surface.glsl).
@@ -195,6 +226,8 @@ struct options {
     bool cull_only = false;
     float sw_pixels = 32;
     uint64_t pool_mb = 1024;   // The page pool
+    bool vsm = true;           // Shadows from virtual shadow maps, not ray queries (--shadows rt)
+    uint32_t vsm_side = 32;    // Physical shadow pages a side: 32 is 1024 pages, 128 MB (two layers)
     uint64_t upload_mb = 64;   // Pages loaded per frame, at most
     int warmup = 0;            // Headless: frames drawn before timing starts
     float fly = 0;             // Headless: move the camera this far forward each frame, turning slowly
@@ -465,8 +498,8 @@ std::string human(double v) {
 class renderer {
 public:
     renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, uint64_t pool_bytes, uint64_t upload_bytes,
-             unsigned loader_threads, bool prefetch, bool cull_only = false)
-        : ctx_(ctx), sc_(sc), cull_only_(cull_only), upload_bytes_(upload_bytes),
+             unsigned loader_threads, bool prefetch, bool cull_only = false, uint32_t vsm_side = 32)
+        : ctx_(ctx), sc_(sc), cull_only_(cull_only), upload_bytes_(upload_bytes), vsm_side_(vsm_side),
           streamer_(sc.pages, sc.deps, pool_bytes, loader_threads, prefetch ? sc.children : std::vector<uint32_t>{}) {
         create_static_buffers();
         create_descriptors();
@@ -501,10 +534,13 @@ public:
             for (vk::buffer* b : {&f.staging, &f.request_readback, &f.used_readback}) ctx_.destroy(*b);
         for (vk::buffer* b : {&clusters_, &page_table_, &pool_buffer_, &page_used_, &requests_, &request_stamp_, &shadow_positions_, &meshes_,
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_,
-                              &cells_, &cell_lists_})
+                              &cells_, &cell_lists_, &vsm_entries_, &vsm_phys_, &vsm_lists_, &vsm_atlas_, &vsm_work_,
+                              &vsm_visible_, &vsm_args_, &moving_instances_})
             ctx_.destroy(*b);
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
-        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_, cell_cull_})
+        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_, cell_cull_,
+                            vsm_mark_, vsm_alloc_, vsm_clear_, vsm_args_pipeline_, vsm_instance_, vsm_expand_, vsm_cluster_,
+                            vsm_raster_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
         for (accel* a : {&tlas_, &tlas_moving_}) {
@@ -603,7 +639,7 @@ public:
         gpu_stats stats{};
         // Pass 1 culling, pass 1 drawing, both pyramids and pass 2, shading,
         // and the total: from the frame that last used this slot.
-        double ms[5] = {};
+        double ms[6] = {};  // The last is the total
         streamer::stats_t streaming;
         double streaming_ms = 0;  // Render thread time in the streamer this frame
         bool valid = false;
@@ -625,8 +661,8 @@ public:
             if (vkGetQueryPoolResults(ctx_.device, f.queries, 0, timestamp_count, sizeof ts, ts, sizeof(uint64_t),
                                       VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
                 const double tick = ctx_.properties.limits.timestampPeriod * 1e-6;
-                for (int k = 0; k < 4; ++k) result.ms[k] = (ts[k + 1] - ts[k]) * tick;
-                result.ms[4] = (ts[4] - ts[0]) * tick;
+                for (int k = 0; k < 5; ++k) result.ms[k] = (ts[k + 1] - ts[k]) * tick;
+                result.ms[5] = (ts[5] - ts[0]) * tick;
                 result.valid = true;
             }
         }
@@ -657,6 +693,8 @@ public:
         gpu_frame fr = frame_in;
         fr.prev_time = history_valid_ ? prev_time_ : fr.time;
         if (sc_.moving) fr.flags |= flag_moving;
+        fr.vsm_atlas_side = vsm_side_;
+
         prev_time_ = fr.time;
         // Temporal antialiasing: each frame's projection is nudged by a
         // sub-pixel offset, the Halton (2, 3) sequence over eight frames,
@@ -727,6 +765,10 @@ public:
         vkCmdFillBuffer(cmd, vis_.handle, 0, VK_WHOLE_SIZE, 0);
         vkCmdFillBuffer(cmd, work_.handle, 0, 32, 0);  // Both passes' counts, the late counts and the big counts
         vkCmdFillBuffer(cmd, cell_lists_.handle, 0, 16, 0);
+        if (fr.flags & flag_vsm) {
+            vkCmdFillBuffer(cmd, vsm_lists_.handle, 0, 4 * vsm_lists_header, 0);
+            vkCmdFillBuffer(cmd, vsm_work_.handle, 0, 16, 0);
+        }
         vkCmdFillBuffer(cmd, visible_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, f.stats.handle, 0, sizeof(gpu_stats), 0);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -734,7 +776,7 @@ public:
 
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &f.set, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &f.set, 0, nullptr);
-        if (tlas_scratch_address_ && (fr.flags & flag_shadows)) update_shadow_scene(cmd);
+        if (tlas_scratch_address_ && (fr.flags & flag_shadows) && !(fr.flags & flag_vsm)) update_shadow_scene(cmd);
         vk::transition(cmd, depth_.handle, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
@@ -753,7 +795,9 @@ public:
         vk::transition(cmd, color_.handle, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                        VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
-        if (shadow_ && (frame_in.flags & flag_shadows) && !(frame_in.flags & flag_full_res_shadows)) {
+        if ((fr.flags & flag_vsm) && (fr.flags & flag_shadows)) update_shadow_pages(cmd, f);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 4);
+        if (shadow_ && (frame_in.flags & flag_shadows) && !(frame_in.flags & flag_full_res_shadows) && !(fr.flags & flag_vsm)) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadow_);
             vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
             vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
@@ -766,7 +810,7 @@ public:
         // Into this slot's history image, from the other's (last frame's).
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, taa_);
         vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 4);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 5);
         const VkImage out = history_[size_t(&f - slots_.data())].handle;
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -845,7 +889,7 @@ public:
     }
 
 private:
-    static constexpr uint32_t timestamp_count = 5;
+    static constexpr uint32_t timestamp_count = 6;
 
     struct frame_slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -868,6 +912,60 @@ private:
 
     vk::buffer clusters_, page_table_, pool_buffer_, page_used_, requests_, request_stamp_, shadow_positions_, meshes_, instances_;
     vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_, cells_, cell_lists_;
+    // Virtual shadow maps: see vsm.glsl.
+    uint32_t vsm_side_ = 1;
+    vk::buffer vsm_entries_, vsm_phys_, vsm_lists_, vsm_atlas_, vsm_work_, vsm_visible_, vsm_args_, moving_instances_;
+    VkPipeline vsm_mark_ = VK_NULL_HANDLE, vsm_alloc_ = VK_NULL_HANDLE, vsm_clear_ = VK_NULL_HANDLE, vsm_args_pipeline_ = VK_NULL_HANDLE,
+               vsm_instance_ = VK_NULL_HANDLE, vsm_expand_ = VK_NULL_HANDLE, vsm_cluster_ = VK_NULL_HANDLE, vsm_raster_ = VK_NULL_HANDLE;
+
+    void compute_barrier(VkCommandBuffer cmd) {
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+    }
+
+    // Brings the shadow pages this frame needs up to date (see vsm.glsl):
+    // marks them from the visibility buffer, gives the missing ones
+    // physical pages, and renders those and any invalidated ones.
+    void update_shadow_pages(VkCommandBuffer cmd, frame_slot& f) {
+        auto run = [&](VkPipeline p, uint32_t step, uint32_t groups) {
+            const gpu_push push{0, step};
+            vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+            vkCmdDispatch(cmd, std::min(groups, 65535u), (groups + 65534) / 65535, 1);
+            compute_barrier(cmd);
+        };
+        auto run_indirect = [&](VkPipeline p, VkDeviceSize offset) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+            vkCmdDispatchIndirect(cmd, vsm_args_.handle, offset);
+            compute_barrier(cmd);
+        };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vsm_mark_);
+        vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
+        compute_barrier(cmd);
+        if (sc_.moving) run(vsm_alloc_, 3, uint32_t(sc_.moving));
+        run(vsm_alloc_, 0, (vsm_slots + 63) / 64);
+        run(vsm_alloc_, 1, (vsm_side_ * vsm_side_ + 63) / 64);
+        run(vsm_alloc_, 2, (vsm_slots + 63) / 64);
+        run(vsm_args_pipeline_, 0, 1);
+        run_indirect(vsm_clear_, 16);
+        run_indirect(vsm_instance_, 0);
+        run(vsm_args_pipeline_, 1, 1);
+        run_indirect(vsm_expand_, 32);
+        run(vsm_args_pipeline_, 2, 1);
+        run_indirect(vsm_cluster_, 48);
+        run(vsm_args_pipeline_, 3, 1);
+        run_indirect(vsm_raster_, 64);
+        // How many pages were rendered, and how many found no physical page.
+        const VkBufferCopy counts[2] = {{12, offsetof(gpu_stats, vsm_rendered), 4}, {24, offsetof(gpu_stats, vsm_overflow), 4}};
+        vkCmdCopyBuffer(cmd, vsm_lists_.handle, f.stats.handle, 2, counts);
+        const VkBufferCopy work_counts{0, offsetof(gpu_stats, vsm_work), 12};
+        vkCmdCopyBuffer(cmd, vsm_work_.handle, f.stats.handle, 1, &work_counts);
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+        const gpu_push back{0, 0};
+        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof back, &back);
+    }
     vk::image depth_, color_, hzb_image_;
     std::vector<VkImageView> hzb_views_;
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -1088,6 +1186,25 @@ private:
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
         cells_ = ctx_.upload(sc_.cells, ssbo);
+        const VkBufferUsageFlags filled = ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        vsm_entries_ = ctx_.make_buffer(16ull * vsm_slots, filled, false);
+        vsm_phys_ = ctx_.make_buffer(8ull * vsm_side_ * vsm_side_, filled, false);
+        vsm_lists_ = ctx_.make_buffer(4ull * (vsm_lists_header + 5 * vsm_slots), filled | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
+        // Two layers: still instances, moving instances.
+        vsm_atlas_ = ctx_.make_buffer(2 * 4ull * vsm_side_ * vsm_side_ * vsm_page * vsm_page, ssbo, false);
+        vsm_work_ = ctx_.make_buffer(16 + 8ull * (max_work_items + 2 * vsm_big_capacity), filled | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
+        vsm_visible_ = ctx_.make_buffer(8ull * max_visible, ssbo, false);
+        vsm_args_ = ctx_.make_buffer(80, ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
+        std::vector<uint32_t> moving;
+        for (uint32_t i = 0; i < sc_.instances.size(); ++i)
+            if (sc_.instances[i].anim) moving.push_back(i);
+        if (moving.empty()) moving.push_back(0);  // A buffer cannot be empty; nothing reads it then
+        moving_instances_ = ctx_.upload(moving, ssbo);
+        // Every slot empty, every physical page free (vsm_none is all ones).
+        ctx_.submit([&](VkCommandBuffer cmd) {
+            vkCmdFillBuffer(cmd, vsm_entries_.handle, 0, VK_WHOLE_SIZE, 0xffffffffu);
+            vkCmdFillBuffer(cmd, vsm_phys_.handle, 0, VK_WHOLE_SIZE, 0xffffffffu);
+        });
         cell_lists_ = ctx_.make_buffer(16 + 3 * 4 * uint64_t(sc_.cells.size()), ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         work_ = ctx_.make_buffer(32 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         visible_ = ctx_.make_buffer(16 + uint64_t(max_visible) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
@@ -1256,7 +1373,7 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 26; ++i) {
+        for (uint32_t i = 0; i <= 34; ++i) {
             if ((i == 18 || i == 23 || i == 24) && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
@@ -1275,7 +1392,7 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 28 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (2 + max_hzb_levels) * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2 * frames_in_flight}};
@@ -1296,10 +1413,11 @@ private:
                                            nullptr,    &f.stats,   &draw_args_,  nullptr,         &late_instances_,
                                            &late_clusters_, nullptr, nullptr,   nullptr,         &request_stamp_,
                                            nullptr,         nullptr, nullptr,   as_moving_.handle ? &as_moving_ : nullptr,
-                                           nullptr,         &cells_, &cell_lists_};
-            VkDescriptorBufferInfo infos[27];
+                                           nullptr,         &cells_, &cell_lists_, &vsm_entries_, &vsm_phys_, &vsm_lists_,
+                                           &vsm_atlas_,     &vsm_work_, &vsm_visible_, &vsm_args_, &moving_instances_};
+            VkDescriptorBufferInfo infos[35];
             std::vector<VkWriteDescriptorSet> writes;
-            for (uint32_t i = 0; i < 27; ++i) {
+            for (uint32_t i = 0; i < 35; ++i) {
                 if (!buffers[i]) continue;  // The visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1355,6 +1473,14 @@ private:
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
         expand_ = compute_pipeline(expand_spv, sizeof expand_spv);
         cell_cull_ = compute_pipeline(cell_cull_spv, sizeof cell_cull_spv);
+        vsm_mark_ = compute_pipeline(vsm_mark_spv, sizeof vsm_mark_spv);
+        vsm_alloc_ = compute_pipeline(vsm_alloc_spv, sizeof vsm_alloc_spv);
+        vsm_clear_ = compute_pipeline(vsm_clear_spv, sizeof vsm_clear_spv);
+        vsm_args_pipeline_ = compute_pipeline(vsm_args_spv, sizeof vsm_args_spv);
+        vsm_instance_ = compute_pipeline(vsm_instance_spv, sizeof vsm_instance_spv);
+        vsm_expand_ = compute_pipeline(vsm_expand_spv, sizeof vsm_expand_spv);
+        vsm_cluster_ = compute_pipeline(vsm_cluster_spv, sizeof vsm_cluster_spv);
+        vsm_raster_ = compute_pipeline(vsm_raster_spv, sizeof vsm_raster_spv);
         if (ctx_.ray_query) tlas_update_ = compute_pipeline(tlas_spv, sizeof tlas_spv);
         args_ = compute_pipeline(args_spv, sizeof args_spv);
         shade_ = ctx_.ray_query ? compute_pipeline(shade_rt_spv, sizeof shade_rt_spv) : compute_pipeline(shade_spv, sizeof shade_spv);
@@ -1583,17 +1709,24 @@ void move_camera(GLFWwindow* w, view_state& v, float dt) {
 
 std::string stats_line(const renderer::frame_result& r, const view_state& v, size_t instances) {
     char b[400];
-    std::snprintf(b, sizeof b, "%.2f ms (cull %.2f, raster %.2f, pass 2 %.2f, shade %.2f) | %s tris, %s clusters (%s software, %s late) | %u/%zu instances | %.3gpx | %s%s%s%s%s%s",
-                  r.ms[4], r.ms[0], r.ms[1], r.ms[2], r.ms[3], human(r.stats.triangles_drawn).c_str(),
+    std::snprintf(b, sizeof b, "%.2f ms (cull %.2f, raster %.2f, pass 2 %.2f, shadow pages %.2f, shade %.2f) | %s tris, %s clusters (%s software, %s late) | %u/%zu instances | %.3gpx | %s%s%s%s%s%s",
+                  r.ms[5], r.ms[0], r.ms[1], r.ms[2], r.ms[3], r.ms[4], human(r.stats.triangles_drawn).c_str(),
                   human(r.stats.clusters_drawn).c_str(), human(r.stats.clusters_software).c_str(), human(r.stats.clusters_late).c_str(), r.stats.instances_visible,
                   instances, v.threshold,
                   mode_names[v.mode], v.frozen ? " | FROZEN" : "", (v.flags & flag_cone_culling) ? "" : " | no cone",
                   (v.flags & flag_occlusion) ? "" : " | no occlusion", (v.flags & flag_software_raster) ? "" : " | no software raster",
                   (r.stats.work_overflow || r.stats.visible_overflow) ? " | OVERFLOW" : "");
+    std::string line = b;
+    if (v.flags & flag_vsm) {
+        char sp[160];
+        std::snprintf(sp, sizeof sp, " | shadow pages: %u rendered (%u clusters), %u short", r.stats.vsm_rendered, r.stats.vsm_visible,
+                      r.stats.vsm_overflow);
+        line += sp;
+    }
     const auto& st = r.streaming;
     char m[160];
     std::snprintf(m, sizeof m, " | pages %u/%u%s", st.resident, st.slots, st.waiting ? " (streaming)" : "");
-    return std::string(b) + m;
+    return line + m;
 }
 
 options parse(int argc, char** argv) {
@@ -1621,6 +1754,11 @@ options parse(int argc, char** argv) {
         else if (a == "--no-cone") o.disable |= flag_cone_culling;
         else if (a == "--no-sw") o.disable |= flag_software_raster;
         else if (a == "--no-shadows") o.disable |= flag_shadows;
+        else if (a == "--shadows") {
+            const std::string kind = next();
+            if (kind != "rt" && kind != "vsm") throw std::runtime_error("--shadows takes rt or vsm");
+            o.vsm = kind == "vsm";
+        } else if (a == "--vsm-pages") o.vsm_side = static_cast<uint32_t>(std::stoul(next()));
         else if (a == "--no-taa") o.disable |= flag_taa;
         else if (a == "--full-res-shadows") o.full_res_shadows = true;
         else if (a == "--materials") o.mixed_materials = next() != "plain";
@@ -1666,6 +1804,7 @@ int main(int argc, char** argv) {
         if (opt.wireframe) v.flags |= flag_wireframe;
         if (opt.full_res_shadows) v.flags |= flag_full_res_shadows;
         v.flags &= ~opt.disable;
+        if (opt.vsm) v.flags |= flag_vsm;
         v.sw_max_pixels = opt.sw_pixels;
         const float extent = std::max(1.0f, opt.grid * opt.spacing);
         v.cam.eye = {0, 0.35f + 0.25f * extent, 0.5f + 0.75f * extent};
@@ -1680,7 +1819,8 @@ int main(int argc, char** argv) {
         if (opt.headless) {
             vk::context ctx(nullptr, opt.validate);
             std::printf("GPU: %s\n", ctx.device_name.c_str());
-            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch, opt.cull_only);
+            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch, opt.cull_only,
+                       opt.vsm ? opt.vsm_side : 1);
             std::vector<renderer::frame_result> results;
             const int total = opt.warmup + opt.frames;
             int settled = 0;  // The frame after the last that asked for or waited on a page
@@ -1703,9 +1843,10 @@ int main(int argc, char** argv) {
                 service_ms.push_back(res.streaming_ms);
                 most_resident = std::max(most_resident, res.streaming.resident);
                 if (std::getenv("COLOSSUS_TRACE_STREAMING"))
-                    std::printf("frame %d: requests %u, loaded %u (%.1f MB), waiting %u, resident %u, drawn %u clusters\n", i,
+                    std::printf("frame %d: requests %u, loaded %u (%.1f MB), waiting %u, resident %u, drawn %u clusters, shadow pages %u (%u clusters)\n", i,
                                 res.streaming.requested, res.streaming.loaded, res.streaming.bytes_loaded / 1048576.0,
-                                res.streaming.waiting, res.streaming.resident, res.stats.clusters_drawn);
+                                res.streaming.waiting, res.streaming.resident, res.stats.clusters_drawn, res.stats.vsm_rendered,
+                                res.stats.vsm_visible);
                 // Settled: nothing asked for or waiting from here on. (The first
                 // frames ask for nothing only because no requests are back yet.)
                 if (res.streaming.requested != 0 || res.streaming.waiting != 0) settled = i + 1;
@@ -1725,7 +1866,7 @@ int main(int argc, char** argv) {
                         opt.loader_threads ? (std::to_string(opt.loader_threads) + " loader threads").c_str() : "loads on the render thread");
             if (!results.empty()) {
                 // The median frame, by total time.
-                std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[4] < b.ms[4]; });
+                std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[5] < b.ms[5]; });
                 std::printf("%s\n", stats_line(results[results.size() / 2], v, sc.instances.size()).c_str());
                 const auto& s = results[results.size() / 2].stats;
                 std::printf("clusters tested %s, work items %s, hidden by last frame %s, instances hidden %u\n",
@@ -1749,7 +1890,8 @@ int main(int argc, char** argv) {
             glfwGetFramebufferSize(window, &fw, &fh);
             swapchain swap(ctx, opt.vsync);
             swap.create(fw, fh);
-            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch);
+            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch,
+                       false, opt.vsm ? opt.vsm_side : 1);
             std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-8 view (shaded, clusters, triangles, LOD level, groups, instances, holes, rasterizer)\n"
                         "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling,\n"

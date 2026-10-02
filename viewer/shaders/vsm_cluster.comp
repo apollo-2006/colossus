@@ -1,0 +1,53 @@
+#version 460
+// Cluster culling for the shadow pages: one workgroup per piece of work,
+// one invocation per cluster. The level of detail is the camera's rule
+// seen orthographically (errors in texels of the piece's level), and a
+// cluster is kept if its sphere reaches a page being rendered. A cluster
+// standing in for finer clusters not yet loaded asks for them; it and any
+// cluster of the cut not loaded itself mark the pages they reach
+// provisional, so those are rendered again until everything arrives.
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 64) in;
+
+void main() {
+    const uint item = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (item >= min(vsm_work_count, frame.max_work_items)) return;
+    const uvec2 w = vsm_work[item];
+    const uint instance = w.x & 0xffffffu, level = (w.x >> 24) & 15u, layer = w.x >> 28;
+    const Instance inst = load_instance(instance);
+    const Mesh m = meshes[inst.mesh];
+    const uint cluster = w.y + gl_LocalInvocationIndex;
+    if (cluster >= m.first_cluster + m.cluster_count) return;
+    const Cluster c = clusters[cluster];
+    const float texel = vsm_texel(level);
+    const float self_error = c.lod_error * inst.scale / texel;
+    const bool coarse_enough = c.parent_error * inst.scale / texel > frame.lod_threshold;
+    const bool finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
+    const bool wants_finer = self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
+    const bool loaded = page_table[c.group] != NO_PAGE;
+    if (!coarse_enough || (self_error > frame.lod_threshold && finer_resident)) return;
+    const vec2 center = vsm_light_space(to_world(inst, c.center)).xy;
+    const float radius = c.radius * inst.scale;
+    if (!vsm_touches(layer, level, center, radius)) return;
+    // Drawn with a stand-in, or not drawn at all because its own clusters
+    // are not loaded yet (in the first frames, not even the roots): either
+    // way the pages it reaches are not finished, and are rendered again
+    // next frame.
+    // (The moving layer is rendered again every frame anything moves.)
+    if ((wants_finer || !loaded) && layer == vsm_still) {
+        const float size = texel * float(vsm_page);
+        const ivec4 r = vsm_rendered(layer, level);
+        const ivec2 lo = max(ivec2(floor((center - radius) / size)), r.xy);
+        const ivec2 hi = min(ivec2(floor((center + radius) / size)), r.zw);
+        for (int y = lo.y; y <= hi.y; ++y)
+            for (int x = lo.x; x <= hi.x; ++x)
+                if (vsm_in_window(level, ivec2(x, y))) atomicOr(vsm_entries[vsm_slot(level, ivec2(x, y))].flags, vsm_provisional);
+    }
+    if (!loaded) return;
+    page_used[c.group] = frame.frame_index;
+    if (wants_finer) request_finer(c, self_error);
+    const uint k = atomicAdd(vsm_visible_count, 1u);
+    if (k < frame.max_visible) vsm_visible[k] = uvec2(w.x, cluster);
+}

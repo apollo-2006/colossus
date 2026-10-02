@@ -1,0 +1,39 @@
+#version 460
+// Marks the shadow pages this frame's pixels will read: for each pixel
+// that shading will ask about the sun, the page under it at the level
+// whose texels match its footprint, and the pages its filter's taps can
+// reach. The surface comes from the visibility buffer's depth alone.
+#extension GL_EXT_shader_atomic_int64 : require
+#include "common.glsl"
+#include "vsm.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= frame.width || px.y >= frame.height) return;
+    const vec2 ndc = (vec2(px) + 0.5) / vec2(frame.width, frame.height) * 2.0 - 1.0;
+    const vec4 near_point = frame.inv_view_proj * vec4(ndc, 1.0, 1.0);
+    const vec3 origin = frame.origin.xyz;
+    const vec3 dir = normalize(near_point.xyz / near_point.w - origin);
+    const uint64_t v = vis[px.x + px.y * frame.width];
+    float t;
+    if (v != 0ul) {
+        const vec4 center = frame.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
+        const vec3 forward = normalize(center.xyz / center.w - origin);
+        t = frame.near_z / uintBitsToFloat(uint(v >> 32)) / dot(dir, forward);
+    } else if (dir.y < 0.0) {
+        t = -origin.y / dir.y;  // The ground
+    } else {
+        return;  // The sky
+    }
+    const uint level = vsm_level_for(t);
+    const vec2 texel = vsm_light_space(origin + dir * t).xy / vsm_texel(level);
+    // The filter reads a texel either side, and the lookup moves the point
+    // off the surface by a couple of texels: mark three either way.
+    for (int k = 0; k < 4; ++k) {
+        const vec2 corner = texel + vec2(k & 1, k >> 1) * 6.0 - 3.0;
+        const ivec2 page = ivec2(floor(corner / float(vsm_page)));
+        if (vsm_in_window(level, page)) vsm_entries[vsm_slot(level, page)].needed = frame.frame_index;
+    }
+}

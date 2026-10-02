@@ -77,7 +77,7 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     uint max_requests;
     float scene_top;  // The highest point of any instance: no shadow ray need climb above it
     float prev_time;      // Last frame's time
-    uint pad12;
+    uint vsm_atlas_side;  // Physical pages a side of the virtual shadow map atlas (vsm.glsl)
     vec4 shadow_lod_error;  // Each shadow copy's largest error over the models
     mat4 prev_view_proj;    // Last frame's, without its sub-pixel offset: for taa.comp
     uint taa_valid;         // Last frame's image fits this one
@@ -94,6 +94,7 @@ const uint flag_software_raster = 32u;
 const uint flag_shadows = 64u;
 const uint flag_full_res_shadows = 128u;  // Every pixel traces its own ray
 const uint flag_taa = 256u;
+const uint flag_vsm = 1024u;  // Shadows from the virtual shadow maps (vsm.glsl), not rays
 const uint flag_moving = 512u;  // Some instances move: shadow rays also test shadow_moving
 
 // Which pass this is (0 or 1), and for the pyramid builder, which level.
@@ -382,6 +383,9 @@ void request_finer(Cluster c, float priority) {
     const uint k = atomicAdd(request_count, 1u);
     if (k < frame.max_requests) requests[k] = uvec2(c.creator, floatBitsToUint(priority));
 }
+
+const vec3 sun_dir = normalize(vec3(0.75, 0.5, 0.3));  // Toward the sun
+const vec3 sun_color = vec3(1.0, 0.92, 0.82) * 1.7;
 
 uint hash(uint x) {
     x ^= x >> 16;
