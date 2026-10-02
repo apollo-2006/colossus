@@ -78,6 +78,10 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     float scene_top;  // The highest point of any instance: no shadow ray need climb above it
     uint pad11, pad12;
     vec4 shadow_lod_error;  // Each shadow copy's largest error over the models
+    mat4 prev_view_proj;    // Last frame's, without its sub-pixel offset: for taa.comp
+    uint taa_valid;         // Last frame's image fits this one
+    vec2 jitter;            // This frame's sub-pixel offset, in clip space
+    uint pad15;
 } frame;
 
 const uint flag_cone_culling = 1u;
@@ -88,6 +92,7 @@ const uint flag_prev_valid = 16u;  // Last frame's pyramid fits this frame
 const uint flag_software_raster = 32u;
 const uint flag_shadows = 64u;
 const uint flag_full_res_shadows = 128u;  // Every pixel traces its own ray
+const uint flag_taa = 256u;
 
 // Which pass this is (0 or 1), and for the pyramid builder, which level.
 layout(push_constant, scalar) uniform Push {
@@ -259,9 +264,11 @@ bool occluded(vec3 center, float radius) {
     c.z = -c.z;
     vec4 aabb;
     if (!project_sphere(c, radius, aabb)) return false;
+    // A pixel's margin: frames are drawn with a sub-pixel offset (taa.comp),
+    // which the projection above leaves out.
     const vec2 screen = vec2(frame.width, frame.height);
-    const vec2 lo = clamp(aabb.xy, 0.0, 1.0) * screen;
-    const vec2 hi = clamp(aabb.zw, 0.0, 1.0) * screen - 0.5;
+    const vec2 lo = max(clamp(aabb.xy, 0.0, 1.0) * screen - 1.0, vec2(0.0));
+    const vec2 hi = min(clamp(aabb.zw, 0.0, 1.0) * screen + 0.5, screen - 0.5);
     // The finest level at which the rectangle spans at most 2x2 texels.
     int level = 0;
     ivec2 t0, t1;

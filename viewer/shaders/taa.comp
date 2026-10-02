@@ -1,0 +1,97 @@
+#version 460
+// Temporal antialiasing. Every frame is drawn with the projection nudged
+// by a different sub-pixel offset (a Halton sequence, in main.cpp); this
+// pass blends each pixel with what was there last frame, so edges settle
+// to the average over the offsets: about eight samples a pixel.
+//
+// Last frame's color for a pixel is found by reprojection: the surface
+// under it (its depth, from the visibility buffer) is projected with last
+// frame's camera. The scene does not move, so that is exact but for
+// disocclusion, which the clamp below handles: last frame's color is held
+// to the range of this frame's 3 x 3 neighbourhood (in YCoCg), so what
+// was not there before cannot bleed in.
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 13, rgba16f) uniform readonly image2D current;
+layout(set = 0, binding = 21) uniform sampler2D history;
+layout(set = 0, binding = 22, rgba16f) uniform writeonly image2D resolved;
+
+vec3 to_ycocg(vec3 c) {
+    return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 from_ycocg(vec3 c) {
+    return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+// Last frame's image at uv, through a Catmull-Rom filter: sharper than
+// bilinear, which would blur the history a little more every frame the
+// camera moves. Five bilinear fetches (the corners of the 4 x 4 footprint
+// carry little weight and are left out), after Jimenez's SMAA 1TX filter.
+vec3 history_at(vec2 uv) {
+    const vec2 size = vec2(frame.width, frame.height);
+    const vec2 p = uv * size;
+    const vec2 center = floor(p - 0.5) + 0.5;
+    const vec2 f = p - center;
+    const vec2 f2 = f * f, f3 = f2 * f;
+    const vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+    const vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    const vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    const vec2 w3 = 0.5 * f3 - 0.5 * f2;
+    const vec2 w12 = w1 + w2;
+    const vec2 t0 = (center - 1.0) / size, t3 = (center + 2.0) / size;
+    const vec2 t12 = (center + w2 / w12) / size;
+    vec3 c = texture(history, vec2(t12.x, t0.y)).rgb * (w12.x * w0.y);
+    c += texture(history, vec2(t0.x, t12.y)).rgb * (w0.x * w12.y);
+    c += texture(history, t12).rgb * (w12.x * w12.y);
+    c += texture(history, vec2(t3.x, t12.y)).rgb * (w3.x * w12.y);
+    c += texture(history, vec2(t12.x, t3.y)).rgb * (w12.x * w3.y);
+    const float w = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(c / w, vec3(0.0));
+}
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(frame.width) || px.y >= int(frame.height)) return;
+    const vec3 c = imageLoad(current, px).rgb;
+    if ((frame.flags & flag_taa) == 0u || frame.taa_valid == 0u || frame.debug_mode != 0u) {
+        imageStore(resolved, px, vec4(c, 1.0));
+        return;
+    }
+    vec3 lo = to_ycocg(c), hi = lo;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            const ivec2 q = clamp(px + ivec2(x, y), ivec2(0), ivec2(frame.width, frame.height) - 1);
+            const vec3 n = to_ycocg(imageLoad(current, q).rgb);
+            lo = min(lo, n);
+            hi = max(hi, n);
+        }
+
+    // Where the surface under this pixel was on screen last frame.
+    const vec2 ndc = (vec2(px) + 0.5) / vec2(frame.width, frame.height) * 2.0 - 1.0;
+    const vec4 near_point = frame.inv_view_proj * vec4(ndc, 1.0, 1.0);
+    const vec3 dir = normalize(near_point.xyz / near_point.w - frame.origin.xyz);
+    const uint64_t v = vis[px.x + px.y * int(frame.width)];
+    vec4 prev;
+    if (v != 0ul) {
+        const vec4 center = frame.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
+        const vec3 forward = normalize(center.xyz / center.w - frame.origin.xyz);
+        const float t = frame.near_z / uintBitsToFloat(uint(v >> 32)) / dot(dir, forward);
+        prev = frame.prev_view_proj * vec4(frame.origin.xyz + dir * t, 1.0);
+    } else if (dir.y < 0.0) {
+        prev = frame.prev_view_proj * vec4(frame.origin.xyz + dir * (-frame.origin.y / dir.y), 1.0);
+    } else {
+        prev = frame.prev_view_proj * vec4(dir, 0.0);  // The sky: a direction, at infinity
+    }
+    // The surface was found along the nudged ray; taking the nudge back
+    // out means a still camera reads its history at the pixel's center,
+    // so it is not resampled, and blurred, a little more every frame.
+    const vec2 uv = (prev.xy / prev.w + frame.jitter) * 0.5 + 0.5;
+    if (prev.w <= 0.0 || any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        imageStore(resolved, px, vec4(c, 1.0));
+        return;
+    }
+    const vec3 h = from_ycocg(clamp(to_ycocg(history_at(uv)), lo, hi));
+    imageStore(resolved, px, vec4(mix(h, c, 0.1), 1.0));
+}
