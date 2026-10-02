@@ -109,6 +109,8 @@ const uint32_t hzb_spv[] = {
 constexpr uint32_t frames_in_flight = 2;
 // vsm.glsl's sizes.
 constexpr uint32_t vsm_levels = 14, vsm_window = 32, vsm_page = 128, vsm_slots = vsm_levels * vsm_window * vsm_window;
+constexpr uint32_t vsm_profile_steps = 6;
+constexpr const char* vsm_profile_names[vsm_profile_steps] = {"mark", "alloc", "clear", "instances", "clusters", "raster"};
 constexpr uint32_t vsm_lists_header = 8 + 8 * vsm_levels + 2 * vsm_levels * vsm_window, vsm_big_capacity = 65536;
 constexpr uint32_t max_work_items = 1u << 22;
 constexpr uint32_t max_visible = 1u << 22;  // leaves 7 bits for the triangle in a 32-bit id, and 3 to spare
@@ -700,6 +702,7 @@ public:
         // pass 1 culling, pass 1 drawing, pyramids and pass 2, shadow pages, shading, then the
         // total: from the frame that last used this slot.
         double ms[6] = {};  // the last is the total
+        double vsm_ms[vsm_profile_steps] = {};  // COLOSSUS_PROFILE_VSM: shadow passes (vsm_profile_names)
         streamer::stats_t streaming;
         double streaming_ms = 0;  // render thread time in the streamer
         bool valid = false;
@@ -717,11 +720,16 @@ public:
         if (f.used) {
             std::memcpy(&result.stats, f.stats.mapped, sizeof(gpu_stats));
             uint64_t ts[timestamp_count];
-            if (vkGetQueryPoolResults(ctx_.device, f.queries, 0, timestamp_count, sizeof ts, ts, sizeof(uint64_t),
+            // the shadow passes' stamps are written only when profiling.
+            const uint32_t written = profile_vsm_ ? timestamp_count : 6;
+            if (vkGetQueryPoolResults(ctx_.device, f.queries, 0, written, written * sizeof(uint64_t), ts, sizeof(uint64_t),
                                       VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
                 const double tick = ctx_.properties.limits.timestampPeriod * 1e-6;
                 for (int k = 0; k < 5; ++k) result.ms[k] = (ts[k + 1] - ts[k]) * tick;
                 result.ms[5] = (ts[5] - ts[0]) * tick;
+                if (profile_vsm_)
+                    for (uint32_t k = 0; k < vsm_profile_steps; ++k)
+                        result.vsm_ms[k] = (ts[6 + k] - (k == 0 ? ts[3] : ts[6 + k - 1])) * tick;
                 result.valid = true;
             }
         }
@@ -959,7 +967,7 @@ public:
     }
 
 private:
-    static constexpr uint32_t timestamp_count = 6;
+    static constexpr uint32_t timestamp_count = 6 + vsm_profile_steps;
 
     struct frame_slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -997,6 +1005,11 @@ private:
     // updates this frame's shadow pages (vsm.glsl): mark from the visibility buffer, give
     // missing ones physical pages, render those and invalidated ones.
     void update_shadow_pages(VkCommandBuffer cmd, frame_slot& f) {
+        // with COLOSSUS_PROFILE_VSM, a timestamp after each step (vsm_profile_names).
+        uint32_t stamp = 6;
+        auto mark_time = [&] {
+            if (profile_vsm_) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, stamp++);
+        };
         auto run = [&](VkPipeline p, uint32_t step, uint32_t groups) {
             const gpu_push push{0, step};
             vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
@@ -1012,19 +1025,25 @@ private:
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vsm_mark_);
         vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);  // a 2x2 block per invocation
         compute_barrier(cmd);
+        mark_time();
         if (sc_.moving) run(vsm_alloc_, 3, uint32_t(sc_.moving));
         run(vsm_alloc_, 0, (vsm_slots + 63) / 64);
         run(vsm_alloc_, 1, (vsm_side_ * vsm_side_ + 63) / 64);
         run(vsm_alloc_, 2, (vsm_slots + 63) / 64);
         run(vsm_args_pipeline_, 0, 1);
+        mark_time();
         run_indirect(vsm_clear_, 16);
+        mark_time();
         run_indirect(vsm_instance_, 0);
         run(vsm_args_pipeline_, 1, 1);
         run_indirect(vsm_expand_, 32);
+        mark_time();
         run(vsm_args_pipeline_, 2, 1);
         run_indirect(vsm_cluster_, 48);
+        mark_time();
         run(vsm_args_pipeline_, 3, 1);
         run_indirect(vsm_raster_, 64);
+        mark_time();
         // pages rendered, and pages that found no physical page.
         const VkBufferCopy counts[2] = {{12, offsetof(gpu_stats, vsm_rendered), 4}, {24, offsetof(gpu_stats, vsm_overflow), 4}};
         vkCmdCopyBuffer(cmd, vsm_lists_.handle, f.stats.handle, 2, counts);
@@ -1059,6 +1078,7 @@ private:
     float prev_time_ = 0;
     bool history_valid_ = false;
     bool cull_only_ = false;
+    bool profile_vsm_ = std::getenv("COLOSSUS_PROFILE_VSM") != nullptr;
     uint64_t upload_bytes_;
     streamer streamer_;
     uint32_t frame_counter_ = 0;
@@ -1956,6 +1976,16 @@ int main(int argc, char** argv) {
                 // median frame by total time.
                 std::sort(results.begin(), results.end(), [](auto& a, auto& b) { return a.ms[5] < b.ms[5]; });
                 std::printf("%s\n", stats_line(results[results.size() / 2], v, sc.instances.size()).c_str());
+                if (std::getenv("COLOSSUS_PROFILE_VSM")) {
+                    std::printf("shadow passes, medians:");
+                    for (uint32_t k = 0; k < vsm_profile_steps; ++k) {
+                        std::vector<double> m;
+                        for (const auto& r : results) m.push_back(r.vsm_ms[k]);
+                        std::sort(m.begin(), m.end());
+                        std::printf(" %s %.3f", vsm_profile_names[k], m[m.size() / 2]);
+                    }
+                    std::printf(" ms\n");
+                }
                 const auto& s = results[results.size() / 2].stats;
                 std::printf("clusters tested %s, work items %s, hidden by last frame %s, instances hidden %u\n",
                             human(s.clusters_tested).c_str(), human(s.work_items).c_str(), human(s.clusters_occluded).c_str(),
