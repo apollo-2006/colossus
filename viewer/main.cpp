@@ -501,7 +501,7 @@ class renderer {
 public:
     renderer(vk::context& ctx, const scene& sc, uint32_t width, uint32_t height, uint64_t pool_bytes, uint64_t upload_bytes,
              unsigned loader_threads, bool prefetch, bool cull_only = false, uint32_t vsm_side = 32, bool merge_reads = true)
-        : ctx_(ctx), sc_(sc), cull_only_(cull_only), upload_bytes_(upload_bytes), vsm_side_(vsm_side),
+        : ctx_(ctx), sc_(sc), vsm_side_(vsm_side), cull_only_(cull_only), upload_bytes_(upload_bytes),
           streamer_(sc.pages, sc.deps, pool_bytes, loader_threads, prefetch ? sc.children : std::vector<uint32_t>{}, merge_reads) {
         create_static_buffers();
         create_descriptors();

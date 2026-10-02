@@ -188,15 +188,15 @@ private:
         std::vector<std::shared_ptr<job>> jobs;
     };
     // pages issued in one frame merge into a read when the gap between them is at most this
-    // (read and dropped), up to max_run bytes: the file is laid out depth first, so a request
-    // and the pages prefetched below it are mostly neighbours.
+    // (read and dropped), up to max_run bytes: the file keeps each level's groups together,
+    // and a frame's requests are mostly siblings.
     static constexpr uint64_t max_gap = 64 << 10, max_run = 4 << 20;
     std::vector<std::shared_ptr<job>> batch_;  // issued this frame, not yet read
-    bool merge_reads_ = true;                  // else a read per page
 
     static constexpr size_t max_prefetch = 4096;
     std::vector<stream_page> pages_;
     std::vector<uint32_t> deps_, children_;
+    bool merge_reads_ = true;  // else a read per page
     uint64_t slot_bytes_ = 0;
     uint32_t slot_count_ = 0;
     std::vector<uint32_t> free_;
