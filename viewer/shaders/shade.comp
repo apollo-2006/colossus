@@ -11,6 +11,14 @@
 #include "surface.glsl"
 #include "vsm.glsl"
 
+layout(set = 0, binding = 35, r32f) uniform readonly image2D ao_in;  // ao.comp, half resolution
+
+// ambient occlusion at a full-resolution pixel: the half-resolution texel over it.
+float occlusion(uvec2 px) {
+    if ((frame.flags & flag_ao) == 0u) return 1.0;
+    return imageLoad(ao_in, min(ivec2(px / 2u), imageSize(ao_in) - 1)).x;
+}
+
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D out_image;
 
@@ -81,7 +89,7 @@ float sunlight(uvec2 px, Surface s) {
 }
 
 // lambert plus ggx specular, schlick fresnel, smith shadowing.
-vec3 shade_material(Material m, vec3 n, vec3 v, float lit) {
+vec3 shade_material(Material m, vec3 n, vec3 v, float lit, float ao) {
     const vec3 f0 = mix(vec3(0.04), m.albedo, m.metallic);
     const float nl = max(dot(n, sun_dir), 0.0), nv = max(dot(n, v), 1e-4);
     const vec3 h = normalize(sun_dir + v);
@@ -94,10 +102,10 @@ vec3 shade_material(Material m, vec3 n, vec3 v, float lit) {
     // times pi: the diffuse term drops its 1 / pi.
     const vec3 specular = 3.14159 * d * g * fresnel / max(4.0 * nl * nv, 1e-4);
     const vec3 diffuse = m.albedo * (1.0 - m.metallic) * (1.0 - fresnel);
-    const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42;
+    const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42 * ao;
     // sky in the reflection, fading with roughness.
     const vec3 env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
-    const vec3 env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8;
+    const vec3 env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8 * ao;
     return (diffuse + specular) * sun_color * nl * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
            m.albedo * m.metallic * ambient * 0.5;
 }
@@ -119,10 +127,12 @@ void main() {
         const vec2 cell = abs(fract(s.hit.xz * 0.5) - 0.5);
         const float line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
         const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) *
-                            (sun_color * max(sun_dir.y, 0.0) * 0.6 * sunlight(px, s) + sky(vec3(0, 1, 0)) * 0.45);
+                            (sun_color * max(sun_dir.y, 0.0) * 0.6 * sunlight(px, s) + sky(vec3(0, 1, 0)) * 0.45 * occlusion(px));
         color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
     }
-    if (s.kind != surface_sky && frame.debug_mode == 8u) {
+    if (s.kind != surface_sky && frame.debug_mode == 9u) {
+        color = vec3(occlusion(px));  // ambient occlusion alone
+    } else if (s.kind != surface_sky && frame.debug_mode == 8u) {
         // shadow levels: each pixel's vsm level, dark in shadow; magenta where
         // no level had pages.
         uint used = vsm_levels;
@@ -143,9 +153,10 @@ void main() {
         else if (frame.debug_mode == 7u) m.albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
 
         const float lit = dot(s.n, sun_dir) > 0.0 ? sunlight(px, s) : 0.0;
-        color = shade_material(m, s.n, -s.dir, lit);
+        const float ao = occlusion(px);
+        color = shade_material(m, s.n, -s.dir, lit, ao);
         // from behind: no rim light, which would outline every sliver.
-        if (!s.behind) color += pow(1.0 - max(dot(s.n, -s.dir), 0.0), 4.0) * 0.25 * sky(s.n) * (1.0 - m.metallic);
+        if (!s.behind) color += pow(1.0 - max(dot(s.n, -s.dir), 0.0), 4.0) * 0.25 * sky(s.n) * (1.0 - m.metallic) * ao;
 
         if ((frame.flags & flag_wireframe) != 0u) {
             const vec2 p = vec2(px) + 0.5;

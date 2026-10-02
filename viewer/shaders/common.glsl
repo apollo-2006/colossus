@@ -94,6 +94,7 @@ const uint flag_software_raster = 32u;
 const uint flag_shadows = 64u;
 const uint flag_full_res_shadows = 128u;  // every pixel traces its own ray
 const uint flag_taa = 256u;
+const uint flag_ao = 2048u;  // ambient occlusion (ao.comp)
 const uint flag_vsm = 1024u;  // virtual shadow maps (vsm.glsl), not rays
 const uint flag_moving = 512u;  // some instances move: rays also test shadow_moving
 

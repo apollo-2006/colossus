@@ -1,0 +1,31 @@
+#version 460
+// view depth for ao.comp: level 0 at half resolution from the visibility buffer (the top-left
+// pixel of each 2x2), then three halvings, each texel its block's top-left. far taps read the
+// coarse levels, which keeps them in cache.
+#extension GL_EXT_shader_atomic_int64 : require
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 36, r32f) uniform image2D ao_depth_levels[4];
+
+void main() {
+    const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    const uint level = push.level;
+    if (any(greaterThanEqual(q, imageSize(ao_depth_levels[level])))) return;
+    float w;
+    if (level > 0u) {
+        w = imageLoad(ao_depth_levels[level - 1u], q * 2).x;
+    } else {
+        const ivec2 px = min(q * 2, ivec2(frame.width, frame.height) - 1);
+        const uint64_t v = vis[px.x + px.y * int(frame.width)];
+        if (v != 0ul) {
+            w = frame.near_z / uintBitsToFloat(uint(v >> 32));
+        } else {
+            // the ground, y = 0: world y of a view point is dot(view[1].xyz, p) + eye y.
+            const vec2 ndc = (vec2(px) + 0.5) / vec2(frame.width, frame.height) * 2.0 - 1.0;
+            const float down = dot(frame.view[1].xyz, vec3(ndc.x / frame.p00, -ndc.y / frame.p11, -1.0));
+            w = down < 0.0 ? -frame.origin.y / down : 1e5;
+        }
+    }
+    imageStore(ao_depth_levels[level], q, vec4(w));
+}

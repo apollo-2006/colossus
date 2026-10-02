@@ -57,6 +57,12 @@ const uint32_t vsm_cluster_spv[] = {
 const uint32_t vsm_raster_spv[] = {
 #include "vsm_raster.comp.inc"
 };
+const uint32_t ao_depth_spv[] = {
+#include "ao_depth.comp.inc"
+};
+const uint32_t ao_spv[] = {
+#include "ao.comp.inc"
+};
 const uint32_t cell_cull_spv[] = {
 #include "cell_cull.comp.inc"
 };
@@ -107,8 +113,8 @@ constexpr uint32_t vsm_lists_header = 8 + 8 * vsm_levels + 2 * vsm_levels * vsm_
 constexpr uint32_t max_work_items = 1u << 22;
 constexpr uint32_t max_visible = 1u << 22;  // leaves 7 bits for the triangle in a 32-bit id, and 3 to spare
 constexpr const char* mode_names[] = {"shaded", "clusters", "triangles", "LOD level", "groups", "instances", "holes", "rasterizer",
-                                      "shadow levels"};
-constexpr uint32_t mode_count = 9;
+                                      "shadow levels", "ambient occlusion"};
+constexpr uint32_t mode_count = 10;
 
 // as common.glsl declares them (scalar layout).
 struct gpu_mesh {
@@ -191,7 +197,8 @@ struct gpu_push {
 constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
                    flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64, flag_full_res_shadows = 128, flag_taa = 256,
                    flag_moving = 512,  // some instances move: see animate() in common.glsl
-                   flag_vsm = 1024;    // virtual shadow maps (vsm.glsl), not rays
+                   flag_vsm = 1024,    // virtual shadow maps (vsm.glsl), not rays
+                   flag_ao = 2048;     // ambient occlusion (ao.comp)
 // ray traced shadows use the finest cut within each budget; far surfaces use coarser ones
 // (trace_surface() in surface.glsl).
 constexpr size_t shadow_budgets[] = {1u << 18, 1u << 15, 1u << 12};
@@ -528,7 +535,7 @@ public:
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
         for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_, cell_cull_,
                             vsm_mark_, vsm_alloc_, vsm_clear_, vsm_args_pipeline_, vsm_instance_, vsm_expand_, vsm_cluster_,
-                            vsm_raster_})
+                            vsm_raster_, ao_pipeline_, ao_depth_pipeline_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
         for (accel* a : {&tlas_, &tlas_moving_}) {
@@ -616,6 +623,66 @@ public:
             w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[1].pImageInfo = &write;
             vkUpdateDescriptorSets(ctx_.device, 2, w, 0, nullptr);
+        }
+        // ambient occlusion, half resolution.
+        ao_ = ctx_.make_image((width + 1) / 2, (height + 1) / 2, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT);
+        // its depth chain (ao_depth.comp): half resolution and three halvings.
+        VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ic.imageType = VK_IMAGE_TYPE_2D;
+        ic.format = VK_FORMAT_R32_SFLOAT;
+        ic.extent = {(width + 1) / 2, (height + 1) / 2, 1};
+        ic.mipLevels = ao_depth_levels;
+        ic.arrayLayers = 1;
+        ic.samples = VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ao_depth_ = ctx_.make_image(ic, VK_IMAGE_ASPECT_COLOR_BIT);
+        for (uint32_t l = 0; l < ao_depth_levels; ++l) {
+            VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vc.image = ao_depth_.handle;
+            vc.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vc.format = VK_FORMAT_R32_SFLOAT;
+            vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l, 1, 0, 1};
+            VK_CHECK(vkCreateImageView(ctx_.device, &vc, nullptr, &ao_depth_views_[l]));
+        }
+        ctx_.submit([&](VkCommandBuffer cmd) {
+            for (VkImage image : {ao_.handle, ao_depth_.handle}) {
+                VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+                ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                ib.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+                ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                ib.image = image;
+                ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, 1};
+                VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                di.imageMemoryBarrierCount = 1;
+                di.pImageMemoryBarriers = &ib;
+                vkCmdPipelineBarrier2(cmd, &di);
+            }
+        });
+        for (frame_slot& f : slots_) {
+            VkDescriptorImageInfo info{VK_NULL_HANDLE, ao_.view, VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo levels[ao_depth_levels];
+            for (uint32_t l = 0; l < ao_depth_levels; ++l) levels[l] = {VK_NULL_HANDLE, ao_depth_views_[l], VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo sampled{sampler_, ao_depth_.view, VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet w[3] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                                         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+            w[0].dstSet = w[1].dstSet = w[2].dstSet = f.set;
+            w[0].dstBinding = 35;
+            w[0].descriptorCount = 1;
+            w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[0].pImageInfo = &info;
+            w[1].dstBinding = 36;
+            w[1].descriptorCount = ao_depth_levels;
+            w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[1].pImageInfo = levels;
+            w[2].dstBinding = 37;
+            w[2].descriptorCount = 1;
+            w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[2].pImageInfo = &sampled;
+            vkUpdateDescriptorSets(ctx_.device, 3, w, 0, nullptr);
         }
         create_hzb();
         prev_valid_ = false;
@@ -782,6 +849,20 @@ public:
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
         if ((fr.flags & flag_vsm) && (fr.flags & flag_shadows)) update_shadow_pages(cmd, f);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, f.queries, 4);
+        if (fr.flags & flag_ao) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ao_depth_pipeline_);
+            for (uint32_t l = 0; l < ao_depth_levels; ++l) {
+                const gpu_push push{0, l};
+                vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
+                vkCmdDispatch(cmd, (((width_ + 1) / 2 >> l) + 8) / 8, (((height_ + 1) / 2 >> l) + 8) / 8, 1);
+                compute_barrier(cmd);
+            }
+            const gpu_push back{0, 0};
+            vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof back, &back);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ao_pipeline_);
+            vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
+            compute_barrier(cmd);
+        }
         if (shadow_ && (frame_in.flags & flag_shadows) && !(frame_in.flags & flag_full_res_shadows) && !(fr.flags & flag_vsm)) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadow_);
             vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
@@ -963,6 +1044,11 @@ private:
     vk::buffer shadow_mask_;
     VkPipeline taa_ = VK_NULL_HANDLE, expand_ = VK_NULL_HANDLE, cell_cull_ = VK_NULL_HANDLE;
     std::array<vk::image, frames_in_flight> history_;  // slot k writes history_[k], reads the other
+    vk::image ao_;                                     // ao.comp's output, half resolution
+    static constexpr uint32_t ao_depth_levels = 4;
+    vk::image ao_depth_;                               // ao_depth.comp's chain
+    std::array<VkImageView, ao_depth_levels> ao_depth_views_{};
+    VkPipeline ao_pipeline_ = VK_NULL_HANDLE, ao_depth_pipeline_ = VK_NULL_HANDLE;
     VkSampler history_sampler_ = VK_NULL_HANDLE;
     float prev_view_proj_[16] = {};
     float prev_time_ = 0;
@@ -977,6 +1063,12 @@ private:
         ctx_.destroy(vis_);
         ctx_.destroy(shadow_mask_);
         for (vk::image& h : history_) ctx_.destroy(h);
+        ctx_.destroy(ao_);
+        for (VkImageView& v : ao_depth_views_) {
+            if (v) vkDestroyImageView(ctx_.device, v, nullptr);
+            v = VK_NULL_HANDLE;
+        }
+        ctx_.destroy(ao_depth_);
         ctx_.destroy(depth_);
         ctx_.destroy(color_);
         for (VkImageView v : hzb_views_) vkDestroyImageView(ctx_.device, v, nullptr);
@@ -1346,14 +1438,14 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 34; ++i) {
+        for (uint32_t i = 0; i <= 37; ++i) {
             if ((i == 18 || i == 23 || i == 24) && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
-            x.descriptorCount = i == 17 ? max_hzb_levels : 1;
+            x.descriptorCount = i == 17 ? max_hzb_levels : i == 36 ? ao_depth_levels : 1;
             x.descriptorType = i == 0                ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-                             : i == 13 || i == 17 || i == 22 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                             : i == 16 || i == 21    ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                             : i == 13 || i == 17 || i == 22 || i == 35 || i == 36 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                             : i == 16 || i == 21 || i == 37 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                              : i == 18 || i == 24    ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
                                                      : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             x.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1366,8 +1458,8 @@ private:
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 28 * frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (2 + max_hzb_levels) * frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (3 + max_hzb_levels + ao_depth_levels) * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2 * frames_in_flight}};
         VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pci.maxSets = frames_in_flight;
@@ -1446,6 +1538,8 @@ private:
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
         expand_ = compute_pipeline(expand_spv, sizeof expand_spv);
         cell_cull_ = compute_pipeline(cell_cull_spv, sizeof cell_cull_spv);
+        ao_pipeline_ = compute_pipeline(ao_spv, sizeof ao_spv);
+        ao_depth_pipeline_ = compute_pipeline(ao_depth_spv, sizeof ao_depth_spv);
         vsm_mark_ = compute_pipeline(vsm_mark_spv, sizeof vsm_mark_spv);
         vsm_alloc_ = compute_pipeline(vsm_alloc_spv, sizeof vsm_alloc_spv);
         vsm_clear_ = compute_pipeline(vsm_clear_spv, sizeof vsm_clear_spv);
@@ -1593,7 +1687,7 @@ struct view_state {
     bool frozen = false;
     float threshold = 1;
     uint32_t mode = 0;
-    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster | flag_shadows | flag_taa;
+    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster | flag_shadows | flag_taa | flag_ao;
     float sw_max_pixels = 32;
     float speed = 1.5f;
     bool looking = false;
@@ -1642,6 +1736,8 @@ void on_key(GLFWwindow* w, int key, int, int action, int) {
     if (key == GLFW_KEY_R) v->flags ^= flag_software_raster;
     if (key == GLFW_KEY_H) v->flags ^= flag_shadows;
     if (key == GLFW_KEY_X) v->flags ^= flag_taa;
+    if (key == GLFW_KEY_G) v->flags ^= flag_ao;
+    if (key == GLFW_KEY_0) v->mode = 9;
     if (key == GLFW_KEY_T) v->flags ^= flag_wireframe;
     if (key == GLFW_KEY_P) v->print_camera = true;
     if (key == GLFW_KEY_F) {
@@ -1732,6 +1828,7 @@ options parse(int argc, char** argv) {
             o.vsm = kind == "vsm";
         } else if (a == "--vsm-pages") o.vsm_side = static_cast<uint32_t>(std::stoul(next()));
         else if (a == "--no-taa") o.disable |= flag_taa;
+        else if (a == "--no-ao") o.disable |= flag_ao;
         else if (a == "--full-res-shadows") o.full_res_shadows = true;
         else if (a == "--materials") o.mixed_materials = next() != "plain";
         else if (a == "--moving") o.moving = std::stof(next());
@@ -1863,10 +1960,12 @@ int main(int argc, char** argv) {
             swap.create(fw, fh);
             renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch,
                        false, opt.vsm ? opt.vsm_side : 1);
-            std::printf("keys: WASD/QE move, drag to look, scroll for speed, shift to hurry\n"
-                        "      1-8 view (shaded, clusters, triangles, LOD level, groups, instances, holes, rasterizer)\n"
-                        "      [ ] LOD threshold, F freeze culling, C cone, V frustum, O occlusion culling,\n"
-                        "      R software rasterizer, H shadows, X antialiasing, T wireframe, P print camera\n");
+            std::printf("keys: wasd/qe move, drag to look, scroll for speed, shift to hurry\n"
+                        "      1-9, 0 view (shaded, clusters, triangles, lod level, groups, instances, holes, rasterizer,\n"
+                        "      shadow levels, ambient occlusion)\n"
+                        "      [ ] lod threshold, f freeze culling, c cone, v frustum, o occlusion culling,\n"
+                        "      r software rasterizer, h shadows, x antialiasing, g ambient occlusion, t wireframe,\n"
+                        "      p print camera\n");
 
             auto last = std::chrono::steady_clock::now();
             const auto start = last;
