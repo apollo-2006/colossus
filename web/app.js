@@ -73,6 +73,13 @@ async function main() {
   renderer.loadModels(models, Math.min(POOL_BYTES, renderer.device.limits.maxStorageBufferBindingSize));
 
   const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS | FLAG_OCCLUSION | FLAG_TAA | FLAG_AO | FLAG_SOFT_SHADOWS, threshold: 1, mode: 0, swPixels: 32, motion: true };
+  // ?still: motion paused and the camera held from the start, so every load shows the same
+  // frame (screenshots).
+  const still = new URLSearchParams(location.search).has('still');
+  if (still) {
+    settings.motion = false;
+    $('motion').checked = false;
+  }
   let frozen = null;
   const build = () => {
     // the slider steps through grid sides, up to a million instances.
@@ -103,7 +110,7 @@ async function main() {
 
   // drag to look, wasd (and q, e) to fly, wheel for speed.
   const keys = new Set();
-  let speed = 1.5, dragging = false, last = [0, 0], idle = true;
+  let speed = 1.5, dragging = false, last = [0, 0], idle = !still;
   addEventListener('keydown', (e) => { if (!e.target.closest('input, select')) { keys.add(e.code); idle = false; } });
   addEventListener('keyup', (e) => keys.delete(e.code));
   canvas.addEventListener('pointerdown', (e) => { dragging = true; idle = false; last = [e.clientX, e.clientY]; canvas.setPointerCapture(e.pointerId); });

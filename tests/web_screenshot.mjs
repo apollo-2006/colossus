@@ -2,7 +2,7 @@
 // opens the web demo in headless chrome with webgpu, lets it render, saves a
 // screenshot, printing page errors:
 //
-//     node tests/web_screenshot.mjs [--out shot.png] [--wait SECONDS] [--eval JS] [--clip x,y,w,h,scale]
+//     node tests/web_screenshot.mjs [--out shot.png] [--wait SECONDS] [--eval JS] [--clip x,y,w,h,scale] [--query QUERY]
 //
 // serves web/ (models built by web/build.sh). needs google-chrome-stable and a
 // gpu chrome can use.
@@ -15,11 +15,12 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', 'web');
 const args = process.argv.slice(2);
-let out = 'web.png', wait = 6, script = '', clip = null;
+let out = 'web.png', wait = 6, script = '', clip = null, query = '';
 for (let k = 0; k < args.length; k++) {
   if (args[k] === '--out') out = args[++k];
   else if (args[k] === '--wait') wait = Number(args[++k]);
   else if (args[k] === '--eval') script = args[++k];
+  else if (args[k] === '--query') query = args[++k];
   else if (args[k] === '--clip') { const [x, y, width, height, scale] = args[++k].split(',').map(Number); clip = { x, y, width, height, scale }; }
   else { console.error(`unknown flag ${args[k]}`); process.exit(2); }
 }
@@ -88,7 +89,7 @@ try {
   console.error('connected');
   await send('Runtime.enable');
   console.error('runtime enabled');
-  console.error('navigate:', JSON.stringify(await send('Page.navigate', { url: `http://127.0.0.1:${port}/` })));
+  console.error('navigate:', JSON.stringify(await send('Page.navigate', { url: `http://127.0.0.1:${port}/${query ? '?' + query : ''}` })));
   for (let t = 0; t < wait; t++) {
     await new Promise((r) => setTimeout(r, 1000));
     const s = await send('Runtime.evaluate', { expression: 'document.readyState + " " + (document.getElementById("loading")?.textContent ?? "loaded")', returnByValue: true }, 5)
