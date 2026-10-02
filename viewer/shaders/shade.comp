@@ -127,7 +127,7 @@ void main() {
                             (sun_color * max(sun_dir.y, 0.0) * 0.6 * sunlight(px, s) + sky(vec3(0, 1, 0)) * 0.45);
         color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
     } else if (s.kind == surface_object) {
-        const Instance inst = instances[s.vc.x];
+        const Instance inst = load_instance(s.vc.x);
         const Cluster c = clusters[s.vc.y];
         const uint vid = s.id >> 7;
         Material m = materials[min(inst.material, 5u)];

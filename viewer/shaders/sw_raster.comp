@@ -43,7 +43,7 @@ void main() {
     if (k >= sw_pass_start[pass + 1u]) return;
     const uint vid = sw_slot(k);
     const uvec2 v = visible[vid];
-    const Instance inst = instances[v.x];
+    const Instance inst = load_instance(v.x);
     const Cluster c = clusters[v.y];
     const uint t = gl_LocalInvocationIndex;
 

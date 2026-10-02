@@ -41,12 +41,14 @@ void main() {
     uint first = 0u;
     if (slot < n) {
         i = pass == 0u ? slot : late_instances[slot];
-        const Instance inst = instances[i];
+        const Instance inst = load_instance(i);
         const Mesh m = meshes[inst.mesh];
         const vec3 center = to_world(inst, m.bounds.xyz);
         const float radius = m.bounds.w * inst.scale;
         bool keep = pass != 0u || (frame.flags & flag_frustum_culling) == 0u || sphere_in_frustum(center, radius);
-        if (keep && occluded(center, radius)) {
+        // Pass 1 asks whether it was hidden last frame, where last frame was.
+        const vec3 then = pass == 0u && inst.anim != 0u ? to_world(load_prev_instance(i), m.bounds.xyz) : center;
+        if (keep && occluded(then, radius)) {
             if (pass == 0u) late_instances[atomicAdd(late_instance_count, 1u)] = i;
             else atomicAdd(stats.instances_occluded, 1u);
             keep = false;

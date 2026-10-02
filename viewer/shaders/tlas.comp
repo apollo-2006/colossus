@@ -1,0 +1,19 @@
+#version 460
+// Moves the shadow scene's moving instances: writes each entry of the
+// moving instances' top level (one per instance and shadow copy) the
+// instance's transform this frame, which main.cpp then refits.
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+// VkAccelerationStructureInstanceKHR, 16 words: the 3x4 transform, then the
+// custom index (the instance, low 24 bits) and mask.
+layout(set = 0, binding = 23, scalar) buffer AsInstances { uint as_instances[]; };
+
+void main() {
+    const uint e = gl_GlobalInvocationID.y * 65535u * 64u + gl_GlobalInvocationID.x;
+    if (e * 16u >= as_instances.length()) return;
+    const uint at = e * 16u;
+    const Instance inst = load_instance(as_instances[at + 12u] & 0xffffffu);
+    for (uint r = 0u; r < 3u; ++r)
+        for (uint c = 0u; c < 4u; ++c) as_instances[at + r * 4u + c] = floatBitsToUint(inst.rows[r][c]);
+}

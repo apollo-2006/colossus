@@ -39,6 +39,9 @@
 
 namespace {
 
+const uint32_t tlas_spv[] = {
+#include "tlas.comp.inc"
+};
 const uint32_t expand_spv[] = {
 #include "expand.comp.inc"
 };
@@ -96,7 +99,7 @@ struct gpu_instance {
     uint32_t mesh;
     float scale;
     uint32_t material;  // Into shade.comp's materials
-    uint32_t pad1;
+    uint32_t anim;      // See animate() in common.glsl
 };
 struct gpu_frame {
     float view_proj[16];
@@ -122,7 +125,8 @@ struct gpu_frame {
     float sw_max_pixels;
     uint32_t max_requests;
     float scene_top;
-    uint32_t pad11, pad12;
+    float prev_time;
+    uint32_t pad12;
     float shadow_lod_error[4];
     float prev_view_proj[16];
     uint32_t taa_valid;
@@ -149,7 +153,8 @@ struct gpu_push {
 };
 
 constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wireframe = 4, flag_occlusion = 8,
-                   flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64, flag_full_res_shadows = 128, flag_taa = 256;
+                   flag_prev_valid = 16, flag_software_raster = 32, flag_shadows = 64, flag_full_res_shadows = 128, flag_taa = 256,
+                   flag_moving = 512;  // Some instances move: see animate() in common.glsl
 // Shadows are traced against cuts of each model, the finest within each of
 // these budgets: rays from far surfaces use the coarser ones (see
 // trace_surface() in surface.glsl).
@@ -182,6 +187,7 @@ struct options {
     unsigned loader_threads = 2;  // 0: read pages on the render thread
     bool cold = false;         // Drop the models from the OS's file cache first, so pages come off the disk
     bool mixed_materials = true;
+    float moving = 0;  // Share of instances that move (see animate() in common.glsl)
     bool full_res_shadows = false;
     bool prefetch = true;
 };
@@ -237,6 +243,7 @@ struct scene {
     std::vector<float> shadow_positions;
     std::vector<uint32_t> shadow_indices;
     size_t instanced_triangles = 0;  // At full detail, over every instance
+    size_t moving = 0;               // Instances that move
     uint64_t total_page_bytes = 0;
 
     scene() = default;
@@ -362,7 +369,8 @@ void make_scene(const options& opt, scene& s) {
         }
     }
 
-    std::mt19937 rng(7), material_rng(11);
+    std::mt19937 rng(7), material_rng(11), motion_rng(13);
+    std::uniform_real_distribution<float> chance(0, 1);
     std::uniform_real_distribution<float> turn(0, 6.2831853f), size(0.85f, 1.15f);
     // Mostly marble, some sandstone, bronze, gold and granite: the
     // materials table in shade.comp. One statue alone is marble.
@@ -381,6 +389,9 @@ void make_scene(const options& opt, scene& s) {
             inst.mesh = mesh;
             inst.scale = scale;
             inst.material = !opt.mixed_materials ? 0 : n == 1 ? 1 : mix[material_rng() % 20];
+            // Moving: bit 9 marks it, bit 8 picks the direction, the low 8 bits the phase.
+            if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
+            s.moving += inst.anim != 0;
             s.instances.push_back(inst);
             s.instanced_triangles += leaf_triangles[mesh];
         }
@@ -436,10 +447,10 @@ public:
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_})
             ctx_.destroy(*b);
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
-        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_})
+        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
-        for (accel* a : {&tlas_}) {
+        for (accel* a : {&tlas_, &tlas_moving_}) {
             if (a->handle) ctx_.destroy_as(ctx_.device, a->handle, nullptr);
             ctx_.destroy(a->storage);
         }
@@ -449,6 +460,8 @@ public:
         }
         ctx_.destroy(shadow_indices_);
         ctx_.destroy(as_instances_);
+        ctx_.destroy(as_moving_);
+        ctx_.destroy(tlas_scratch_);
         vkDestroyPipelineLayout(ctx_.device, layout_, nullptr);
         vkDestroyDescriptorPool(ctx_.device, pool_, nullptr);
         vkDestroyDescriptorSetLayout(ctx_.device, set_layout_, nullptr);
@@ -585,6 +598,9 @@ public:
         f.used = true;
 
         gpu_frame fr = frame_in;
+        fr.prev_time = history_valid_ ? prev_time_ : fr.time;
+        if (sc_.moving) fr.flags |= flag_moving;
+        prev_time_ = fr.time;
         // Temporal antialiasing: each frame's projection is nudged by a
         // sub-pixel offset, the Halton (2, 3) sequence over eight frames,
         // and taa.comp blends the frames. Its history is last frame's
@@ -660,6 +676,7 @@ public:
 
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &f.set, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &f.set, 0, nullptr);
+        if (tlas_scratch_address_ && (fr.flags & flag_shadows)) update_shadow_scene(cmd);
         vk::transition(cmd, depth_.handle, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
@@ -809,6 +826,7 @@ private:
     std::array<vk::image, frames_in_flight> history_;  // Slot k writes history_[k] and reads the other
     VkSampler history_sampler_ = VK_NULL_HANDLE;
     float prev_view_proj_[16] = {};
+    float prev_time_ = 0;
     bool history_valid_ = false;
     bool cull_only_ = false;
     uint64_t upload_bytes_;
@@ -1031,14 +1049,48 @@ private:
         VkDeviceAddress address = 0;
     };
     std::vector<accel> blas_;
-    accel tlas_;
-    vk::buffer shadow_indices_, as_instances_;
+    accel tlas_, tlas_moving_;  // Still instances; moving instances
+    vk::buffer shadow_indices_, as_instances_, as_moving_;
+    uint32_t moving_entries_ = 0;
+    VkAccelerationStructureGeometryKHR tlas_geom_{};
+    vk::buffer tlas_scratch_;  // For refitting: see update_shadow_scene()
+    VkDeviceAddress tlas_scratch_address_ = 0;
+    VkPipeline tlas_update_ = VK_NULL_HANDLE;
+
+    // Moves the shadow scene's moving instances to where they are this
+    // frame: tlas.comp writes their transforms, then the top level is
+    // refitted in place, its tree kept. The motion is small and periodic,
+    // so the tree stays good.
+    void update_shadow_scene(VkCommandBuffer cmd) {
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tlas_update_);
+        const uint32_t n = (moving_entries_ + 63) / 64;
+        vkCmdDispatch(cmd, std::min(n, 65535u), (n + 65534) / 65535, 1);
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_2_SHADER_READ_BIT);
+        VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+        info.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+        info.srcAccelerationStructure = info.dstAccelerationStructure = tlas_moving_.handle;
+        info.geometryCount = 1;
+        info.pGeometries = &tlas_geom_;
+        info.scratchData.deviceAddress = tlas_scratch_address_;
+        VkAccelerationStructureBuildRangeInfoKHR range{moving_entries_, 0, 0, 0};
+        const VkAccelerationStructureBuildRangeInfoKHR* ranges = &range;
+        ctx_.build_as(cmd, 1, &info, &ranges);
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    }
 
     // Builds an acceleration structure over one geometry and waits for it.
-    accel build_accel(VkAccelerationStructureTypeKHR type, const VkAccelerationStructureGeometryKHR& geom, uint32_t primitives) {
+    accel build_accel(VkAccelerationStructureTypeKHR type, const VkAccelerationStructureGeometryKHR& geom, uint32_t primitives,
+                      bool updatable = false) {
         VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
         info.type = type;
-        info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                     (updatable ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0);
         info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         info.geometryCount = 1;
         info.pGeometries = &geom;
@@ -1057,6 +1109,10 @@ private:
         vkGetPhysicalDeviceProperties2(ctx_.gpu, &p2);
         const VkDeviceSize align = asp.minAccelerationStructureScratchOffsetAlignment;
         vk::buffer scratch = ctx_.make_buffer(sizes.buildScratchSize + align, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+        if (updatable) {
+            tlas_scratch_ = ctx_.make_buffer(sizes.updateScratchSize + align, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+            tlas_scratch_address_ = (tlas_scratch_.address + align - 1) / align * align;
+        }
         info.dstAccelerationStructure = a.handle;
         info.scratchData.deviceAddress = (scratch.address + align - 1) / align * align;
         VkAccelerationStructureBuildRangeInfoKHR range{primitives, 0, 0, 0};
@@ -1094,38 +1150,54 @@ private:
         }
         // Every instance three times, once per shadow copy, each copy
         // under its own mask bit: a ray sees only the copy it asks for.
-        std::vector<VkAccelerationStructureInstanceKHR> instances(sc_.instances.size() * shadow_lods);
+        // Still instances go in one top level, built once; moving ones in
+        // another, refitted every frame (see update_shadow_scene()), since
+        // a refit costs by the size of the whole structure, not by what
+        // moved.
+        std::vector<VkAccelerationStructureInstanceKHR> still, moving;
         for (size_t k = 0; k < sc_.instances.size(); ++k)
             for (uint32_t lod = 0; lod < shadow_lods; ++lod) {
-                auto& ai = instances[k * shadow_lods + lod];
+                VkAccelerationStructureInstanceKHR ai{};
                 std::memcpy(ai.transform.matrix, sc_.instances[k].rows, sizeof ai.transform.matrix);
-                ai.instanceCustomIndex = static_cast<uint32_t>(k);
+                ai.instanceCustomIndex = static_cast<uint32_t>(k);  // tlas.comp reads it back
                 ai.mask = 1u << lod;
                 ai.flags = 0;
                 ai.accelerationStructureReference = blas_[sc_.instances[k].mesh * shadow_lods + lod].address;
+                (sc_.instances[k].anim ? moving : still).push_back(ai);
             }
-        as_instances_ = ctx_.upload(instances, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
-        VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-        geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-        geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-        geom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-        geom.geometry.instances.data.deviceAddress = as_instances_.address;
-        tlas_ = build_accel(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, geom, static_cast<uint32_t>(instances.size()));
+        auto top_level = [&](const vk::buffer& b) {
+            VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+            geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+            geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+            geom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+            geom.geometry.instances.data.deviceAddress = b.address;
+            return geom;
+        };
+        const VkBufferUsageFlags input = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        if (still.empty()) still.push_back({});  // A top level of one empty instance (mask 0): nothing to hit
+        as_instances_ = ctx_.upload(still, input);
+        tlas_ = build_accel(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, top_level(as_instances_), uint32_t(still.size()));
+        if (!moving.empty()) {
+            as_moving_ = ctx_.upload(moving, input | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            moving_entries_ = uint32_t(moving.size());
+            tlas_geom_ = top_level(as_moving_);
+            tlas_moving_ = build_accel(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, tlas_geom_, moving_entries_, true);
+        }
         std::printf("shadows: %s triangles over %zu models, built in %.2f s\n", human(double(triangles)).c_str(),
                     sc_.shadow_meshes.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     }
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 22; ++i) {
-            if (i == 18 && !ctx_.ray_query) continue;
+        for (uint32_t i = 0; i <= 24; ++i) {
+            if ((i == 18 || i == 23 || i == 24) && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
             x.descriptorCount = i == 17 ? max_hzb_levels : 1;
             x.descriptorType = i == 0                ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
                              : i == 13 || i == 17 || i == 22 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                              : i == 16 || i == 21    ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                             : i == 18               ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+                             : i == 18 || i == 24    ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
                                                      : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             x.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
             b.push_back(x);
@@ -1136,10 +1208,10 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (2 + max_hzb_levels) * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, frames_in_flight}};
+                                              {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2 * frames_in_flight}};
         VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pci.maxSets = frames_in_flight;
         pci.poolSizeCount = ctx_.ray_query ? 5 : 4;
@@ -1155,10 +1227,11 @@ private:
             const vk::buffer* buffers[] = {&f.frame,   &clusters_, &page_table_, &pool_buffer_,   &page_used_,
                                            &requests_, &meshes_,   &instances_,  &work_,          &visible_,
                                            nullptr,    &f.stats,   &draw_args_,  nullptr,         &late_instances_,
-                                           &late_clusters_, nullptr, nullptr,   nullptr,         &request_stamp_};
-            VkDescriptorBufferInfo infos[20];
+                                           &late_clusters_, nullptr, nullptr,   nullptr,         &request_stamp_,
+                                           nullptr,         nullptr, nullptr,   as_moving_.handle ? &as_moving_ : nullptr};
+            VkDescriptorBufferInfo infos[24];
             std::vector<VkWriteDescriptorSet> writes;
-            for (uint32_t i = 0; i < 20; ++i) {
+            for (uint32_t i = 0; i < 24; ++i) {
                 if (!buffers[i]) continue;  // The visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1169,14 +1242,17 @@ private:
                 w.pBufferInfo = &infos[i];
                 writes.push_back(w);
             }
-            VkWriteDescriptorSetAccelerationStructureKHR as_info{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
-            as_info.accelerationStructureCount = 1;
-            as_info.pAccelerationStructures = &tlas_.handle;
-            if (ctx_.ray_query) {
+            // The moving instances' top level, or with none moving, the
+            // still one again (shaders skip it then: flag_moving).
+            VkWriteDescriptorSetAccelerationStructureKHR as_info[2] = {
+                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, nullptr, 1, &tlas_.handle},
+                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, nullptr, 1,
+                 tlas_moving_.handle ? &tlas_moving_.handle : &tlas_.handle}};
+            for (uint32_t k = 0; k < 2 && ctx_.ray_query; ++k) {
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                w.pNext = &as_info;
+                w.pNext = &as_info[k];
                 w.dstSet = f.set;
-                w.dstBinding = 18;
+                w.dstBinding = k == 0 ? 18 : 24;
                 w.descriptorCount = 1;
                 w.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
                 writes.push_back(w);
@@ -1210,6 +1286,7 @@ private:
     void create_pipelines() {
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
         expand_ = compute_pipeline(expand_spv, sizeof expand_spv);
+        if (ctx_.ray_query) tlas_update_ = compute_pipeline(tlas_spv, sizeof tlas_spv);
         args_ = compute_pipeline(args_spv, sizeof args_spv);
         shade_ = ctx_.ray_query ? compute_pipeline(shade_rt_spv, sizeof shade_rt_spv) : compute_pipeline(shade_spv, sizeof shade_spv);
         if (ctx_.ray_query) shadow_ = compute_pipeline(shadow_spv, sizeof shadow_spv);
@@ -1478,6 +1555,7 @@ options parse(int argc, char** argv) {
         else if (a == "--no-taa") o.disable |= flag_taa;
         else if (a == "--full-res-shadows") o.full_res_shadows = true;
         else if (a == "--materials") o.mixed_materials = next() != "plain";
+        else if (a == "--moving") o.moving = std::stof(next());
         else if (a == "--pool-mb") o.pool_mb = std::clamp<uint64_t>(std::stoull(next()), 16, 4095);
         else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
         else if (a == "--warmup") o.warmup = std::stoi(next());
@@ -1510,7 +1588,8 @@ int main(int argc, char** argv) {
         const options opt = parse(argc, argv);
         scene sc;
         make_scene(opt, sc);
-        std::printf("%zu instances, %s triangles at full detail\n", sc.instances.size(), human(double(sc.instanced_triangles)).c_str());
+        std::printf("%zu instances (%zu moving), %s triangles at full detail\n", sc.instances.size(), sc.moving,
+                    human(double(sc.instanced_triangles)).c_str());
 
         view_state v;
         v.threshold = opt.threshold;
@@ -1546,7 +1625,9 @@ int main(int argc, char** argv) {
                     v.cull_cam = v.cam;
                 }
                 const bool last = i == total - 1;
-                auto res = r.draw(frame_data(v, opt.width, opt.height, 0), VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                // Time moves on at 60 frames a second, so moving instances move
+                // the same in every run.
+                auto res = r.draw(frame_data(v, opt.width, opt.height, i / 60.0f), VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
                                   last && !opt.screenshot.empty());
                 streamed += res.streaming.bytes_loaded;
                 evicted += res.streaming.evicted;

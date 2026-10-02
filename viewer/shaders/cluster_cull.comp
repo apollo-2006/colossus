@@ -30,7 +30,7 @@ void main() {
     if (group < items) {
         // A work item: 64 clusters of one instance, tested in full.
         const WorkItem w = work[pass * frame.max_work_items + group];
-        const Instance inst = instances[w.instance];
+        const Instance inst = load_instance(w.instance);
         const Mesh m = meshes[inst.mesh];
         instance_id = w.instance;
         cluster_id = w.first + lane;
@@ -49,7 +49,10 @@ void main() {
                 const vec3 view = center - frame.cull_origin.xyz;
                 if (dot(view, axis) >= c.cone_cutoff * length(view) + r) draw = false;
             }
-            if (draw && occluded(center, r)) {
+            // Pass 1 asks whether it was hidden last frame, where last
+            // frame was.
+            const vec3 then = pass == 0u && inst.anim != 0u ? to_world(load_prev_instance(w.instance), c.center) : center;
+            if (draw && occluded(then, r)) {
                 draw = false;
                 hidden = true;
             }
@@ -62,7 +65,7 @@ void main() {
             const uvec2 ic = late_clusters[k];
             instance_id = ic.x;
             cluster_id = ic.y;
-            const Instance inst = instances[instance_id];
+            const Instance inst = load_instance(instance_id);
             const Cluster c = clusters[cluster_id];
             draw = !occluded(to_world(inst, c.center), c.radius * inst.scale);
             hidden = !draw;
@@ -98,7 +101,7 @@ void main() {
     // reaching the near plane always go to the hardware, which clips.
     bool software = false;
     if (draw && (frame.flags & flag_software_raster) != 0u) {
-        const Instance inst = instances[instance_id];
+        const Instance inst = load_instance(instance_id);
         const Cluster c = clusters[cluster_id];
         vec3 vc = (frame.view * vec4(to_world(inst, c.center), 1.0)).xyz;
         vc.z = -vc.z;

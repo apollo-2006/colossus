@@ -48,7 +48,7 @@ Surface surface_at(uvec2 px) {
     s.kind = surface_object;
     s.id = uint(v & 0xffffffffu);
     s.vc = visible[s.id >> 7];
-    const Instance inst = instances[s.vc.x];
+    const Instance inst = load_instance(s.vc.x);
     const Cluster c = clusters[s.vc.y];
     const uint base = page_table[c.group];
     const uint packed = cluster_triangle(base, c, s.id & 127u);
@@ -87,7 +87,18 @@ Surface surface_at(uvec2 px) {
 
 #ifdef RAY_QUERY
 #extension GL_EXT_ray_query : require
-layout(set = 0, binding = 18) uniform accelerationStructureEXT shadow_scene;
+layout(set = 0, binding = 18) uniform accelerationStructureEXT shadow_scene;   // Still instances
+layout(set = 0, binding = 24) uniform accelerationStructureEXT shadow_moving;  // Moving ones, refitted every frame
+
+bool hits(accelerationStructureEXT scene, vec3 start, uint mask) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, scene,
+                          gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsCullBackFacingTrianglesEXT, mask,
+                          start, 0.0, sun_dir, (frame.scene_top - start.y) / sun_dir.y);
+    while (rayQueryProceedEXT(q)) {
+    }
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
 
 // 1 where the sun reaches p, 0 where something is in the way. The ray
 // starts `bias` above the surface: the shadow geometry is a coarser copy
@@ -102,13 +113,8 @@ layout(set = 0, binding = 18) uniform accelerationStructureEXT shadow_scene;
 float trace_sun(vec3 p, vec3 n, float bias, uint mask) {
     const vec3 start = p + n * bias;
     if (start.y >= frame.scene_top) return 1.0;
-    rayQueryEXT q;
-    rayQueryInitializeEXT(q, shadow_scene,
-                          gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsCullBackFacingTrianglesEXT, mask,
-                          start, 0.0, sun_dir, (frame.scene_top - start.y) / sun_dir.y);
-    while (rayQueryProceedEXT(q)) {
-    }
-    return rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+    if (hits(shadow_scene, start, mask)) return 0.0;
+    return (frame.flags & flag_moving) != 0u && hits(shadow_moving, start, mask) ? 0.0 : 1.0;
 }
 
 // Whether a surface faces the sun and is lit by it. The ray is traced

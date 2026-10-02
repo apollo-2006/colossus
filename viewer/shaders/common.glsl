@@ -44,7 +44,7 @@ struct Instance {
     uint mesh;
     float scale;
     uint material;  // Into shade.comp's materials
-    uint pad1;
+    uint anim;      // 0: still. Else moving (see animate()): phase in the low 8 bits, bit 8 turns it the other way
 };
 
 layout(set = 0, binding = 0, scalar) uniform Frame {
@@ -64,7 +64,7 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     uint debug_mode;
     uint max_work_items;
     uint max_visible;
-    float time;
+    float time;           // Seconds, for moving instances
     uint frame_index;  // Counts from 1: stamps pages used and requested
     // Occlusion culling: the depth pyramid (hzb) and the cameras it is
     // tested from. Pass 1 tests against last frame's pyramid, from last
@@ -76,7 +76,8 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     float sw_max_pixels;  // Clusters smaller than this on screen go to the software rasterizer
     uint max_requests;
     float scene_top;  // The highest point of any instance: no shadow ray need climb above it
-    uint pad11, pad12;
+    float prev_time;      // Last frame's time
+    uint pad12;
     vec4 shadow_lod_error;  // Each shadow copy's largest error over the models
     mat4 prev_view_proj;    // Last frame's, without its sub-pixel offset: for taa.comp
     uint taa_valid;         // Last frame's image fits this one
@@ -93,6 +94,7 @@ const uint flag_software_raster = 32u;
 const uint flag_shadows = 64u;
 const uint flag_full_res_shadows = 128u;  // Every pixel traces its own ray
 const uint flag_taa = 256u;
+const uint flag_moving = 512u;  // Some instances move: shadow rays also test shadow_moving
 
 // Which pass this is (0 or 1), and for the pyramid builder, which level.
 layout(push_constant, scalar) uniform Push {
@@ -143,6 +145,32 @@ uint cluster_triangle(uint base, Cluster c, uint t) {
 }
 layout(set = 0, binding = 6, scalar) readonly buffer Meshes { Mesh meshes[]; };
 layout(set = 0, binding = 7, scalar) readonly buffer Instances { Instance instances[]; };
+
+// A moving instance turns on the spot and drifts round a small circle,
+// both computed from the time, so a million of them cost no uploads. Its
+// transform last frame (load_prev_instance) is what last frame's depth
+// pyramid and image hold it at: occlusion pass 1 and taa.comp use it.
+Instance animate(Instance inst, float t) {
+    if (inst.anim == 0u) return inst;
+    const float phase = float(inst.anim & 255u) * (6.2831853 / 256.0);
+    const float turn = phase + t * ((inst.anim & 256u) != 0u ? -0.7 : 0.7);
+    const float c = cos(turn), s = sin(turn);
+    const vec2 drift = vec2(cos(phase + t * 0.9), sin(phase + t * 0.9)) * 0.2;
+    // The turn, about the instance's own vertical axis, applied after the
+    // placement: rows 0 and 2 of the linear part mix.
+    const vec3 r0 = inst.rows[0].xyz, r2 = inst.rows[2].xyz;
+    inst.rows[0] = vec4(c * r0 + s * r2, inst.rows[0].w + drift.x);
+    inst.rows[2] = vec4(-s * r0 + c * r2, inst.rows[2].w + drift.y);
+    return inst;
+}
+
+Instance load_instance(uint i) {
+    return animate(instances[i], frame.time);
+}
+
+Instance load_prev_instance(uint i) {
+    return animate(instances[i], frame.prev_time);
+}
 
 // Work for the task shaders: 64 clusters of one instance from first. Pass
 // 1's items are work[0, max_work_items), pass 2's the next max_work_items.
@@ -225,6 +253,16 @@ layout(set = 0, binding = 12, scalar) buffer DrawArgs {
 vec3 to_world(Instance inst, vec3 p) {
     return vec3(dot(inst.rows[0].xyz, p) + inst.rows[0].w, dot(inst.rows[1].xyz, p) + inst.rows[1].w,
                 dot(inst.rows[2].xyz, p) + inst.rows[2].w);
+}
+
+// The inverse of to_world: placements are a rotation and a uniform scale,
+// so the transpose over the scale squared.
+vec3 from_world(Instance inst, vec3 p) {
+    const vec3 d = p - vec3(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
+    const vec3 c0 = vec3(inst.rows[0].x, inst.rows[1].x, inst.rows[2].x);
+    const vec3 c1 = vec3(inst.rows[0].y, inst.rows[1].y, inst.rows[2].y);
+    const vec3 c2 = vec3(inst.rows[0].z, inst.rows[1].z, inst.rows[2].z);
+    return vec3(dot(c0, d), dot(c1, d), dot(c2, d)) / (inst.scale * inst.scale);
 }
 
 vec3 to_world_dir(Instance inst, vec3 v) {
