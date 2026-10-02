@@ -56,9 +56,9 @@ layout(set = 0, binding = 29, scalar) buffer VsmLists {
 const uint vsm_stale = 8u;  // frames unneeded before a page is evicted ahead of recent ones (taa's cycle)
 const uint vsm_lists_header = 8u + 8u * vsm_levels + 2u * vsm_levels * vsm_window;
 
-// atlas: physical page p at (p mod side, p / side) * vsm_page, side =
-// frame.vsm_atlas_side. depths as sortable uints (vsm_sortable): larger is
-// nearer the sun, 0 empty.
+// atlas: each layer's physical pages one after another, side x side of them (side =
+// frame.vsm_atlas_side), tiled (vsm_atlas_index). depths as sortable uints (vsm_sortable):
+// larger is nearer the sun, 0 empty.
 layout(set = 0, binding = 30, scalar) buffer VsmAtlas { uint vsm_atlas[]; };
 
 // light frame: x, y across the sun, z toward it.
@@ -124,9 +124,10 @@ float vsm_unsortable(uint u) {
 }
 
 uint vsm_atlas_index(uint phys, uvec2 texel_in_page, uint layer) {
-    const uint side = frame.vsm_atlas_side;
-    const uvec2 at = uvec2(phys % side, phys / side) * vsm_page + texel_in_page;
-    return (layer * side * vsm_page + at.y) * side * vsm_page + at.x;
+    // page after page, each in 8x8 tiles of 256 bytes: a small triangle's texels share a tile or two.
+    const uint page = layer * frame.vsm_atlas_side * frame.vsm_atlas_side + phys;
+    const uvec2 tile = texel_in_page / 8u, in_tile = texel_in_page % 8u;
+    return page * (vsm_page * vsm_page) + (tile.y * (vsm_page / 8u) + tile.x) * 64u + in_tile.y * 8u + in_tile.x;
 }
 
 uint vsm_mask_word(uint layer, uint slot) {
