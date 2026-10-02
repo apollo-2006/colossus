@@ -1,6 +1,7 @@
 #include "dag.hpp"
 
 #include "cluster.hpp"
+#include "deviation.hpp"
 #include "parallel.hpp"
 #include "simplify.hpp"
 
@@ -16,6 +17,10 @@ constexpr uint32_t group_target = 8;  // Clusters per group
 // triangles is left as it is: its clusters become roots.
 constexpr float stuck_ratio = 0.85f;
 constexpr uint32_t max_levels = 48;
+// A simplification whose measured worst spot is more than this many times
+// its quadric estimate is tried again more gently (see build_lod).
+constexpr float outlier_ratio = 4.0f;
+constexpr size_t min_group_triangles = 64;
 
 // Groups the clusters (numbers into all) into sets of about group_target
 // that share as many edges as possible.
@@ -267,14 +272,42 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 bounds = merge(bounds, cl.lod_bounds);
             }
             const size_t tris = merged.size() / 3;
-            const simplify_result s = simplify(out.positions, merged, locked, tris / 2);
+            // Errors add: the new level is this far from this one, which is
+            // child_error from the original. How far is measured, not the
+            // simplifier's quadric estimate, which is a mean and typically
+            // a little under half the worst spot; the larger is kept.
+            //
+            // A few groups come out far worse than their estimate (a thin
+            // part folded flat, a hole's rim pulled across). Those are
+            // simplified again, more gently, and the attempt that measures
+            // better is kept. Either way the measured error is the one
+            // recorded, so a bad spot costs detail, never correctness.
+            // Groups of a few triangles are islands of the scan, cut off
+            // from the rest: halving a ten-triangle flake reshapes it
+            // entirely (the dragon's worst three groups at level 0 were
+            // these, measuring 6 to 0.4 percent of its size). They stay as
+            // they are, roots at full detail, which costs a few triangles.
+            if (tris < min_group_triangles) {
+                stuck[g] = 1;
+                return;
+            }
+            simplify_result s = simplify(out.positions, merged, locked, tris / 2);
             if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) {
                 stuck[g] = 1;
                 return;
             }
-            // Errors add: the new level is s.error from this one, which is
-            // child_error from the original.
-            const float error = child_error + s.error;
+            float measured = mesh_deviation(out.positions, merged, s.indices);
+            if (measured > outlier_ratio * s.error) {
+                simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4);
+                if (!gentle.indices.empty() && gentle.indices.size() / 3 <= stuck_ratio * tris) {
+                    const float gentle_measured = mesh_deviation(out.positions, merged, gentle.indices);
+                    if (gentle_measured < measured) {
+                        s = std::move(gentle);
+                        measured = gentle_measured;
+                    }
+                }
+            }
+            const float error = child_error + std::max(s.error, measured);
             make_clusters(s.indices, made[g]);
             for (lod_cluster& c : made[g]) {
                 cluster_bounds(out.positions, c);

@@ -175,6 +175,15 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
         // border vertex: anything else would pull the hole's outline inward
         // or pinch it.
         if (border[from] && shared != 1) continue;
+        // Nor may a collapse delete a piece of surface outright: if no
+        // triangle would be left at `to`, an island of the scan is gone.
+        {
+            uint32_t at_to = 0;
+            for (uint32_t t : vertex_tris[to]) at_to += tri_alive[t];
+            uint32_t at_from = 0;
+            for (uint32_t t : vertex_tris[from]) at_from += tri_alive[t];
+            if (at_to + at_from - 2 * shared == 0) continue;
+        }
         uint32_t common = 0;
         ++mark_id;
         const uint32_t from_mark = mark_id - 1;
