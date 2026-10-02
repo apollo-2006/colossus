@@ -11,10 +11,10 @@
 // the vsm culling passes draw the hierarchy at each level's texel detail,
 // shading reads the nearer layer.
 
-const uint vsm_levels = 12u;
+const uint vsm_levels = 14u;
 const uint vsm_window = 32u;   // pages a side, per level
 const uint vsm_page = 128u;    // texels a side, per page
-const float vsm_texel0 = 1.0 / 1024.0;
+const float vsm_texel0 = 1.0 / 4096.0;  // fine enough for close-ups on surfaces oblique to sun and camera
 const uint vsm_slots = vsm_levels * vsm_window * vsm_window;
 const uint vsm_none = 0xffffffffu;
 
@@ -42,17 +42,18 @@ layout(set = 0, binding = 28, scalar) buffer VsmPhysPages { VsmPhys vsm_phys[]; 
 layout(set = 0, binding = 29, scalar) buffer VsmLists {
     uint vsm_request_count;    // needed, not resident
     uint vsm_unowned_count;    // free physical pages
-    uint vsm_evictable_count;  // physical pages not needed this frame
+    uint vsm_evictable_count;  // physical pages unneeded for vsm_stale frames or more
     uint vsm_render_count;        // slot layers to render
     uint vsm_rendered_levels[2];  // per layer, bit l: level l renders
     uint vsm_overflow;            // needed pages left without a physical page
-    uint vsm_pad0;
+    uint vsm_recent_count;     // physical pages unneeded this frame but needed lately
     ivec4 vsm_render_rect[2 * vsm_levels];  // per layer and level: rendered pages span [xy, zw]
     uint vsm_render_mask[2 * vsm_levels * vsm_window];  // per layer, level, slot row: bit x if slot (x, row) renders
-    // requests, unowned, evictable: vsm_slots each. then the render list, slot
-    // | layer << 31, twice that.
+    // requests, unowned: vsm_slots each. then evictable (stale, then from half way recent):
+    // vsm_slots. then the render list, slot | layer << 31, twice that.
     uint vsm_list[];
 };
+const uint vsm_stale = 8u;  // frames unneeded before a page is evicted ahead of recent ones (taa's cycle)
 const uint vsm_lists_header = 8u + 8u * vsm_levels + 2u * vsm_levels * vsm_window;
 
 // atlas: physical page p at (p mod side, p / side) * vsm_page, side =
@@ -105,6 +106,12 @@ ivec2 vsm_slot_page(uint slot) {
 uint vsm_level_for(float t) {
     const float footprint = t / frame.lod_scale;
     return uint(clamp(ceil(log2(max(footprint / vsm_texel0, 1.0))), 0.0, float(vsm_levels - 1u)));
+}
+
+// the same for a surface lit at cosine nl: a texel stretches over it by 1 / nl, so grazing surfaces
+// take finer levels (up to two).
+uint vsm_level_for(float t, float nl) {
+    return vsm_level_for(t * clamp(nl, 0.25, 1.0));
 }
 
 uint vsm_sortable(float z) {
@@ -215,7 +222,7 @@ vec2 vogel(uint k, uint n, float angle) {
 // else vogel taps rotated by `noise` (taa averages them). a tap without a physical page sends
 // the lookup up a level.
 float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
-    for (uint level = vsm_level_for(t); level < vsm_levels; ++level) {
+    for (uint level = vsm_level_for(t, dot(n, sun_dir)); level < vsm_levels; ++level) {
         used = level;
         const float texel = vsm_texel(level);
         const vec3 lp = vsm_light_space(p + n * (2.0 * texel));

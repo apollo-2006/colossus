@@ -1,38 +1,64 @@
 #version 460
-// marks the shadow pages pixels will read: per lit pixel, the page under it at
-// the level matching its footprint, and those its filter taps reach. surface
-// from the visibility buffer's depth alone.
+// marks the shadow pages pixels will read: per pixel, the page under it at the level matching its
+// footprint (finer where the sun grazes it), and those its filter taps reach. surface and normal
+// from the visibility buffer's depth alone; the plain level is always marked, the lookup's
+// fallback where the shading normal disagrees.
 #extension GL_EXT_shader_atomic_int64 : require
 #include "common.glsl"
 #include "vsm.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-void main() {
-    const uvec2 px = gl_GlobalInvocationID.xy;
-    if (px.x >= frame.width || px.y >= frame.height) return;
+// world position under a pixel and its distance: the drawn surface, the ground, or none (t < 0).
+vec3 surface_point(ivec2 px, out float t) {
+    px = clamp(px, ivec2(0), ivec2(frame.width, frame.height) - 1);
     const vec2 ndc = (vec2(px) + 0.5) / vec2(frame.width, frame.height) * 2.0 - 1.0;
     const vec4 near_point = frame.inv_view_proj * vec4(ndc, 1.0, 1.0);
     const vec3 origin = frame.origin.xyz;
     const vec3 dir = normalize(near_point.xyz / near_point.w - origin);
     const uint64_t v = vis[px.x + px.y * frame.width];
-    float t;
+    t = -1.0;
     if (v != 0ul) {
         const vec4 center = frame.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
         const vec3 forward = normalize(center.xyz / center.w - origin);
         t = frame.near_z / uintBitsToFloat(uint(v >> 32)) / dot(dir, forward);
     } else if (dir.y < 0.0) {
-        t = -origin.y / dir.y;  // ground
-    } else {
-        return;  // sky
+        t = -origin.y / dir.y;
     }
-    const uint level = vsm_level_for(t);
-    const vec2 texel = vsm_light_space(origin + dir * t).xy / vsm_texel(level);
+    return origin + dir * t;
+}
+
+void mark(uint level, vec3 p) {
+    const vec2 texel = vsm_light_space(p).xy / vsm_texel(level);
     // the lookup offsets a couple of texels and searches vsm_max_penumbra around: mark that far.
     const float reach = vsm_max_penumbra + 3.0;
     for (int k = 0; k < 4; ++k) {
         const vec2 corner = texel + vec2(k & 1, k >> 1) * (2.0 * reach) - reach;
         const ivec2 page = ivec2(floor(corner / float(vsm_page)));
         if (vsm_in_window(level, page)) vsm_entries[vsm_slot(level, page)].needed = frame.frame_index;
+    }
+}
+
+// a 2x2 block per invocation: each pixel marks its plain level; where the block is one smooth
+// surface (no depth edge), its normal from the four points marks the grazing level too.
+void main() {
+    const ivec2 block = ivec2(gl_GlobalInvocationID.xy) * 2;
+    if (block.x >= int(frame.width) || block.y >= int(frame.height)) return;
+    vec3 p[4];
+    float t[4];
+    for (int k = 0; k < 4; ++k) {
+        p[k] = surface_point(block + ivec2(k & 1, k >> 1), t[k]);
+        if (t[k] >= 0.0) mark(vsm_level_for(t[k]), p[k]);
+    }
+    // one surface: all drawn, depths within a few percent of each other.
+    for (int k = 0; k < 4; ++k)
+        if (t[k] < 0.0 || abs(t[k] - t[0]) > 0.02 * t[0]) return;
+    vec3 n = normalize(cross(p[1] - p[0], p[2] - p[0]));
+    if (dot(n, p[0] - frame.origin.xyz) > 0.0) n = -n;
+    const float nl = dot(n, sun_dir);
+    if (nl <= 0.0) return;
+    for (int k = 0; k < 4; ++k) {
+        const uint level = vsm_level_for(t[k], nl);
+        if (level != vsm_level_for(t[k])) mark(level, p[k]);
     }
 }

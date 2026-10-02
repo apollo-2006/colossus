@@ -108,7 +108,7 @@ const uint32_t hzb_spv[] = {
 
 constexpr uint32_t frames_in_flight = 2;
 // vsm.glsl's sizes.
-constexpr uint32_t vsm_levels = 12, vsm_window = 32, vsm_page = 128, vsm_slots = vsm_levels * vsm_window * vsm_window;
+constexpr uint32_t vsm_levels = 14, vsm_window = 32, vsm_page = 128, vsm_slots = vsm_levels * vsm_window * vsm_window;
 constexpr uint32_t vsm_lists_header = 8 + 8 * vsm_levels + 2 * vsm_levels * vsm_window, vsm_big_capacity = 65536;
 constexpr uint32_t max_work_items = 1u << 22;
 constexpr uint32_t max_visible = 1u << 22;  // leaves 7 bits for the triangle in a 32-bit id, and 3 to spare
@@ -226,7 +226,7 @@ struct options {
     float sw_pixels = 32;
     uint64_t pool_mb = 1024;   // page pool
     bool vsm = true;           // virtual shadow maps, not ray queries (--shadows rt)
-    uint32_t vsm_side = 32;    // physical shadow pages a side: 32 is 1024 pages, 128 mb (two layers)
+    uint32_t vsm_side = 48;    // physical shadow pages a side: 48 is 2304 pages, 288 mb (two layers)
     uint64_t upload_mb = 64;   // pages loaded per frame, at most
     int warmup = 0;            // headless: frames before timing
     float fly = 0;             // headless: camera moves this far forward per frame, turning slowly
@@ -1006,7 +1006,7 @@ private:
             compute_barrier(cmd);
         };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vsm_mark_);
-        vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
+        vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);  // a 2x2 block per invocation
         compute_barrier(cmd);
         if (sc_.moving) run(vsm_alloc_, 3, uint32_t(sc_.moving));
         run(vsm_alloc_, 0, (vsm_slots + 63) / 64);
@@ -1828,7 +1828,11 @@ options parse(int argc, char** argv) {
             const std::string kind = next();
             if (kind != "rt" && kind != "vsm") throw std::runtime_error("--shadows takes rt or vsm");
             o.vsm = kind == "vsm";
-        } else if (a == "--vsm-pages") o.vsm_side = static_cast<uint32_t>(std::stoul(next()));
+        } else if (a == "--vsm-pages") {
+            o.vsm_side = static_cast<uint32_t>(std::stoul(next()));
+            // the evictable list holds half a slot count each of stale and recent pages.
+            if (o.vsm_side == 0 || o.vsm_side * o.vsm_side > vsm_slots / 2) throw std::runtime_error("--vsm-pages takes 1 to 84");
+        }
         else if (a == "--no-taa") o.disable |= flag_taa;
         else if (a == "--no-ao") o.disable |= flag_ao;
         else if (a == "--hard-shadows") o.disable |= flag_soft_shadows;

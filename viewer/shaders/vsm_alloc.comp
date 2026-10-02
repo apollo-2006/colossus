@@ -95,16 +95,22 @@ void main() {
         if (k >= pages) return;
         const VsmPhys p = vsm_phys[k];
         if (p.last_used == frame.frame_index) return;
+        // free pages first, then those unneeded longest: a page needed every few frames (taa's
+        // jitter moves the marked edge) would otherwise be evicted and redrawn over and over.
         if (p.owner == vsm_none) vsm_list[vsm_slots + atomicAdd(vsm_unowned_count, 1u)] = k;
-        else vsm_list[2u * vsm_slots + atomicAdd(vsm_evictable_count, 1u)] = k;
+        else if (frame.frame_index - p.last_used >= vsm_stale) vsm_list[2u * vsm_slots + atomicAdd(vsm_evictable_count, 1u)] = k;
+        else vsm_list[2u * vsm_slots + vsm_slots / 2u + atomicAdd(vsm_recent_count, 1u)] = k;
     } else {
         if (k >= vsm_request_count) return;
         const uint unowned = vsm_unowned_count;
-        if (k >= unowned + vsm_evictable_count) {
+        const uint stale = vsm_evictable_count;
+        if (k >= unowned + stale + vsm_recent_count) {
             atomicAdd(vsm_overflow, 1u);
             return;
         }
-        const uint p = k < unowned ? vsm_list[vsm_slots + k] : vsm_list[2u * vsm_slots + k - unowned];
+        const uint p = k < unowned           ? vsm_list[vsm_slots + k]
+                     : k < unowned + stale   ? vsm_list[2u * vsm_slots + k - unowned]
+                                             : vsm_list[2u * vsm_slots + vsm_slots / 2u + k - unowned - stale];
         // the old page went unneeded this frame: nothing else touches it.
         const uint old = vsm_phys[p].owner;
         if (old != vsm_none) vsm_entries[old].phys = vsm_none;
