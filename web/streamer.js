@@ -3,13 +3,13 @@
 //   * loads issue dependencies first and publish in issue order;
 //   * a page depends on its dependencies from issue, and is evicted only when nothing
 //     depends on it;
-//   * pages below a request prefetch while their error, halving a level, stays over
-//     the threshold.
+//   * pages below a request prefetch while their error, at the request's screen
+//     scale, stays over the threshold.
 const NONE = 0xffffffff;
 const MAX_GAP = 64 << 10, MAX_RUN = 4 << 20;  // merging range requests: as viewer/streamer.hpp
 
 export class Streamer {
-  // pages: [{url, offset, size, deps: [global page], children: [global page], pinned}]
+  // pages: [{url, offset, size, deps: [global page], children: [global page], error, pinned}]
   constructor(pages, poolBytes, { maxInFlight = 256, uploadBytes = 16 << 20 } = {}) {
     this.pages = pages;
     let largest = 16;
@@ -66,10 +66,13 @@ export class Streamer {
       const stack = [[requests[r][0], requests[r][1]]];
       while (stack.length && best.size < 4096) {
         const [page, priority] = stack.pop();
-        if (priority * 0.5 <= threshold) continue;
-        for (const c of this.pages[page].children) {
-          want(c, priority * 0.5);
-          stack.push([c, priority * 0.5]);
+        const pg = this.pages[page];
+        const known = pg.error > 0 && Number.isFinite(pg.error);
+        for (const c of pg.children) {
+          const predicted = known ? priority * (this.pages[c].error / pg.error) : priority * 0.5;
+          if (predicted <= threshold) continue;
+          want(c, predicted);
+          stack.push([c, predicted]);
         }
       }
     }

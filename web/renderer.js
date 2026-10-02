@@ -248,7 +248,7 @@ export class Renderer {
       }
       m.pages.forEach((p, i) => pages.push({
         url: m.pagesUrl, offset: p.offset, size: p.size, pinned: i === 0,
-        deps: p.deps.map((x) => x + pageBase), children: p.children.map((x) => x + pageBase),
+        deps: p.deps.map((x) => x + pageBase), children: p.children.map((x) => x + pageBase), error: p.error,
       }));
       const mu = new Uint32Array(meshes, k * 64, 4), mf = new Float32Array(meshes, k * 64 + 16, 12);
       mu[0] = clusterBase;

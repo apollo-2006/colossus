@@ -55,14 +55,18 @@ export function parseMeta(buffer) {
     const first = pageView.getUint32(o + 12, true), count = pageView.getUint32(o + 16, true);
     pages.push({
       offset: Number(pageView.getBigUint64(o, true)), size: pageView.getUint32(o + 8, true),
-      deps: Array.from(deps.subarray(first, first + count)), children: [],
+      deps: Array.from(deps.subarray(first, first + count)), children: [], error: 0,
     });
   }
   // each page's children: the finer pages its clusters stand for (cluster word
-  // 24 is the creator page, word 23 its own).
+  // 24 is the creator page, word 23 its own). its error, the clusters' parent
+  // error (word 17), for prefetch.
+  const floats = new Float32Array(clusters);
   for (let c = 0; c < clusterCount; c++) {
+    const page = pages[words[28 * c + 23]];
     const creator = words[28 * c + 24];
-    if (creator !== 0xffffffff) pages[words[28 * c + 23]].children.push(creator);
+    if (creator !== 0xffffffff) page.children.push(creator);
+    page.error = Math.max(page.error, floats[28 * c + 17]);
   }
   for (const p of pages) p.children = [...new Set(p.children)];
   let leafTriangles = 0;
