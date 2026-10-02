@@ -225,7 +225,7 @@ export class Renderer {
     // 28) pass 2 instance culling, [28, 36) expand per pass, [36, 40) pass 1 instance
     // culling, [40, 44) pass 2 cell culling.
     this.args = d.createBuffer({ size: 176, usage: S | GPUBufferUsage.INDIRECT });
-    this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 96, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
+    this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 112, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
     this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
     this.frameIndex = 0;
     this.time = 0;
@@ -697,12 +697,12 @@ export class Renderer {
     // stats and timings return a few frames late, into a free readback buffer.
     const rb = this.readbacks.find((x) => !x.busy);
     if (rb) {
-      // shadow pages rendered and their clusters, into the counters' spare words.
+      // shadow pages rendered and their clusters, into the words after the counters (100).
       if (shadows) {
-        enc.copyBufferToBuffer(this.vsmLists, 12, this.counters, 88, 4);
-        enc.copyBufferToBuffer(this.vsmWork, 8, this.counters, 92, 4);
+        enc.copyBufferToBuffer(this.vsmLists, 12, this.counters, 100, 4);
+        enc.copyBufferToBuffer(this.vsmWork, 8, this.counters, 104, 4);
       }
-      enc.copyBufferToBuffer(this.counters, 0, rb.buffer, 0, 96);
+      enc.copyBufferToBuffer(this.counters, 0, rb.buffer, 0, 112);
     }
     const tb = this.timestamps && this.timeReadbacks.find((x) => !x.busy);
     if (tb) {
@@ -730,7 +730,7 @@ export class Renderer {
         rb.busy = false;
         this.stats = {
           work: u[0] + u[1], hw: u[2], sw: u[3], instances: u[4], tested: u[5], triangles: u[6], overflow: u[7],
-          hiddenLastFrame: u[9], instancesOccluded: u[10], late: u[11], shadowPages: u[22], shadowClusters: u[23],
+          hiddenLastFrame: u[9], instancesOccluded: u[10], late: u[11], shadowPages: u[25], shadowClusters: u[26],
         };
       });
     }
