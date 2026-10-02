@@ -244,18 +244,20 @@ export class Renderer {
   loadModels(models, poolBytes) {
     const d = this.device;
     const total = models.reduce((a, m) => ({ c: a.c + m.clusterCount, p: a.p + m.pages.length }), { c: 0, p: 0 });
-    const clusters = new ArrayBuffer(total.c * 112);
+    const clusters = new ArrayBuffer(total.c * 48);
+    const shared = new Float32Array(total.p * 5);
     const meshes = new ArrayBuffer(models.length * 64);
     const pages = [];
     let clusterBase = 0;
     models.forEach((m, k) => {
       const pageBase = pages.length;
-      const dst = new Uint32Array(clusters, clusterBase * 112, m.clusterCount * 28);
+      const dst = new Uint32Array(clusters, clusterBase * 48, m.clusterCount * 12);
       dst.set(new Uint32Array(m.clusters));
       for (let c = 0; c < m.clusterCount; c++) {
-        dst[28 * c + 23] += pageBase;                                       // its page
-        if (dst[28 * c + 24] !== 0xffffffff) dst[28 * c + 24] += pageBase;  // the finer clusters' page
+        dst[12 * c + 7] += pageBase;                                      // its page
+        if (dst[12 * c + 8] !== 0xffffffff) dst[12 * c + 8] += pageBase;  // the finer clusters' page
       }
+      shared.set(m.shared, 5 * pageBase);
       m.pages.forEach((p, i) => pages.push({
         url: m.pagesUrl, offset: p.offset, size: p.size, pinned: i === 0,
         deps: p.deps.map((x) => x + pageBase), children: p.children.map((x) => x + pageBase), error: p.error,
@@ -278,7 +280,10 @@ export class Renderer {
     };
     this.clusterBuffer = upload(clusters);
     this.meshBuffer = upload(meshes);
-    this.pageTable = d.createBuffer({ size: pages.length * 4, usage: S | CD });
+    // the page table (rewritten each frame), then each page's shared bounds (common.wgsl).
+    this.pageTable = d.createBuffer({ size: pages.length * 4 + shared.byteLength, usage: S | CD });
+    d.queue.writeBuffer(this.pageTable, pages.length * 4, shared);
+    this.pageCount = pages.length;
     this.pool = d.createBuffer({ size: this.streamer.slotCount * this.streamer.slotBytes, usage: S | CD });
     // per page: frame last drawn from, then frame last asked for.
     this.pageStamps = d.createBuffer({ size: pages.length * 8, usage: S | CD | CS });
@@ -513,6 +518,7 @@ export class Renderer {
     ff[66] = camera.near;
     fu[67] = settings.mode;
     fu[68] = MAX_WORK; fu[69] = MAX_VISIBLE;
+    fu[74] = this.pageCount;
     ff[70] = settings.swPixels;
     ff[71] = time;
     ff[151] = prevTime;

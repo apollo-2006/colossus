@@ -30,7 +30,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) local: u32) -> Ve
   var out: VertexOut;
   let ii = counters.pass_start[pass_info.pass_index] + local;
   let v = hw_visible[ii];
-  let c = clusters[v.y];
+  let c = load_cluster(v.y);
   let tri = vi / 3u;
   out.id = (ii << 7u) | tri;
   if (tri >= c.triangle_count) {

@@ -296,7 +296,7 @@ fn vsm_instance(@builtin(global_invocation_id) gid: vec3u) {
     var hi = m.cluster_count;
     while (lo < hi) {
       let mid = (lo + hi) / 2u;
-      if (clusters[m.first_cluster + mid].parent_error > limit) { hi = mid; } else { lo = mid + 1u; }
+      if (cluster_parent_error(m.first_cluster + mid) > limit) { hi = mid; } else { lo = mid + 1u; }
     }
     let chunks = (m.cluster_count - lo + 63u) / 64u;
     if (chunks == 0u) { continue; }
@@ -360,7 +360,7 @@ fn vsm_cluster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
   let m = meshes[inst.mesh];
   let cluster = word(VW_WORK + 2u * item + 1u) + lane;
   if (cluster >= m.first_cluster + m.cluster_count) { return; }
-  let c = clusters[cluster];
+  let c = load_cluster(cluster);
   let texel = vsm_texel(level);
   let self_error = c.lod_error * inst.scale / texel;
   let coarse_enough = c.parent_error * inst.scale / texel > frame.lod_threshold;
@@ -568,7 +568,7 @@ fn vsm_raster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
   let level = (tagged >> 24u) & 15u;
   let layer = tagged >> 28u;
   let inst = load_instance(tagged & 0xffffffu);
-  let c = clusters[cluster];
+  let c = load_cluster(cluster);
   let texel = vsm_texel(level);
   if (t == 0u) { atomicStore(&together_count, 0u); }
   if (valid && t < c.vertex_count) {

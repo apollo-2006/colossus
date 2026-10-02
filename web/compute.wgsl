@@ -314,7 +314,7 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
       var hi = m.cluster_count;
       while (lo < hi) {
         let mid = (lo + hi) / 2u;
-        if (clusters[m.first_cluster + mid].parent_error > limit) { hi = mid; } else { lo = mid + 1u; }
+        if (cluster_parent_error(m.first_cluster + mid) > limit) { hi = mid; } else { lo = mid + 1u; }
       }
       chunks = (m.cluster_count - lo + 63u) / 64u;
       first = m.first_cluster + lo;
@@ -455,7 +455,7 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
     cluster_id = w.y + lane;
     if (cluster_id < m.first_cluster + m.cluster_count) {
       atomicAdd(&wg_tested, 1u);
-      let c = clusters[cluster_id];
+      let c = load_cluster(cluster_id);
       let s = inst.scale;
       let lod = lod_test(inst, c);
       draw = lod.draw;
@@ -493,7 +493,7 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       instance_id = ic.x;
       cluster_id = ic.y;
       let inst = load_instance(instance_id);
-      let c = clusters[cluster_id];
+      let c = load_cluster(cluster_id);
       let center = to_world(inst, c.center);
       let r = c.radius * inst.scale;
       draw = !occluded(center, r);
@@ -581,7 +581,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   if (workgroupUniformLoad(&wg_valid) == 0u) { return; }
   let v = sw_visible[k];
   let inst = load_instance(v.x);
-  let c = clusters[v.y];
+  let c = load_cluster(v.y);
   if (lane < c.vertex_count) {
     let clip = frame.view_proj * vec4f(to_world(inst, cluster_position(c, meshes[inst.mesh].grid, lane)), 1.0);
     let ndc = clip.xy / clip.w;
@@ -890,7 +890,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     }
   } else {
     let inst = load_instance(vc.x);
-    let c = clusters[vc.y];
+    let c = load_cluster(vc.y);
     let packed = cluster_triangle(c, tri);
     let i0 = packed & 255u;
     let i1 = (packed >> 8u) & 255u;

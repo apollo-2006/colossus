@@ -14,7 +14,7 @@ for path in sys.argv[1:]:
         n = struct.unpack_from("<Q", data, at)[0]
         at += 8 + n * element
 
-    for element in (112, 24, 4, 40):  # clusters, pages, dependencies, levels
+    for element in (48, 20, 24, 4, 40):  # clusters, page bounds, pages, dependencies, levels
         skip(element)
     size = struct.unpack_from("<Q", data, at)[0]
     at += 8

@@ -2,7 +2,7 @@
 // and dependencies, all of a .cgeo but page data, which streams from name.pages
 // (web/streamer.js). layout: include/paged_file.hpp.
 
-const MAGIC = 'CGEOv007';
+const MAGIC = 'CGEOv008';
 
 // streams a url, reporting (bytes so far, total or 0), gunzipping .gz names.
 export async function fetchBytes(url, onProgress) {
@@ -42,12 +42,13 @@ export function parseMeta(buffer) {
     at += n * elementBytes;
     return slice;
   };
-  const clusters = array(112);
+  const clusters = array(48);  // packed_cluster
+  const shared = new Float32Array(array(20));  // page_bounds: centre, radius, error
   const pageBytes = array(24);
   const deps = new Uint32Array(array(4));
   array(40);  // level stats
   const pageView = new DataView(pageBytes);
-  const clusterCount = clusters.byteLength / 112;
+  const clusterCount = clusters.byteLength / 48;
   const words = new Uint32Array(clusters);
   const pages = [];
   for (let p = 0; p < pageBytes.byteLength / 24; p++) {
@@ -55,24 +56,20 @@ export function parseMeta(buffer) {
     const first = pageView.getUint32(o + 12, true), count = pageView.getUint32(o + 16, true);
     pages.push({
       offset: Number(pageView.getBigUint64(o, true)), size: pageView.getUint32(o + 8, true),
-      deps: Array.from(deps.subarray(first, first + count)), children: [], error: 0,
+      deps: Array.from(deps.subarray(first, first + count)), children: [], error: shared[5 * p + 4],
     });
   }
   // each page's children: the finer pages its clusters stand for (cluster word
-  // 24 is the creator page, word 23 its own). its error, the clusters' parent
-  // error (word 17), for prefetch.
-  const floats = new Float32Array(clusters);
+  // 8 is the creator page, word 7 its own).
   for (let c = 0; c < clusterCount; c++) {
-    const page = pages[words[28 * c + 23]];
-    const creator = words[28 * c + 24];
-    if (creator !== 0xffffffff) page.children.push(creator);
-    page.error = Math.max(page.error, floats[28 * c + 17]);
+    const creator = words[12 * c + 8];
+    if (creator !== 0xffffffff) pages[words[12 * c + 7]].children.push(creator);
   }
   for (const p of pages) p.children = [...new Set(p.children)];
-  let leafTriangles = 0;
-  for (let c = 0; c < clusterCount; c++) if (words[28 * c + 22] === 0) leafTriangles += words[28 * c + 21];
+  let leafTriangles = 0;  // the triangle count rides in word 9's top byte
+  for (let c = 0; c < clusterCount; c++) if (words[12 * c + 8] === 0xffffffff) leafTriangles += words[12 * c + 9] >>> 24;
   return {
     bounds: header.slice(0, 4), lodBounds: header.slice(4, 8), grid: header.slice(8, 12),
-    clusters, clusterCount, pages, leafTriangles,
+    clusters, shared, clusterCount, pages, leafTriangles,
   };
 }

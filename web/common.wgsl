@@ -21,7 +21,7 @@ struct Frame {
   time: f32,
   frame_index: u32,   // from 1: stamps pages used and requested
   max_requests: u32,
-  pad0: u32,
+  page_count: u32,  // page_table's entries; the pages' shared bounds follow
   pad1: u32,
   unused0: mat4x4f,  // was the old shadow map's camera; kept for the layout
   unused1: f32,
@@ -44,8 +44,8 @@ struct Frame {
   prev_time: f32,  // last frame's time, for motion
 }
 
-// gpu_cluster (include/geometry_file.hpp) as paged: 112 bytes. `group` is its
-// page; offsets are words into it.
+// gpu_cluster (include/geometry_file.hpp) as paged, unpacked by load_cluster().
+// `group` is its page; offsets are words into it.
 struct Cluster {
   center: vec3f,
   radius: f32,
@@ -67,6 +67,20 @@ struct Cluster {
   // corner on the model's grid. three u32, not vec3u, which would align to 16
   // and make 128 bytes.
   origin_x: u32,
+  origin_y: u32,
+  origin_z: u32,
+}
+
+// as stored: packed_cluster (include/paged_file.hpp), 48 bytes.
+struct PackedCluster {
+  center: vec3f,
+  radius: f32,
+  cone: u32,     // axis u (11) | v (11) << 11 | cutoff (10) << 22
+  offsets: u32,  // vertex_offset | triangle_offset << 16
+  level: u32,    // level word | vertex_count << 24
+  group: u32,
+  creator: u32,
+  origin_x: u32,  // 24 bits each, origin_x | triangle_count << 24
   origin_y: u32,
   origin_z: u32,
 }
@@ -99,11 +113,66 @@ const FLAG_AO = 512u;  // ambient occlusion (ao.wgsl)
 const FLAG_SOFT_SHADOWS = 1024u;  // contact-hardening penumbras (sunlight())  // last frame's pyramid fits this frame
 
 @group(0) @binding(0) var<uniform> frame: Frame;
-@group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
+@group(0) @binding(1) var<storage, read> packed_clusters: array<PackedCluster>;
 // pages stream into the pool (web/streamer.js); the page table holds each one's
-// first word, or NO_PAGE.
+// first word, or NO_PAGE. after its frame.page_count entries, each page's shared
+// bounds: centre, radius, error.
 const NO_PAGE = 0xffffffffu;
 @group(0) @binding(2) var<storage, read> page_table: array<u32>;
+
+fn decode_octahedral(uv: u32) -> vec3f {
+  let e = vec2f(f32(uv & 2047u), f32((uv >> 11u) & 2047u)) / 2047.0 * 2.0 - 1.0;
+  var n = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
+  if (n.z < 0.0) {
+    n = vec3f((1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0), (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0), n.z);
+  }
+  return normalize(n);
+}
+
+fn page_sphere(p: u32) -> vec4f {
+  let at = frame.page_count + 5u * p;
+  return bitcast<vec4f>(vec4u(page_table[at], page_table[at + 1u], page_table[at + 2u], page_table[at + 3u]));
+}
+
+fn page_error(p: u32) -> f32 { return bitcast<f32>(page_table[frame.page_count + 5u * p + 4u]); }
+
+// for the binary searches over a model's clusters (sorted by it).
+fn cluster_parent_error(i: u32) -> f32 { return page_error(packed_clusters[i].group); }
+
+fn load_cluster(i: u32) -> Cluster {
+  let p = packed_clusters[i];
+  var c: Cluster;
+  c.center = p.center;
+  c.radius = p.radius;
+  let steps = p.cone >> 22u;
+  c.cone_axis = select(decode_octahedral(p.cone), vec3f(0.0, 0.0, 1.0), steps == 1023u);
+  c.cone_cutoff = f32(steps) / 1023.0 * 2.0 - 1.0;
+  c.vertex_offset = p.offsets & 0xffffu;
+  c.triangle_offset = p.offsets >> 16u;
+  c.level = p.level & 0xffffffu;
+  c.vertex_count = p.level >> 24u;
+  c.group = p.group;
+  c.creator = p.creator;
+  c.origin_x = p.origin_x & 0xffffffu;
+  c.origin_y = p.origin_y;
+  c.origin_z = p.origin_z;
+  c.triangle_count = p.origin_x >> 24u;
+  let parent = page_sphere(p.group);
+  c.parent_center = parent.xyz;
+  c.parent_radius = parent.w;
+  c.parent_error = page_error(p.group);
+  if (p.creator == NO_PAGE) {
+    c.lod_center = p.center;
+    c.lod_radius = p.radius;
+    c.lod_error = 0.0;
+  } else {
+    let lod = page_sphere(p.creator);
+    c.lod_center = lod.xyz;
+    c.lod_radius = lod.w;
+    c.lod_error = page_error(p.creator);
+  }
+  return c;
+}
 @group(0) @binding(3) var<storage, read> pool: array<u32>;
 @group(0) @binding(6) var<storage, read> meshes: array<Mesh>;
 @group(0) @binding(7) var<storage, read> instances: array<Instance>;
@@ -181,13 +250,7 @@ fn cluster_position(c: Cluster, grid: vec4f, k: u32) -> vec3f {
 fn cluster_normal(c: Cluster, k: u32) -> vec3f {
   let b = cluster_widths(c);
   let xyz = b.x + b.y + b.z;
-  let uv = read_bits(page_table[c.group] + c.vertex_offset, k * (xyz + 22u) + xyz, 22u);
-  let e = vec2f(f32(uv & 2047u), f32(uv >> 11u)) / 2047.0 * 2.0 - 1.0;
-  var n = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
-  if (n.z < 0.0) {
-    n = vec3f((1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0), (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0), n.z);
-  }
-  return normalize(n);
+  return decode_octahedral(read_bits(page_table[c.group] + c.vertex_offset, k * (xyz + 22u) + xyz, 22u));
 }
 
 // triangle t as a | b << 8 | c << 16.
