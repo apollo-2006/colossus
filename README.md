@@ -19,9 +19,10 @@ with.
 ![900 instances of Lucy and the XYZ RGB dragon, lit by the sun with ray traced shadows](docs/crowd.png)
 
 900 instances of Lucy (28M triangles) and the XYZ RGB dragon (7.2M), 15.9 billion
-triangles at full detail, drawn at 1920x1080 in 0.81 ms on an RX 9070 XT, shadows and
+triangles at full detail, drawn at 1920x1080 in 0.84 ms on an RX 9070 XT, shadows and
 antialiasing included. About 3M triangles reach the screen, from 23 MB of the 579 MB
-on disk.
+on disk. A million instances (17.6 trillion triangles) take 1.32 ms, and instances
+can move.
 
 ## How it works
 
@@ -65,16 +66,29 @@ on disk.
 * **Checked for cracks.** Since every level uses the original vertices, a crack is
   exact to detect: an edge used by one triangle of a cut whose ends are not both on a
   hole in the scan. `colossus_build --check` selects 25 cuts across the error range and
-  counts them. Lucy builds 19 levels in 83 s and the dragon 19 levels in 21 s, every
+  counts them. Lucy builds 23 levels in 84 s and the dragon 21 levels in 21 s, every
   cut with 0 cracked edges.
+* **One small root.** Near the top, a model's last group is thin parts and hole rims,
+  and edge collapses that keep the topology run out: Lucy used to stop at three roots
+  of 313 triangles. Nothing borders the last group, so there vertex clustering takes
+  over: one original vertex per cell of a grid, the grid made coarser until the count
+  halves. Duplicate triangles are kept, so every edge keeps the parity of its use
+  count, and a cell with a hole vertex keeps one, so the crack check still holds.
+  Lucy now ends in one root of 20 triangles and the dragon in one of 32.
 
 ### Drawing it (`colossus`)
 
-1. **Instance culling** (`instance_cull.comp`) drops instances outside the view and,
+1. **Instance culling.** Instances are placed in cells of 8x8 neighbours, and
+   `cell_cull.comp` tests a sphere around each cell against the frustum and the depth
+   pyramid before any of its instances is read. `instance_cull.comp` then takes the
+   visible cells' instances, one per invocation: it drops those outside the view and,
    for the rest, finds which clusters could be drawn at all. Clusters are stored in
    order of parent error, and one can only be drawn while its parent looks too coarse,
    so a binary search skips every cluster fine enough anywhere on the instance. A far
-   instance tests a short tail of its coarsest clusters, not all 445k.
+   instance tests a short tail of its coarsest clusters, not all 445k. The workgroup
+   writes its instances' work together after a prefix sum of their counts; a near
+   instance, thousands of pieces of work, gets a workgroup of its own
+   (`expand.comp`).
 2. **Cluster culling** (`cluster_cull.comp`) tests the rest: the LOD cut, the
    frustum, the normal cone, and occlusion. Survivors are appended to a list with one
    atomic per subgroup. This began as a task shader; on RADV each task workgroup has a
@@ -88,11 +102,12 @@ on disk.
    no gaps. Its edge functions are 32-bit, measured from each triangle's corner: RDNA
    has no 64-bit integer multiply, and the first, 64-bit version lost to the hardware
    at every size.
-4. **Occlusion in two passes.** Pass 1 tests against last frame's depth pyramid, from
-   last frame's camera, and draws what it cannot prove hidden. A pyramid is built from
-   what it drew, and pass 2 tests what pass 1 rejected again, drawing anything this
-   frame reveals. The pyramid is built from the visibility buffer, so both
-   rasterizers count.
+4. **Occlusion in two passes.** Pass 1 tests cells, instances and clusters against
+   last frame's depth pyramid, from last frame's camera, and draws what it cannot
+   prove hidden. A pyramid is built from what it drew, and pass 2 tests what pass 1
+   rejected again, drawing anything this frame reveals. The pyramid is built from the
+   visibility buffer, so both rasterizers count. A moving instance is tested where it
+   was last frame, since that is where last frame's pyramid has it.
 5. **Shading** (`shade.comp`) finds each pixel's triangle again, intersects the
    pixel's ray with it for exact barycentrics, and interpolates normals. Each instance
    is one of five materials (marble, sandstone, granite, bronze or gold), lit with
@@ -106,13 +121,15 @@ on disk.
    and traces its own ray at shadow edges and silhouettes. Rays stop once they climb above
    the tallest model. Together these took the three views below from 0.40, 0.55 and
    0.48 ms of shading to 0.32, 0.44 and 0.37 ms, with 0.07% to 0.37% of pixels
-   visibly different.
+   visibly different. Moving instances are in a second acceleration structure,
+   refitted every frame (see Motion and scale).
 7. **Antialiasing** (`taa.comp`). Each frame's projection is nudged by a sub-pixel
    offset, eight in turn, and each pixel is blended 10% into a history found by
    projecting the surface under it with last frame's camera, the nudge taken back
    out, so a still camera never resamples its history. The history is read through a
    Catmull-Rom filter so a moving camera does not blur it, and held to the colours of
-   the pixel's 3x3 neighbourhood so nothing ghosts. It costs 0.05 to 0.07 ms.
+   the pixel's 3x3 neighbourhood so nothing ghosts. A moving surface is reprojected
+   through its instance's last transform. It costs 0.05 to 0.07 ms.
 8. **Streaming.** Only the clusters' bounds and errors stay resident. Their geometry is
    packed into pages, one per group, and paged from disk into a fixed pool
    (`--pool-mb`, 1 GB by default) as the GPU asks for it. A cluster that is drawn but
@@ -152,6 +169,34 @@ on disk.
    file cache, the render thread's worst frame in the streamer is 2.0 ms with loader
    threads, against 44 ms reading pages itself (`--sync-loads`).
 
+### Motion and scale
+
+`--moving F` sets a share of the instances moving: each turns on the spot and drifts
+round a small circle. The motion is computed in the shaders from the time
+(`animate()` in `common.glsl`), so a million moving instances cost no uploads, and
+every read of an instance goes through it. Occlusion pass 1 and antialiasing use the
+transform an instance had last frame. For shadows, the moving instances are kept in a
+second top-level acceleration structure: `tlas.comp` writes their transforms and it is
+refitted in place each frame. A refit on RADV costs by the size of the whole structure
+(2.7k entries 0.25 ms, 270k entries 0.94 ms, however few moved), so the still
+instances stay in a structure built once, and a shadow ray that misses it also tests
+the moving one.
+
+| instances | moving | frame | triangles |
+|---|---|---|---|
+| 900 | none | 0.84 ms | 3.0M |
+| 900 | half | 1.12 ms | 3.1M |
+| 90,000 | 1% | 1.31 ms | 6.5M |
+| 90,000 | half | 1.72 ms | 6.5M |
+| 1,000,000 | none | 1.32 ms | 8.9M |
+| 1,000,000 | 1% | 1.73 ms | 9.8M |
+
+The crowd view, 1920x1080. About 0.16 ms of the cost of motion is a refit's fixed cost,
+paid even for nine moving instances. At a million instances occlusion culling is what
+makes it work: without it the same view draws 72M triangles in 3.84 ms. Instance
+culling used to give each instance a workgroup, and pass 2 dispatched one for every
+instance in the scene; a million took 2.95 ms, most of it in culling.
+
 ![Lucy, each cluster in its own color](docs/clusters.png)
 
 Each cluster of Lucy in its own color (debug view 2).
@@ -186,12 +231,16 @@ no ray queries and no push constants:
 * Shadows come from a 2048x2048 shadow map over the ground in front of the camera,
   its casters picked by a second run of the same culling with an orthographic
   camera, at an error of 8 texels. Materials and antialiasing are the viewer's.
+* A quarter of the crowd moves, as in the viewer, and instances are culled one per
+  invocation with the same prefix sum and expansion; there are no cells, the demo
+  being at its storage buffer budget. The crowd slider goes to a million.
 
 The models are trimmed to 4M triangles at their finest (`colossus_build --max-triangles`,
 which keeps the hierarchy above that cut intact): about 4 MB of gzipped metadata each,
-loaded up front, and about 71 MB of pages, streamed. 900 instances (3.6 billion triangles at
-full detail) take 0.72 ms of GPU time at 1600x813 in Chrome on the RX 9070 XT, drawing
-2M triangles from 5 MB of pages. It needs 14 storage buffers per shader stage, which
+loaded up front, and about 71 MB of pages, streamed. In Chrome on the RX 9070 XT at
+1600x813, 900 instances (3.6 billion triangles at full detail) take 0.73 ms of GPU
+time, drawing 2.2M triangles from 5 MB of pages, and a million (4 trillion) take
+1.19 ms. It needs 14 storage buffers per shader stage, which
 desktop GPUs allow. `web/build.sh` builds the models, and
 `node tests/web_screenshot.mjs` renders the page in a headless Chrome.
 
@@ -208,6 +257,7 @@ models/fetch.sh            # downloads Lucy and the dragon (380 MB) and builds b
 
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30
 ./colossus --model models/lucy.cgeo                       # one Lucy
+./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 1000 --moving 0.01
 ./colossus_build any.ply out.cgeo --check                       # your own model, checked for cracks
 ```
 
@@ -252,17 +302,18 @@ RX 9070 XT (RADV), 1920x1080, the 900 instance scene above, median of 200 frames
 
 | camera | frame | culling | raster | pass 2 | shading | triangles | clusters |
 |---|---|---|---|---|---|---|---|
-| beside Lucy (top image) | 0.81 ms | 0.14 | 0.18 | 0.09 | 0.40 | 3.00M | 25.0k |
-| raised (LOD image) | 0.98 ms | 0.07 | 0.24 | 0.08 | 0.58 | 4.33M | 36.7k |
-| ground level | 0.74 ms | 0.11 | 0.17 | 0.10 | 0.37 | 2.59M | 21.5k |
+| beside Lucy (top image) | 0.84 ms | 0.17 | 0.18 | 0.10 | 0.39 | 2.99M | 25.0k |
+| raised (LOD image) | 1.00 ms | 0.10 | 0.24 | 0.09 | 0.57 | 4.33M | 36.7k |
+| ground level | 0.77 ms | 0.13 | 0.17 | 0.10 | 0.37 | 2.58M | 21.4k |
 
-Without shadows the three take 0.56, 0.57 and 0.52 ms, so shadow rays are still the
-largest single cost. Without antialiasing, 0.75, 0.91 and 0.68 ms. Turning the compute
+Without shadows the three take 0.60, 0.60 and 0.55 ms, so shadow rays are still the
+largest single cost. Without antialiasing, 0.77, 0.93 and 0.70 ms. Turning the compute
 rasterizer off costs 0.30 to 0.43 ms (raster time roughly triples). Occlusion culling
-removes 46% of the triangles at ground level (4.77M to 2.59M, 0.82 to 0.74 ms), and
-next to nothing from the raised camera, which sees over the crowd.
+removes 46% of the triangles at ground level (4.77M to 2.58M, 0.84 to 0.77 ms), and
+next to nothing from the raised camera, which sees over the crowd. The culling built
+for a million instances (cells, an expansion pass) costs these 900 about 0.03 ms.
 
-These are more triangles than earlier versions drew (0.86M beside Lucy), and that is
+These are more triangles than early versions drew (0.86M beside Lucy), and that is
 the error bound becoming honest: with errors measured rather than estimated, levels
 that used to be picked while straying several pixels are now refused. The commit
 messages have each step's numbers.
@@ -272,15 +323,17 @@ messages have each step's numbers.
 * The error is measured by sampling each surface at its vertices, edge midpoints and
   triangle centres, so it can still miss a narrow spike between samples; it is a
   close bound, not a proof.
-* At the top of Lucy's hierarchy three groups were too small to simplify further, so
-  she has three roots rather than one.
 * Refinement still takes 17 to 45 frames from a cold start, since each level is a
   request, a read and a publish; prefetching only overlaps the levels.
+* Motion is rigid, per instance: nothing deforms, and the instances' paths are built
+  in. Refitting the moving instances' acceleration structure has a fixed cost of
+  about 0.16 ms on RADV however few move.
+* At a million instances shadow rays cost more (0.55 ms of shading against 0.39),
+  the acceleration structure holding three million entries.
 * Materials are a few parameters per instance, with no textures.
-* Antialiasing assumes the scene is still: there are no motion vectors, so a moving
-  object would rely on the neighbourhood clamp alone.
-* The browser's shadows cover a 16 unit square in front of the camera, and its pages
-  are not compressed beyond what the server does.
+* The browser's shadows cover a 16 unit square in front of the camera, it culls
+  instances without cells, and its pages are not compressed beyond what the server
+  does.
 
 ## Models
 
