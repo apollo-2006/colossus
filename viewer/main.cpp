@@ -230,7 +230,7 @@ struct options {
     uint64_t upload_mb = 64;   // pages loaded per frame, at most
     int warmup = 0;            // headless: frames before timing
     float fly = 0;             // headless: camera moves this far forward per frame, turning slowly
-    unsigned loader_threads = 2;  // 0: read pages on the render thread
+    unsigned loader_threads = 8;  // 0: read pages on the render thread. mostly waiting on disk: nvme wants queue depth
     bool cold = false;         // evict the models from the os file cache first
     bool mixed_materials = true;
     float moving = 0;  // share of moving instances (animate() in common.glsl)
