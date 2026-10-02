@@ -3,7 +3,7 @@
 // does not stream: every page is loaded, and the page table is where each
 // one starts in the data.
 
-const MAGIC = 'CGEOv005';
+const MAGIC = 'CGEOv006';
 
 // Streams a URL, reporting progress as (bytes so far, total or 0), and
 // gunzips it if its name ends in .gz.

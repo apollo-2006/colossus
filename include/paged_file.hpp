@@ -4,7 +4,8 @@
 // group, loaded as needed.
 //
 // A page holds everything its clusters draw from: for each cluster, its
-// vertices and then its triangles (three bytes in a word). The vertices a
+// vertices and then its triangles, three bytes each, packed end to end
+// (the cluster's last word padded). The vertices a
 // cluster shares with its neighbours are stored again, which costs space
 // but leaves a cluster nothing to look up but its own page.
 //
@@ -70,4 +71,6 @@ paged_geometry load_paged(const std::string& path, bool with_data);
 
 // A vertex of a cluster, from its two words.
 vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* vertex);
+// Triangle t of a cluster (a | b << 8 | c << 16), from its page's words.
+uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t);
 vec3 decode_normal(const uint32_t* vertex);

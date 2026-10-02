@@ -251,7 +251,7 @@ void test_hierarchy(const char* name, const mesh& input) {
             const vec3 n = decode_normal(w);
             worst_normal = std::min(worst_normal, dot(n, vec3(g.normals[3 * v], g.normals[3 * v + 1], g.normals[3 * v + 2])));
         }
-        for (uint32_t t = 0; t < c.triangle_count; ++t) wrong += base[pc.triangle_offset + t] != g.cluster_triangles[c.triangle_offset + t];
+        for (uint32_t t = 0; t < c.triangle_count; ++t) wrong += decode_triangle(pc, base, t) != g.cluster_triangles[c.triangle_offset + t];
     }
     std::printf("  %zu pages, %.0f KB; positions within %.2f grid steps, normals within %.3f degrees\n", back.pages.size(),
                 back.data_size / 1024.0, worst_position / back.grid_step, std::acos(std::min(1.0f, worst_normal)) * 57.2958f);

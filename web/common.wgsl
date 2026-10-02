@@ -109,8 +109,14 @@ fn cluster_normal(c: Cluster, k: u32) -> vec3f {
   return normalize(n);
 }
 
+// Triangles are three bytes each, packed end to end.
 fn cluster_triangle(c: Cluster, t: u32) -> u32 {
-  return pool[page_table[c.group] + c.triangle_offset + t];
+  let byte = 3u * t;
+  let at = page_table[c.group] + c.triangle_offset + byte / 4u;
+  let shift = (byte % 4u) * 8u;
+  var v = pool[at] >> shift;
+  if (shift > 8u) { v |= pool[at + 1u] << (32u - shift); }
+  return v & 0xffffffu;
 }
 
 fn sphere_in_frustum(c: vec3f, r: f32) -> bool {

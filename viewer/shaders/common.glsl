@@ -128,8 +128,13 @@ vec3 cluster_normal(uint base, Cluster c, uint k) {
     return normalize(n);
 }
 
+// Triangles are three bytes each, packed end to end: the word one starts
+// in, and the next if it runs over.
 uint cluster_triangle(uint base, Cluster c, uint t) {
-    return pool[base + c.triangle_offset + t];
+    const uint byte = 3u * t, at = base + c.triangle_offset + byte / 4u, shift = (byte % 4u) * 8u;
+    uint v = pool[at] >> shift;
+    if (shift > 8u) v |= pool[at + 1u] << (32u - shift);
+    return v & 0xffffffu;
 }
 layout(set = 0, binding = 6, scalar) readonly buffer Meshes { Mesh meshes[]; };
 layout(set = 0, binding = 7, scalar) readonly buffer Instances { Instance instances[]; };

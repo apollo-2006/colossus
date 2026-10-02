@@ -9,7 +9,7 @@
 
 namespace {
 
-constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '5'};
+constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '6'};
 constexpr uint32_t grid_bits = 14;
 constexpr uint32_t grid_max = (1u << grid_bits) - 2;  // A step of rounding to spare
 
@@ -60,6 +60,15 @@ vec3 decode_normal(const uint32_t* vertex) {
         n.y = (1 - std::abs(u)) * sign_not_zero(v);
     }
     return normalize(n);
+}
+
+uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t) {
+    // As the shaders read it: the word the triangle starts in, and the next
+    // if it runs over.
+    const uint32_t byte = 3 * t, at = c.triangle_offset + byte / 4, shift = (byte % 4) * 8;
+    uint32_t v = page[at] >> shift;
+    if (shift > 8) v |= page[at + 1] << (32 - shift);
+    return v & 0xffffff;
 }
 
 vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* vertex) {
@@ -153,8 +162,14 @@ paged_geometry page(const geometry& g) {
                 words.push_back((d[2] >> 4) | (n << 10));
             }
             dst.triangle_offset = static_cast<uint32_t>(words.size());
-            words.insert(words.end(), g.cluster_triangles.begin() + src.triangle_offset,
-                         g.cluster_triangles.begin() + src.triangle_offset + src.triangle_count);
+            std::vector<uint8_t> bytes;
+            for (uint32_t t = 0; t < src.triangle_count; ++t) {
+                const uint32_t tri = g.cluster_triangles[src.triangle_offset + t];
+                bytes.insert(bytes.end(), {uint8_t(tri), uint8_t(tri >> 8), uint8_t(tri >> 16)});
+            }
+            while (bytes.size() % 4) bytes.push_back(0);
+            for (size_t b = 0; b < bytes.size(); b += 4)
+                words.push_back(bytes[b] | bytes[b + 1] << 8 | bytes[b + 2] << 16 | uint32_t(bytes[b + 3]) << 24);
         }
         while (words.size() % 4) words.push_back(0);
         info.size = static_cast<uint32_t>(words.size() * 4);
@@ -226,7 +241,7 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
             c.vertex_count > cluster_max_vertices || c.triangle_count > cluster_max_triangles)
             throw std::runtime_error(path + ": cluster out of range");
         const uint32_t words = p.pages[c.group].size / 4;
-        if (uint64_t(c.vertex_offset) + 2 * c.vertex_count > words || uint64_t(c.triangle_offset) + c.triangle_count > words)
+        if (uint64_t(c.vertex_offset) + 2 * c.vertex_count > words || uint64_t(c.triangle_offset) + (3 * c.triangle_count + 3) / 4 > words)
             throw std::runtime_error(path + ": cluster outside its page");
     }
     if (with_data) {
@@ -236,7 +251,7 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
         for (const gpu_cluster& c : p.clusters) {
             const uint32_t* base = &p.data[p.pages[c.group].offset / 4];
             for (uint32_t t = 0; t < c.triangle_count; ++t) {
-                const uint32_t w = base[c.triangle_offset + t];
+                const uint32_t w = decode_triangle(c, base, t);
                 if ((w & 255) >= c.vertex_count || (w >> 8 & 255) >= c.vertex_count || (w >> 16 & 255) >= c.vertex_count)
                     throw std::runtime_error(path + ": triangle index out of range");
             }

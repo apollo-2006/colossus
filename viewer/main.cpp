@@ -262,7 +262,7 @@ float shadow_cut(const paged_geometry& g, int fd, size_t budget, std::vector<flo
             positions.insert(positions.end(), {p.x, p.y, p.z});
         }
         for (uint32_t t = 0; t < c.triangle_count; ++t) {
-            const uint32_t w = words[c.triangle_offset + t];
+            const uint32_t w = decode_triangle(c, words.data(), t);
             for (int k = 0; k < 3; ++k) indices.push_back(first + ((w >> (8 * k)) & 255));
         }
     }
