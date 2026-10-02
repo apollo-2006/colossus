@@ -39,6 +39,9 @@
 
 namespace {
 
+const uint32_t expand_spv[] = {
+#include "expand.comp.inc"
+};
 const uint32_t instance_cull_spv[] = {
 #include "instance_cull.comp.inc"
 };
@@ -131,6 +134,16 @@ struct gpu_stats {
     uint32_t work_overflow, visible_overflow;
     uint32_t instances_occluded, clusters_occluded, clusters_late, clusters_software;
 };
+// common.glsl's DrawArgs, for its size and where pass 2's instance
+// culling arguments sit.
+struct draw_args_layout {
+    uint32_t cull_args[2][4], draw_args[2][4], sw_args[2][4];
+    uint32_t pass_start[3], sw_pass_start[3];
+    uint32_t late_instance_args[4];
+    uint32_t big_args[2][4];
+};
+static_assert(sizeof(draw_args_layout) == 168);
+
 struct gpu_push {
     uint32_t pass, level;
 };
@@ -423,7 +436,7 @@ public:
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_})
             ctx_.destroy(*b);
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
-        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_})
+        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
         for (accel* a : {&tlas_}) {
@@ -639,7 +652,7 @@ public:
         vkCmdCopyBuffer(cmd, f.staging.handle, page_table_.handle, 1, &table_copy);
         vkCmdFillBuffer(cmd, requests_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, vis_.handle, 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, work_.handle, 0, 16, 0);  // Both passes' counts and the late counts
+        vkCmdFillBuffer(cmd, work_.handle, 0, 32, 0);  // Both passes' counts, the late counts and the big counts
         vkCmdFillBuffer(cmd, visible_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, f.stats.handle, 0, sizeof(gpu_stats), 0);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -792,7 +805,7 @@ private:
     VkPipeline instance_cull_ = VK_NULL_HANDLE, args_ = VK_NULL_HANDLE, shade_ = VK_NULL_HANDLE, raster_ = VK_NULL_HANDLE,
                hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE, sw_raster_ = VK_NULL_HANDLE, shadow_ = VK_NULL_HANDLE;
     vk::buffer shadow_mask_;
-    VkPipeline taa_ = VK_NULL_HANDLE;
+    VkPipeline taa_ = VK_NULL_HANDLE, expand_ = VK_NULL_HANDLE;
     std::array<vk::image, frames_in_flight> history_;  // Slot k writes history_[k] and reads the other
     VkSampler history_sampler_ = VK_NULL_HANDLE;
     float prev_view_proj_[16] = {};
@@ -909,8 +922,19 @@ private:
         const gpu_push push{pass, 0};
         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instance_cull_);
-        const uint32_t n = uint32_t(sc_.instances.size());
-        vkCmdDispatch(cmd, std::min(n, 65535u), (n + 65534) / 65535, 1);
+        if (pass == 0) {
+            const uint32_t n = (uint32_t(sc_.instances.size()) + 63) / 64;
+            vkCmdDispatch(cmd, std::min(n, 65535u), (n + 65534) / 65535, 1);
+        } else {
+            // Over the instances pass 1 found hidden only: args.comp sized it.
+            vkCmdDispatchIndirect(cmd, draw_args_.handle, offsetof(draw_args_layout, late_instance_args));
+        }
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+        // Instances with many pieces of work get a workgroup each.
+        write_args(cmd, pass, 2);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, expand_);
+        vkCmdDispatchIndirect(cmd, draw_args_.handle, offsetof(draw_args_layout, big_args) + 16 * pass);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
         write_args(cmd, pass, 0);
@@ -980,10 +1004,11 @@ private:
         }
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
-        work_ = ctx_.make_buffer(16 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+        work_ = ctx_.make_buffer(32 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         visible_ = ctx_.make_buffer(16 + uint64_t(max_visible) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
-        draw_args_ = ctx_.make_buffer(128, ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
-        late_instances_ = ctx_.make_buffer(4 * sc_.instances.size(), ssbo, false);
+        draw_args_ = ctx_.make_buffer(sizeof(draw_args_layout), ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
+        // Hidden instances, then each pass's instances for expand.comp (three words each).
+        late_instances_ = ctx_.make_buffer(4 * 7 * sc_.instances.size(), ssbo, false);
         late_clusters_ = ctx_.make_buffer(uint64_t(max_visible) * 8, ssbo, false);
         VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
@@ -1184,6 +1209,7 @@ private:
 
     void create_pipelines() {
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
+        expand_ = compute_pipeline(expand_spv, sizeof expand_spv);
         args_ = compute_pipeline(args_spv, sizeof args_spv);
         shade_ = ctx_.ray_query ? compute_pipeline(shade_rt_spv, sizeof shade_rt_spv) : compute_pipeline(shade_spv, sizeof shade_spv);
         if (ctx_.ray_query) shadow_ = compute_pipeline(shadow_spv, sizeof shadow_spv);

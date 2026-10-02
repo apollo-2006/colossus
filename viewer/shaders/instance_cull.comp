@@ -1,12 +1,18 @@
 #version 460
-// One workgroup per instance: drops instances outside the view or hidden,
+// One invocation per instance: drops instances outside the view or hidden,
 // then hands cluster culling the clusters that might be drawn, in pieces of
-// 64. One invocation decides; all 64 write the pieces, since a nearby
-// Lucy is ten thousand of them.
+// 64. A distant instance is a piece or two, and the workgroup writes its
+// instances' pieces together: a prefix sum over the 64 counts says where
+// each instance's pieces start, and every invocation writes every 64th
+// piece of the whole run. A nearby Lucy is thousands of pieces, and near
+// instances are neighbours in the instance list, so one workgroup would
+// write them all: instances over big_pieces go to expand.comp instead,
+// which gives each its own workgroup.
 //
 // Pass 1 runs over every instance and tests occlusion against last frame's
 // depth; what it finds hidden is listed for pass 2, which runs over that
-// list only and tests against the depth pass 1 drew.
+// list only (args.comp sizes its dispatch) and tests against the depth
+// pass 1 drew.
 //
 // Clusters are stored in order of parent error, and a cluster can only be
 // drawn while its parent looks too coarse. Nowhere on the model is nearer
@@ -18,18 +24,23 @@
 
 layout(local_size_x = 64) in;
 
-shared uint first_chunk;  // Where this instance's pieces go, and how many
-shared uint chunk_count;
-shared uint first_cluster;
+const uint big_pieces = 16u;
+
+shared uint ends[64];        // Inclusive prefix sum of each invocation's pieces
+shared uint instance_of[64];
+shared uint first_of[64];    // Its first cluster
+shared uint base;            // Where the workgroup's pieces go
 
 void main() {
     const uint pass = push.pass;
+    const uint lane = gl_LocalInvocationIndex;
     const uint n = pass == 0u ? frame.instance_count : late_instance_count;
-    const uint slot = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
-    if (slot >= n) return;
-    const uint i = pass == 0u ? slot : late_instances[slot];
-    if (gl_LocalInvocationIndex == 0u) {
-        chunk_count = 0u;
+    const uint slot = (gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x) * 64u + lane;
+    uint chunks = 0u;
+    uint i = 0u;
+    uint first = 0u;
+    if (slot < n) {
+        i = pass == 0u ? slot : late_instances[slot];
         const Instance inst = instances[i];
         const Mesh m = meshes[inst.mesh];
         const vec3 center = to_world(inst, m.bounds.xyz);
@@ -51,19 +62,48 @@ void main() {
                 if (clusters[m.first_cluster + mid].parent_error > limit) hi = mid;
                 else lo = mid + 1;
             }
-            uint chunks = (m.cluster_count - lo + 63u) / 64u;
-            const uint base = chunks > 0u ? atomicAdd(work_count[pass], chunks) : 0u;
-            if (base + chunks > frame.max_work_items) {
-                atomicAdd(stats.work_overflow, 1u);
-                chunks = base < frame.max_work_items ? frame.max_work_items - base : 0u;
+            chunks = (m.cluster_count - lo + 63u) / 64u;
+            first = m.first_cluster + lo;
+            if (chunks > big_pieces) {
+                const uint at = big_instance(pass, atomicAdd(big_count[pass], 1u));
+                late_instances[at] = i;
+                late_instances[at + 1u] = first;
+                late_instances[at + 2u] = chunks;
+                chunks = 0u;
             }
-            atomicAdd(stats.work_items, chunks);
-            first_chunk = pass * frame.max_work_items + base;
-            chunk_count = chunks;
-            first_cluster = m.first_cluster + lo;
         }
     }
+
+    // Prefix sum of the pieces over the workgroup (Hillis and Steele).
+    ends[lane] = chunks;
+    instance_of[lane] = i;
+    first_of[lane] = first;
     barrier();
-    for (uint k = gl_LocalInvocationIndex; k < chunk_count; k += 64u)
-        work[first_chunk + k] = WorkItem(i, first_cluster + 64u * k);
+    for (uint step = 1u; step < 64u; step <<= 1u) {
+        const uint add = lane >= step ? ends[lane - step] : 0u;
+        barrier();
+        ends[lane] += add;
+        barrier();
+    }
+    uint total = ends[63];
+    if (total == 0u) return;
+    if (lane == 0u) base = atomicAdd(work_count[pass], total);
+    barrier();
+    const uint at = base;
+    if (at + total > frame.max_work_items) {
+        if (lane == 0u) atomicAdd(stats.work_overflow, 1u);
+        total = at < frame.max_work_items ? frame.max_work_items - at : 0u;
+    }
+    if (lane == 0u) atomicAdd(stats.work_items, total);
+    for (uint k = lane; k < total; k += 64u) {
+        // The invocation whose run holds piece k: the first end past it.
+        uint lo = 0u, hi = 63u;
+        while (lo < hi) {
+            const uint mid = (lo + hi) / 2u;
+            if (ends[mid] > k) hi = mid;
+            else lo = mid + 1u;
+        }
+        const uint start = lo == 0u ? 0u : ends[lo - 1u];
+        work[pass * frame.max_work_items + at + k] = WorkItem(instance_of[lo], first_of[lo] + 64u * (k - start));
+    }
 }

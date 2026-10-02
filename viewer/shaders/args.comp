@@ -14,7 +14,9 @@ uvec3 rows(uint n) {
 
 void main() {
     const uint pass = push.pass;
-    if (push.level == 0u) {
+    if (push.level == 2u) {
+        big_args[pass] = uvec4(rows(big_count[pass]), 0u);
+    } else if (push.level == 0u) {
         const uint items = min(work_count[pass], frame.max_work_items);
         uint n = items;
         if (pass == 1u) n += (min(late_cluster_count, frame.max_visible) + 63u) / 64u;
@@ -22,6 +24,7 @@ void main() {
         if (pass == 0u) {
             pass_start[0] = 0u;
             sw_pass_start[0] = 0u;
+            late_instance_args = uvec4(rows((late_instance_count + 63u) / 64u), 0u);
         }
     } else {
         // The two ends of the list must not cross: past the point where

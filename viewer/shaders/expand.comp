@@ -1,0 +1,33 @@
+#version 460
+// Writes the pieces of work for instances instance_cull.comp found to have
+// many (a nearby instance can have thousands): one workgroup per instance,
+// all 64 invocations writing.
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+shared uint base;
+shared uint count;
+
+void main() {
+    const uint pass = push.pass;
+    const uint k = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (k >= big_count[pass]) return;
+    const uint at = big_instance(pass, k);
+    const uint instance = late_instances[at];
+    const uint first = late_instances[at + 1u];
+    if (gl_LocalInvocationIndex == 0u) {
+        uint chunks = late_instances[at + 2u];
+        const uint b = atomicAdd(work_count[pass], chunks);
+        if (b + chunks > frame.max_work_items) {
+            atomicAdd(stats.work_overflow, 1u);
+            chunks = b < frame.max_work_items ? frame.max_work_items - b : 0u;
+        }
+        atomicAdd(stats.work_items, chunks);
+        base = pass * frame.max_work_items + b;
+        count = chunks;
+    }
+    barrier();
+    for (uint c = gl_LocalInvocationIndex; c < count; c += 64u)
+        work[base + c] = WorkItem(instance, first + 64u * c);
+}

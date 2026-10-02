@@ -154,12 +154,21 @@ layout(set = 0, binding = 8, scalar) buffer WorkItems {
     uint work_count[2];       // Per pass
     uint late_instance_count;
     uint late_cluster_count;
+    uint big_count[2];        // Per pass: instances left to expand.comp
+    uint pad5, pad6;
     WorkItem work[];
 };
 
 // What pass 1 found hidden behind last frame's depth, for pass 2 to test
 // again: whole instances, and single clusters (instance, cluster).
+// After the instance_count entries for hidden instances come each pass's
+// instances with many pieces of work, for expand.comp: instance, first
+// cluster and piece count, three words each (see big_instance()).
 layout(set = 0, binding = 14, scalar) buffer LateInstances { uint late_instances[]; };
+
+uint big_instance(uint pass, uint k) {
+    return frame.instance_count * (1u + 3u * pass) + 3u * k;
+}
 layout(set = 0, binding = 15, scalar) buffer LateClusters { uvec2 late_clusters[]; };
 
 // The depth pyramid: level 0 is half the screen, each texel the farthest
@@ -209,6 +218,8 @@ layout(set = 0, binding = 12, scalar) buffer DrawArgs {
     uvec4 sw_args[2];
     uint pass_start[3];     // visible[pass_start[p], pass_start[p + 1]) is pass p's
     uint sw_pass_start[3];  // The same, counted from the back
+    uvec4 late_instance_args;  // Pass 2's instance culling: a workgroup per 64 hidden instances
+    uvec4 big_args[2];         // expand.comp, per pass: a workgroup per instance with many pieces
 };
 
 vec3 to_world(Instance inst, vec3 p) {
