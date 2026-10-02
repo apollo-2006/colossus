@@ -1,0 +1,27 @@
+#version 460
+// Culls cells of up to 64 neighbouring instances, one invocation each,
+// before any of their instances are read: at a million instances, reading
+// them all is most of the culling. Pass 1 tests every cell against the
+// frustum and last frame's depth and lists those it hides for pass 2,
+// which tests them against the depth pass 1 drew. A visible cell's
+// instances are culled one by one (instance_cull.comp).
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+void main() {
+    const uint pass = push.pass;
+    const uint n = pass == 0u ? cells.length() : late_cell_count;
+    const uint k = (gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x) * 64u + gl_LocalInvocationIndex;
+    if (k >= n) return;
+    const uint c = pass == 0u ? k : cell_list[k];
+    const Cell cell = cells[c];
+    if (pass == 0u && (frame.flags & flag_frustum_culling) != 0u && !sphere_in_frustum(cell.center, cell.radius)) return;
+    // The cell's sphere holds its moving instances wherever they go, so
+    // last frame's positions are in it too.
+    if (occluded(cell.center, cell.radius)) {
+        if (pass == 0u) cell_list[atomicAdd(late_cell_count, 1u)] = c;
+        return;
+    }
+    cell_list[cells.length() * (1u + pass) + atomicAdd(visible_cell_count[pass], 1u)] = c;
+}

@@ -164,6 +164,26 @@ Instance animate(Instance inst, float t) {
     return inst;
 }
 
+// Cells of up to 64 neighbouring instances, culled before their
+// instances (cell_cull.comp): a sphere around everything in the cell, and
+// the cell's instances, which are consecutive.
+struct Cell {
+    vec3 center;
+    float radius;
+    uint first;
+    uint count;
+    uint pad0, pad1;
+};
+layout(set = 0, binding = 25, scalar) readonly buffer Cells { Cell cells[]; };
+// The cells pass 1 found hidden, for pass 2 (cell_list[0, late_cell_count)),
+// then each pass's cells found visible, from cells.length() * (1 + pass).
+layout(set = 0, binding = 26, scalar) buffer CellLists {
+    uint visible_cell_count[2];
+    uint late_cell_count;
+    uint cell_pad;
+    uint cell_list[];
+};
+
 Instance load_instance(uint i) {
     return animate(instances[i], frame.time);
 }
@@ -246,7 +266,8 @@ layout(set = 0, binding = 12, scalar) buffer DrawArgs {
     uvec4 sw_args[2];
     uint pass_start[3];     // visible[pass_start[p], pass_start[p + 1]) is pass p's
     uint sw_pass_start[3];  // The same, counted from the back
-    uvec4 late_instance_args;  // Pass 2's instance culling: a workgroup per 64 hidden instances
+    uvec4 late_cell_args;      // Pass 2's cell culling: a workgroup per 64 cells pass 1 hid
+    uvec4 instance_args[2];    // Instance culling: a workgroup per visible cell, and in pass 2 per 64 hidden instances
     uvec4 big_args[2];         // expand.comp, per pass: a workgroup per instance with many pieces
 };
 

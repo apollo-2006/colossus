@@ -14,7 +14,15 @@ uvec3 rows(uint n) {
 
 void main() {
     const uint pass = push.pass;
-    if (push.level == 2u) {
+    if (push.level == 3u) {
+        // After cell culling.
+        if (pass == 0u) {
+            instance_args[0] = uvec4(rows(visible_cell_count[0]), 0u);
+            late_cell_args = uvec4(rows((late_cell_count + 63u) / 64u), 0u);
+        } else {
+            instance_args[1] = uvec4(rows((late_instance_count + 63u) / 64u + visible_cell_count[1]), 0u);
+        }
+    } else if (push.level == 2u) {
         big_args[pass] = uvec4(rows(big_count[pass]), 0u);
     } else if (push.level == 0u) {
         const uint items = min(work_count[pass], frame.max_work_items);
@@ -24,7 +32,6 @@ void main() {
         if (pass == 0u) {
             pass_start[0] = 0u;
             sw_pass_start[0] = 0u;
-            late_instance_args = uvec4(rows((late_instance_count + 63u) / 64u), 0u);
         }
     } else {
         // The two ends of the list must not cross: past the point where

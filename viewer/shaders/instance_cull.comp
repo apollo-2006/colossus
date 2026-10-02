@@ -9,9 +9,10 @@
 // write them all: instances over big_pieces go to expand.comp instead,
 // which gives each its own workgroup.
 //
-// Pass 1 runs over every instance and tests occlusion against last frame's
-// depth; what it finds hidden is listed for pass 2, which runs over that
-// list only (args.comp sizes its dispatch) and tests against the depth
+// A workgroup per visible cell (cell_cull.comp), an invocation per
+// instance in it. Pass 1 tests occlusion against last frame's depth; what
+// it finds hidden is listed for pass 2, which runs over that list, then
+// over the cells pass 2 found visible again, and tests against the depth
 // pass 1 drew.
 //
 // Clusters are stored in order of parent error, and a cluster can only be
@@ -34,18 +35,30 @@ shared uint base;            // Where the workgroup's pieces go
 void main() {
     const uint pass = push.pass;
     const uint lane = gl_LocalInvocationIndex;
-    const uint n = pass == 0u ? frame.instance_count : late_instance_count;
-    const uint slot = (gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x) * 64u + lane;
-    uint chunks = 0u;
+    const uint group = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    // Which instance: one of a visible cell's, or in pass 2 first the
+    // instances pass 1 hid (already inside the frustum).
+    bool valid = false, hidden_before = false;
     uint i = 0u;
+    const uint late_groups = pass == 0u ? 0u : (late_instance_count + 63u) / 64u;
+    if (group < late_groups) {
+        const uint slot = group * 64u + lane;
+        valid = slot < late_instance_count;
+        if (valid) i = late_instances[slot];
+        hidden_before = true;
+    } else {
+        const Cell cell = cells[cell_list[cells.length() * (1u + pass) + group - late_groups]];
+        valid = lane < cell.count;
+        i = cell.first + lane;
+    }
+    uint chunks = 0u;
     uint first = 0u;
-    if (slot < n) {
-        i = pass == 0u ? slot : late_instances[slot];
+    if (valid) {
         const Instance inst = load_instance(i);
         const Mesh m = meshes[inst.mesh];
         const vec3 center = to_world(inst, m.bounds.xyz);
         const float radius = m.bounds.w * inst.scale;
-        bool keep = pass != 0u || (frame.flags & flag_frustum_culling) == 0u || sphere_in_frustum(center, radius);
+        bool keep = hidden_before || (frame.flags & flag_frustum_culling) == 0u || sphere_in_frustum(center, radius);
         // Pass 1 asks whether it was hidden last frame, where last frame was.
         const vec3 then = pass == 0u && inst.anim != 0u ? to_world(load_prev_instance(i), m.bounds.xyz) : center;
         if (keep && occluded(then, radius)) {

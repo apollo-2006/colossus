@@ -39,6 +39,9 @@
 
 namespace {
 
+const uint32_t cell_cull_spv[] = {
+#include "cell_cull.comp.inc"
+};
 const uint32_t tlas_spv[] = {
 #include "tlas.comp.inc"
 };
@@ -101,6 +104,16 @@ struct gpu_instance {
     uint32_t material;  // Into shade.comp's materials
     uint32_t anim;      // See animate() in common.glsl
 };
+// Instances are culled in cells of up to 64 neighbours first (see
+// cell_cull.comp): a sphere around the cell, and its instances, which are
+// consecutive.
+struct gpu_cell {
+    float center[3], radius;
+    uint32_t first, count;
+    uint32_t pad[2];
+};
+constexpr uint32_t cell_side = 8;
+
 struct gpu_frame {
     float view_proj[16];
     float cull_planes[5][4];
@@ -143,10 +156,11 @@ struct gpu_stats {
 struct draw_args_layout {
     uint32_t cull_args[2][4], draw_args[2][4], sw_args[2][4];
     uint32_t pass_start[3], sw_pass_start[3];
-    uint32_t late_instance_args[4];
+    uint32_t late_cell_args[4];
+    uint32_t instance_args[2][4];
     uint32_t big_args[2][4];
 };
-static_assert(sizeof(draw_args_layout) == 168);
+static_assert(sizeof(draw_args_layout) == 200);
 
 struct gpu_push {
     uint32_t pass, level;
@@ -238,6 +252,7 @@ struct scene {
     std::vector<int> files;
     std::vector<gpu_mesh> meshes;
     std::vector<gpu_instance> instances;
+    std::vector<gpu_cell> cells;
     std::vector<shadow_mesh> shadow_meshes;  // shadow_lods per model
     float shadow_lod_error[4] = {};          // The largest error of each shadow copy over the models
     std::vector<float> shadow_positions;
@@ -376,6 +391,9 @@ void make_scene(const options& opt, scene& s) {
     // materials table in shade.comp. One statue alone is marble.
     const uint32_t mix[20] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5};
     const int n = std::max(1, opt.grid);
+    // In tiles of cell_side x cell_side, so each cell's instances are
+    // consecutive; the random draws stay in row order.
+    std::vector<gpu_instance> placed(size_t(n) * n);
     for (int z = 0; z < n; ++z)
         for (int x = 0; x < n; ++x) {
             const uint32_t mesh = static_cast<uint32_t>((z * n + x) % s.meshes.size());
@@ -392,8 +410,46 @@ void make_scene(const options& opt, scene& s) {
             // Moving: bit 9 marks it, bit 8 picks the direction, the low 8 bits the phase.
             if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
             s.moving += inst.anim != 0;
-            s.instances.push_back(inst);
+            placed[size_t(z) * n + x] = inst;
             s.instanced_triangles += leaf_triangles[mesh];
+        }
+    for (int tz = 0; tz < n; tz += cell_side)
+        for (int tx = 0; tx < n; tx += cell_side) {
+            gpu_cell cell{};
+            cell.first = uint32_t(s.instances.size());
+            // Each instance's sphere: around its bounds, or for a moving
+            // instance around everywhere it goes (it turns about its
+            // origin and drifts 0.2 from it: see animate() in common.glsl).
+            std::vector<std::pair<vec3, float>> spheres;
+            for (int z = tz; z < std::min(n, tz + int(cell_side)); ++z)
+                for (int x = tx; x < std::min(n, tx + int(cell_side)); ++x) {
+                    const gpu_instance& inst = placed[size_t(z) * n + x];
+                    const gpu_mesh& m = s.meshes[inst.mesh];
+                    const vec3 local = {m.bounds[0], m.bounds[1], m.bounds[2]};
+                    const vec3 origin = {inst.rows[0][3], inst.rows[1][3], inst.rows[2][3]};
+                    vec3 c = origin;
+                    for (int r = 0; r < 3; ++r)
+                        (&c.x)[r] += inst.rows[r][0] * local.x + inst.rows[r][1] * local.y + inst.rows[r][2] * local.z;
+                    float radius = m.bounds[3] * inst.scale;
+                    if (inst.anim) {
+                        radius += length(c - origin) + 0.2f;
+                        c = origin;
+                    }
+                    spheres.push_back({c, radius});
+                    s.instances.push_back(inst);
+                }
+            cell.count = uint32_t(s.instances.size()) - cell.first;
+            vec3 lo = spheres[0].first, hi = lo;
+            for (const auto& [c, r] : spheres) {
+                lo = min(lo, c);
+                hi = max(hi, c);
+            }
+            const vec3 center = (lo + hi) * 0.5f;
+            float radius = 0;
+            for (const auto& [c, r] : spheres) radius = std::max(radius, length(c - center) + r);
+            cell.center[0] = center.x; cell.center[1] = center.y; cell.center[2] = center.z;
+            cell.radius = radius;
+            s.cells.push_back(cell);
         }
 }
 
@@ -444,10 +500,11 @@ public:
         for (frame_slot& f : slots_)
             for (vk::buffer* b : {&f.staging, &f.request_readback, &f.used_readback}) ctx_.destroy(*b);
         for (vk::buffer* b : {&clusters_, &page_table_, &pool_buffer_, &page_used_, &requests_, &request_stamp_, &shadow_positions_, &meshes_,
-                              &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_})
+                              &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_,
+                              &cells_, &cell_lists_})
             ctx_.destroy(*b);
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
-        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_})
+        for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_, cell_cull_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
         for (accel* a : {&tlas_, &tlas_moving_}) {
@@ -669,6 +726,7 @@ public:
         vkCmdFillBuffer(cmd, requests_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, vis_.handle, 0, VK_WHOLE_SIZE, 0);
         vkCmdFillBuffer(cmd, work_.handle, 0, 32, 0);  // Both passes' counts, the late counts and the big counts
+        vkCmdFillBuffer(cmd, cell_lists_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, visible_.handle, 0, 16, 0);
         vkCmdFillBuffer(cmd, f.stats.handle, 0, sizeof(gpu_stats), 0);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -809,7 +867,7 @@ private:
     uint32_t slot_ = 0;
 
     vk::buffer clusters_, page_table_, pool_buffer_, page_used_, requests_, request_stamp_, shadow_positions_, meshes_, instances_;
-    vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_;
+    vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_, cells_, cell_lists_;
     vk::image depth_, color_, hzb_image_;
     std::vector<VkImageView> hzb_views_;
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -822,7 +880,7 @@ private:
     VkPipeline instance_cull_ = VK_NULL_HANDLE, args_ = VK_NULL_HANDLE, shade_ = VK_NULL_HANDLE, raster_ = VK_NULL_HANDLE,
                hzb_ = VK_NULL_HANDLE, cluster_cull_ = VK_NULL_HANDLE, sw_raster_ = VK_NULL_HANDLE, shadow_ = VK_NULL_HANDLE;
     vk::buffer shadow_mask_;
-    VkPipeline taa_ = VK_NULL_HANDLE, expand_ = VK_NULL_HANDLE;
+    VkPipeline taa_ = VK_NULL_HANDLE, expand_ = VK_NULL_HANDLE, cell_cull_ = VK_NULL_HANDLE;
     std::array<vk::image, frames_in_flight> history_;  // Slot k writes history_[k] and reads the other
     VkSampler history_sampler_ = VK_NULL_HANDLE;
     float prev_view_proj_[16] = {};
@@ -939,14 +997,21 @@ private:
     void draw_pass(VkCommandBuffer cmd, uint32_t pass, VkQueryPool queries) {
         const gpu_push push{pass, 0};
         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof push, &push);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instance_cull_);
+        // Cells first: every cell in pass 1, those it hid in pass 2.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cell_cull_);
         if (pass == 0) {
-            const uint32_t n = (uint32_t(sc_.instances.size()) + 63) / 64;
+            const uint32_t n = (uint32_t(sc_.cells.size()) + 63) / 64;
             vkCmdDispatch(cmd, std::min(n, 65535u), (n + 65534) / 65535, 1);
         } else {
-            // Over the instances pass 1 found hidden only: args.comp sized it.
-            vkCmdDispatchIndirect(cmd, draw_args_.handle, offsetof(draw_args_layout, late_instance_args));
+            vkCmdDispatchIndirect(cmd, draw_args_.handle, offsetof(draw_args_layout, late_cell_args));
         }
+        vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+        write_args(cmd, pass, 3);
+        // Then the instances of the cells found visible (and in pass 2, the
+        // instances pass 1 hid): args.comp sized it.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instance_cull_);
+        vkCmdDispatchIndirect(cmd, draw_args_.handle, offsetof(draw_args_layout, instance_args) + 16 * pass);
         vk::barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
         // Instances with many pieces of work get a workgroup each.
@@ -1022,6 +1087,8 @@ private:
         }
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
+        cells_ = ctx_.upload(sc_.cells, ssbo);
+        cell_lists_ = ctx_.make_buffer(16 + 3 * 4 * uint64_t(sc_.cells.size()), ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         work_ = ctx_.make_buffer(32 + 2 * uint64_t(max_work_items) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         visible_ = ctx_.make_buffer(16 + uint64_t(max_visible) * 8, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         draw_args_ = ctx_.make_buffer(sizeof(draw_args_layout), ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
@@ -1189,7 +1256,7 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 24; ++i) {
+        for (uint32_t i = 0; i <= 26; ++i) {
             if ((i == 18 || i == 23 || i == 24) && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
@@ -1208,7 +1275,7 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (2 + max_hzb_levels) * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2 * frames_in_flight}};
@@ -1228,10 +1295,11 @@ private:
                                            &requests_, &meshes_,   &instances_,  &work_,          &visible_,
                                            nullptr,    &f.stats,   &draw_args_,  nullptr,         &late_instances_,
                                            &late_clusters_, nullptr, nullptr,   nullptr,         &request_stamp_,
-                                           nullptr,         nullptr, nullptr,   as_moving_.handle ? &as_moving_ : nullptr};
-            VkDescriptorBufferInfo infos[24];
+                                           nullptr,         nullptr, nullptr,   as_moving_.handle ? &as_moving_ : nullptr,
+                                           nullptr,         &cells_, &cell_lists_};
+            VkDescriptorBufferInfo infos[27];
             std::vector<VkWriteDescriptorSet> writes;
-            for (uint32_t i = 0; i < 24; ++i) {
+            for (uint32_t i = 0; i < 27; ++i) {
                 if (!buffers[i]) continue;  // The visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1286,6 +1354,7 @@ private:
     void create_pipelines() {
         instance_cull_ = compute_pipeline(instance_cull_spv, sizeof instance_cull_spv);
         expand_ = compute_pipeline(expand_spv, sizeof expand_spv);
+        cell_cull_ = compute_pipeline(cell_cull_spv, sizeof cell_cull_spv);
         if (ctx_.ray_query) tlas_update_ = compute_pipeline(tlas_spv, sizeof tlas_spv);
         args_ = compute_pipeline(args_spv, sizeof args_spv);
         shade_ = ctx_.ray_query ? compute_pipeline(shade_rt_spv, sizeof shade_rt_spv) : compute_pipeline(shade_spv, sizeof shade_spv);
