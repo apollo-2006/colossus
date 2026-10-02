@@ -367,10 +367,13 @@ void make_scene(const options& opt, scene& s) {
             const page_info& pg = g.pages[p];
             s.pages.push_back({fd, g.data_offset + pg.offset, pg.size, pg.dep_first + dep_base, pg.dep_count, p == 0});
         }
-        // each page's children: the finer pages its clusters stand for.
+        // each page's children: the finer pages its clusters stand for. its error, for prefetch.
         std::vector<std::vector<uint32_t>> children(g.pages.size());
-        for (const gpu_cluster& c : g.clusters)
+        for (const gpu_cluster& c : g.clusters) {
             if (c.creator != no_page) children[c.group].push_back(c.creator);
+            float& e = s.pages[page_base + c.group].error;
+            e = std::max(e, c.parent_error);
+        }
         for (uint32_t p = 0; p < g.pages.size(); ++p) {
             auto& ch = children[p];
             std::sort(ch.begin(), ch.end());

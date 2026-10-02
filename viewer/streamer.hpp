@@ -44,6 +44,7 @@ struct stream_page {
     uint32_t dep_first, dep_count;  // into the dependency list, global page numbers
     bool pinned;           // root: loaded first, never evicted
     uint32_t child_first = 0, child_count = 0;  // finer pages below it, in the child list
+    float error = 0;  // its clusters' parent error, model units: what a request for it measured
 };
 
 class streamer {
@@ -118,14 +119,20 @@ public:
         uint64_t used = 0;
         publish(staging, staging_bytes, copies, used);
 
-        // prefetch: finer pages below each request while their predicted error
-        // stays over the threshold.
+        // prefetch: finer pages below each request while their predicted error stays over the
+        // threshold. a request's priority is its page's error on screen, so priority / error is
+        // the scale, and a child's prediction is its own error at that scale.
         if (!children_.empty()) {
             for (size_t r = 0; r < requests.size() && requests.size() < 8 * max_prefetch; ++r) {
                 const auto [page, priority] = requests[r];
-                if (page >= pages_.size() || priority * 0.5f <= threshold) continue;
+                if (page >= pages_.size()) continue;
                 const stream_page& pg = pages_[page];
-                for (uint32_t k = 0; k < pg.child_count; ++k) requests.push_back({children_[pg.child_first + k], priority * 0.5f});
+                const bool known = pg.error > 0 && std::isfinite(pg.error);
+                for (uint32_t k = 0; k < pg.child_count; ++k) {
+                    const uint32_t child = children_[pg.child_first + k];
+                    const float predicted = known ? priority * (pages_[child].error / pg.error) : priority * 0.5f;
+                    if (predicted > threshold) requests.push_back({child, predicted});
+                }
             }
             // each page once, at its highest priority.
             std::sort(requests.begin(), requests.end());
