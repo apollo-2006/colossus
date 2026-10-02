@@ -662,33 +662,104 @@ fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32) -> vec3f {
          m.albedo * m.metallic * ambient * 0.5;
 }
 
-// sunlight at p from the virtual shadow maps: 2x2 taps, bilinear weights, at
-// the pixel's level. offset along the normal and biased a couple of texels,
-// covering both surfaces' lod error. a tap without a physical page sends the
+// soft shadows, as vsm.glsl's: contact hardening (pcss) for a sun drawn 1.5 degrees wide.
+const PENUMBRA_PER_UNIT = 0.0262;  // 2 tan(0.75 degrees)
+const MAX_PENUMBRA = 12.0;         // texels, radius; marking covers it
+const SEARCH_TAPS = 4u;
+const FILTER_TAPS = 6u;
+
+// stored depth at a texel (nearer layer); false without a physical page. taps mostly share the
+// centre's page, whose physical page (home_phys) skips the entry read.
+fn texel_depth(level: u32, at: vec2i, home: vec2i, home_phys: u32, stored: ptr<function, u32>) -> bool {
+  let page = at >> vec2u(7u);
+  var phys = home_phys;
+  if (any(page != home)) {
+    if (!vsm_in_window(level, page)) { return false; }
+    let slot = vsm_slot(level, page);
+    if (vsm_entries[4u * slot] != vsm_tag(page)) { return false; }
+    phys = vsm_entries[4u * slot + 1u];
+  }
+  if (phys == VSM_NONE) { return false; }
+  let in_page = vec2u(at & vec2i(i32(VSM_PAGE) - 1));
+  var s = vsm_atlas[vsm_atlas_index(phys, in_page, VSM_STILL)];
+  if ((frame.flags & FLAG_MOVING) != 0u) { s = max(s, vsm_atlas[vsm_atlas_index(phys, in_page, VSM_MOVING)]); }
+  *stored = s;
+  return true;
+}
+
+// interleaved gradient noise, shifted per frame: taa averages the soft shadow taps.
+fn shadow_noise(px: vec2u) -> f32 {
+  return fract(52.9829189 * fract(dot(vec2f(px) + f32(frame.frame_index % 64u) * 5.588238, vec2f(0.06711056, 0.00583715))));
+}
+
+fn vogel(k: u32, n: u32, angle: f32) -> vec2f {
+  let r = sqrt((f32(k) + 0.5) / f32(n));
+  let a = f32(k) * 2.39996323 + angle;
+  return r * vec2f(cos(a), sin(a));
+}
+
+// sunlight at p from the virtual shadow maps, 0 to 1, at the pixel's level: offset along the
+// normal and biased a couple of texels; a blocker search sizes the penumbra, under a texel 2x2
+// bilinear taps, else vogel taps rotated by `noise`. a tap without a physical page sends the
 // lookup up a level.
-fn sunlight(p: vec3f, n: vec3f) -> f32 {
+fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
   if ((frame.flags & FLAG_SHADOWS) == 0u) { return 1.0; }
+  let soft = (frame.flags & FLAG_SOFT_SHADOWS) != 0u;
   for (var level = vsm_level_for(length(p - frame.origin.xyz)); level < VSM_LEVELS; level++) {
     let texel = vsm_texel(level);
     let lp = vsm_light_space(p + n * (2.0 * texel));
-    let f = lp.xy / texel - 0.5;
-    let base = vec2i(floor(f));
-    let w = f - vec2f(base);
-    var lit = 0.0;
+    let receiver = lp.z + 1.5 * texel;
+    let centre = lp.xy / texel;
+    let angle = noise * 6.2831853;
+    let home = vec2i(floor(centre)) >> vec2u(7u);
+    var home_phys = VSM_NONE;
+    if (vsm_in_window(level, home)) {
+      let slot = vsm_slot(level, home);
+      if (vsm_entries[4u * slot] == vsm_tag(home)) { home_phys = vsm_entries[4u * slot + 1u]; }
+    }
     var complete = true;
-    for (var k = 0; k < 4; k++) {
-      let at = base + vec2i(k & 1, k >> 1u);
-      let page = at >> vec2u(7u);
-      if (!vsm_in_window(level, page)) { complete = false; break; }
-      let slot = vsm_slot(level, page);
-      let phys = vsm_entries[4u * slot + 1u];
-      if (phys == VSM_NONE || vsm_entries[4u * slot] != vsm_tag(page)) { complete = false; break; }
-      let in_page = vec2u(at & vec2i(i32(VSM_PAGE) - 1));
-      var stored = vsm_atlas[vsm_atlas_index(phys, in_page, VSM_STILL)];
-      if ((frame.flags & FLAG_MOVING) != 0u) { stored = max(stored, vsm_atlas[vsm_atlas_index(phys, in_page, VSM_MOVING)]); }
-      let open = stored == 0u || vsm_unsortable(stored) <= lp.z + 1.5 * texel;
-      let weight = select(1.0 - w.x, w.x, (k & 1) != 0) * select(1.0 - w.y, w.y, (k >> 1u) != 0);
-      lit += select(0.0, weight, open);
+    var blockers = 0.0;
+    var count = 0.0;
+    var stored = 0u;
+    if (soft) {
+      for (var k = 0u; k < SEARCH_TAPS; k++) {
+        if (!texel_depth(level, vec2i(floor(centre + vogel(k, SEARCH_TAPS, angle) * MAX_PENUMBRA)), home, home_phys, &stored)) {
+          complete = false;
+          break;
+        }
+        if (stored != 0u && vsm_unsortable(stored) > receiver) {
+          blockers += vsm_unsortable(stored);
+          count += 1.0;
+        }
+      }
+      if (!complete) { continue; }
+      if (count == 0.0) { return 1.0; }  // nothing nearby stands between it and the sun
+    }
+    var penumbra = 0.0;
+    if (soft) { penumbra = (blockers / count - lp.z) * PENUMBRA_PER_UNIT * 0.5 / texel; }
+    var lit = 0.0;
+    if (penumbra < 1.0) {
+      let f = centre - 0.5;
+      let base = vec2i(floor(f));
+      let w = f - vec2f(base);
+      for (var k = 0; k < 4; k++) {
+        if (!texel_depth(level, base + vec2i(k & 1, k >> 1u), home, home_phys, &stored)) {
+          complete = false;
+          break;
+        }
+        let weight = select(1.0 - w.x, w.x, (k & 1) != 0) * select(1.0 - w.y, w.y, (k >> 1u) != 0);
+        lit += select(0.0, weight, stored == 0u || vsm_unsortable(stored) <= receiver);
+      }
+    } else {
+      let radius = min(penumbra, MAX_PENUMBRA);
+      for (var k = 0u; k < FILTER_TAPS; k++) {
+        if (!texel_depth(level, vec2i(floor(centre + vogel(k, FILTER_TAPS, angle + 1.0) * radius)), home, home_phys, &stored)) {
+          complete = false;
+          break;
+        }
+        lit += select(0.0, 1.0, stored == 0u || vsm_unsortable(stored) <= receiver);
+      }
+      lit /= f32(FILTER_TAPS);
     }
     if (complete) { return lit; }
   }
@@ -745,7 +816,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       let cell = abs(fract(hit.xz * 0.5) - 0.5);
       let line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
       let ground = mix(vec3f(0.42, 0.4, 0.37), vec3f(0.33, 0.31, 0.29), line) *
-                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0)) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45 * occlusion(gid.xy));
+                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0), shadow_noise(gid.xy)) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45 * occlusion(gid.xy));
       color = mix(ground, color, 1.0 - exp(-t * 0.012));
     }
   } else {
@@ -797,7 +868,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       default: {}
     }
     let hit = origin + dir * t;
-    let lit = select(0.0, sunlight(hit, n), dot(n, SUN_DIR) > 0.0);
+    let lit = select(0.0, sunlight(hit, n, shadow_noise(gid.xy)), dot(n, SUN_DIR) > 0.0);
     let ao = occlusion(gid.xy);
     color = shade_material(m, n, -dir, lit, ao);
     if (!behind) { color += pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic) * ao; }

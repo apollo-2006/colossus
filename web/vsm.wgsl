@@ -79,8 +79,10 @@ fn vsm_mark(@builtin(global_invocation_id) gid: vec3u) {
   }
   let level = vsm_level_for(t);
   let texel = vsm_light_space(origin + dir * t).xy / vsm_texel(level);
+  // the lookup offsets a couple of texels and searches 12 around (compute.wgsl's MAX_PENUMBRA).
+  let reach = 15.0;
   for (var k = 0u; k < 4u; k++) {
-    let corner = texel + vec2f(f32(k & 1u), f32(k >> 1u)) * 6.0 - 3.0;
+    let corner = texel + vec2f(f32(k & 1u), f32(k >> 1u)) * (2.0 * reach) - reach;
     let page = vec2i(floor(corner / f32(VSM_PAGE)));
     if (vsm_in_window(level, page)) { atomicStore(&entries[4u * vsm_slot(level, page) + 2u], frame.frame_index); }
   }

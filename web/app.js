@@ -1,6 +1,6 @@
 // the demo page: loads the models, places a crowd, flies a camera over it.
 import { fetchModel } from './geometry.js';
-import { FLAG_CONE, FLAG_FRUSTUM, FLAG_OCCLUSION, FLAG_AO, FLAG_SHADOWS, FLAG_SOFTWARE, FLAG_TAA, Renderer } from './renderer.js';
+import { FLAG_CONE, FLAG_FRUSTUM, FLAG_OCCLUSION, FLAG_AO, FLAG_SHADOWS, FLAG_SOFT_SHADOWS, FLAG_SOFTWARE, FLAG_TAA, Renderer } from './renderer.js';
 
 const $ = (id) => document.getElementById(id);
 const MODELS = ['models/lucy', 'models/dragon'];
@@ -72,7 +72,7 @@ async function main() {
   $('loading').remove();
   renderer.loadModels(models, Math.min(POOL_BYTES, renderer.device.limits.maxStorageBufferBindingSize));
 
-  const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS | FLAG_OCCLUSION | FLAG_TAA | FLAG_AO, threshold: 1, mode: 0, swPixels: 32, motion: true };
+  const settings = { flags: FLAG_CONE | FLAG_FRUSTUM | FLAG_SOFTWARE | FLAG_SHADOWS | FLAG_OCCLUSION | FLAG_TAA | FLAG_AO | FLAG_SOFT_SHADOWS, threshold: 1, mode: 0, swPixels: 32, motion: true };
   let frozen = null;
   const build = () => {
     // the slider steps through grid sides, up to a million instances.
@@ -95,6 +95,7 @@ async function main() {
   toggle('occlusion', FLAG_OCCLUSION);
   toggle('taa', FLAG_TAA);
   toggle('ao', FLAG_AO);
+  toggle('soft-shadows', FLAG_SOFT_SHADOWS);
   $('motion').onchange = () => (settings.motion = $('motion').checked);
   $('freeze').onchange = () => {
     frozen = $('freeze').checked ? { eye: [...camera.eye], forward: camera.forward, fov: camera.fov, near: camera.near } : null;

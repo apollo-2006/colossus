@@ -95,7 +95,8 @@ const FLAG_SOFTWARE = 4u;
 const FLAG_SHADOWS = 16u;
 const FLAG_OCCLUSION = 32u;
 const FLAG_PREV_VALID = 64u;
-const FLAG_AO = 512u;  // ambient occlusion (ao.wgsl)  // last frame's pyramid fits this frame
+const FLAG_AO = 512u;  // ambient occlusion (ao.wgsl)
+const FLAG_SOFT_SHADOWS = 1024u;  // contact-hardening penumbras (sunlight())  // last frame's pyramid fits this frame
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
