@@ -707,7 +707,7 @@ fn vogel(k: u32, n: u32, angle: f32) -> vec2f {
 fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
   if ((frame.flags & FLAG_SHADOWS) == 0u) { return 1.0; }
   let soft = (frame.flags & FLAG_SOFT_SHADOWS) != 0u;
-  for (var level = vsm_level_for(length(p - frame.origin.xyz)); level < VSM_LEVELS; level++) {
+  for (var level = vsm_level_for_lit(length(p - frame.origin.xyz), dot(n, SUN_DIR)); level < VSM_LEVELS; level++) {
     let texel = vsm_texel(level);
     let lp = vsm_light_space(p + n * (2.0 * texel));
     let receiver = lp.z + 1.5 * texel;

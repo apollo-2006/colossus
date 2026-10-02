@@ -12,28 +12,29 @@
 // evictable (VSM_SLOTS each), render list (twice that), moving instances.
 // atlas: depths, two layers of VSM_SIDE x VSM_SIDE physical pages.
 
-const VSM_LEVELS = 12u;
+const VSM_LEVELS = 14u;
 const VSM_WINDOW = 32u;
 const VSM_PAGE = 128u;
-const VSM_SIDE = 32u;  // physical pages a side
-const VSM_TEXEL0 = 1.0 / 1024.0;
-const VSM_SLOTS = 12288u;  // VSM_LEVELS * VSM_WINDOW * VSM_WINDOW
+override VSM_SIDE: u32 = 32u;  // physical pages a side: renderer.js sets it from the adapter's limits
+const VSM_TEXEL0 = 1.0 / 4096.0;  // fine enough for close-ups on surfaces oblique to sun and camera
+const VSM_SLOTS = VSM_LEVELS * VSM_WINDOW * VSM_WINDOW;
 const VSM_NONE = 0xffffffffu;
 const VSM_DIRTY = 1u;        // something moved over it: redraw the moving layer
 const VSM_PROVISIONAL = 2u;  // drawn before its geometry loaded: redraw the still layer
 const VSM_HAS_MOVING = 4u;   // its moving layer holds something; else lookups skip it
 const VSM_STILL = 0u;
 const VSM_MOVING = 1u;
-const VSM_PHYS = 49152u;     // 4 * VSM_SLOTS: physical page records start
+const VSM_PHYS = 4u * VSM_SLOTS;  // physical page records start
 
 const VSM_RECTS = 8u;        // in the lists header: per layer and level, 4 words
-const VSM_MASKS = 104u;      // per layer, level, slot row: a word
-const VSM_HEADER = 872u;
-const VSM_REQUESTS = 872u;
-const VSM_UNOWNED = 13160u;  // VSM_HEADER + VSM_SLOTS
-const VSM_EVICTABLE = 25448u;
-const VSM_RENDER = 37736u;
-const VSM_MOVING_LIST = 62312u;  // VSM_RENDER + 2 * VSM_SLOTS
+const VSM_MASKS = VSM_RECTS + 8u * VSM_LEVELS;  // per layer, level, slot row: a word
+const VSM_HEADER = VSM_MASKS + 2u * VSM_LEVELS * VSM_WINDOW;
+const VSM_REQUESTS = VSM_HEADER;
+const VSM_UNOWNED = VSM_REQUESTS + VSM_SLOTS;
+const VSM_EVICTABLE = VSM_UNOWNED + VSM_SLOTS;  // stale, then from half way recent
+const VSM_RENDER = VSM_EVICTABLE + VSM_SLOTS;
+const VSM_MOVING_LIST = VSM_RENDER + 2u * VSM_SLOTS;
+const VSM_STALE = 8u;  // frames unneeded before a page is evicted ahead of recent ones (taa's cycle)
 
 const FLAG_MOVING = 256u;  // some instances move
 
@@ -79,6 +80,12 @@ fn vsm_slot_page(slot: u32) -> vec2i {
 fn vsm_level_for(t: f32) -> u32 {
   let footprint = t / frame.lod_scale;
   return u32(clamp(ceil(log2(max(footprint / VSM_TEXEL0, 1.0))), 0.0, f32(VSM_LEVELS - 1u)));
+}
+
+// the same for a surface lit at cosine nl: a texel stretches over it by 1 / nl, so grazing surfaces
+// take finer levels (up to two).
+fn vsm_level_for_lit(t: f32, nl: f32) -> u32 {
+  return vsm_level_for(t * clamp(nl, 0.25, 1.0));
 }
 
 fn vsm_sortable(z: f32) -> u32 {

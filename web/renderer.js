@@ -14,7 +14,10 @@ const PASS_STRIDE = 256;  // dynamic uniform offsets must be multiples of this
 const MAX_HZB_LEVELS = 16;
 const STORAGE_BUFFERS_NEEDED = 16;
 // vsm_common.wgsl's and vsm.wgsl's sizes.
-const VSM_SIDE = 32, VSM_PHYS = 49152, VSM_HEADER = 872, VSM_MOVING_LIST = 62312, VSM_SLOTS = 12288;
+const VSM_LEVELS = 14, VSM_WINDOW = 32;
+const VSM_MAX_SIDE = 48;  // physical shadow pages a side, at most; less where buffers are small
+const VSM_SLOTS = VSM_LEVELS * VSM_WINDOW * VSM_WINDOW, VSM_PHYS = 4 * VSM_SLOTS;
+const VSM_HEADER = 8 + 8 * VSM_LEVELS + 2 * VSM_LEVELS * VSM_WINDOW, VSM_MOVING_LIST = VSM_HEADER + 5 * VSM_SLOTS;
 const VSM_WORK_WORDS = 2359300 + 2 * 1048576;  // VW_VISIBLE + 2 * VSM_MAX_VISIBLE
 const FLAG_MOVING = 256;
 
@@ -49,6 +52,9 @@ export class Renderer {
     });
     const r = new Renderer();
     r.device = device;
+    // the shadow atlas: two layers of side x side pages of 64 kb, in one buffer.
+    const largest = Math.min(device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize);
+    r.vsmSide = Math.min(VSM_MAX_SIDE, Math.floor(Math.sqrt(largest / (2 * 65536))));
     device.addEventListener('uncapturederror', (e) => console.error('WebGPU:', e.error.message));
     device.lost.then((info) => console.error('WebGPU device lost:', info.message));
     r.adapterInfo = adapter.info || {};
@@ -112,7 +118,8 @@ export class Renderer {
     const layout4 = d.createPipelineLayout({
       bindGroupLayouts: [this.sceneLayout, this.workLayout, this.imageLayout, this.argsLayout],
     });
-    const compute = (entryPoint, layout) => d.createComputePipeline({ layout, compute: { module: this.computeModule, entryPoint } });
+    const constants = { VSM_SIDE: this.vsmSide };
+    const compute = (entryPoint, layout) => d.createComputePipeline({ layout, compute: { module: this.computeModule, entryPoint, constants } });
     this.instanceCull = compute('instance_cull', layout3);
     this.argsBig = compute('args_big', layout4);
     this.expand = compute('expand', layout3);
@@ -166,14 +173,14 @@ export class Renderer {
     this.aoLayout = d.createBindGroupLayout({ entries: [unfilterable(4), r32(5)] });
     const aoPipeline = (entryPoint, layout) => d.createComputePipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, layout] }),
-      compute: { module: this.aoModule, entryPoint },
+      compute: { module: this.aoModule, entryPoint, constants: { VSM_SIDE: this.vsmSide } },
     });
     this.aoDepthFirst = aoPipeline('ao_depth_first', this.aoFirstLayout);
     this.aoDepthDown = aoPipeline('ao_depth_down', this.aoDownLayout);
     this.aoPass = aoPipeline('ao', this.aoLayout);
     const vsmPipeline = (entryPoint, args = false) => d.createComputePipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.vsmLayout, ...(args ? [this.vsmArgsLayout] : [])] }),
-      compute: { module: this.vsmModule, entryPoint },
+      compute: { module: this.vsmModule, entryPoint, constants: { VSM_SIDE: this.vsmSide } },
     });
     this.vsm = {};
     for (const e of ['mark', 'invalidate', 'alloc_slots', 'alloc_phys', 'alloc_assign', 'clear', 'instance', 'expand', 'cluster', 'raster'])
@@ -189,9 +196,9 @@ export class Renderer {
     this.frameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
     // shadow pages: all slots and physical pages empty (all ones is VSM_NONE), the atlas's
     // two layers, culling lists, indirect arguments.
-    this.vsmEntries = d.createBuffer({ size: 4 * (VSM_PHYS + 2 * VSM_SIDE * VSM_SIDE), usage: S | CD });
-    d.queue.writeBuffer(this.vsmEntries, 0, new Uint32Array(VSM_PHYS + 2 * VSM_SIDE * VSM_SIDE).fill(0xffffffff));
-    this.vsmAtlas = d.createBuffer({ size: 2 * 4 * VSM_SIDE * VSM_SIDE * 128 * 128, usage: S });
+    this.vsmEntries = d.createBuffer({ size: 4 * (VSM_PHYS + 2 * this.vsmSide * this.vsmSide), usage: S | CD });
+    d.queue.writeBuffer(this.vsmEntries, 0, new Uint32Array(VSM_PHYS + 2 * this.vsmSide * this.vsmSide).fill(0xffffffff));
+    this.vsmAtlas = d.createBuffer({ size: 2 * 4 * this.vsmSide * this.vsmSide * 128 * 128, usage: S });
     this.vsmWork = d.createBuffer({ size: 4 * VSM_WORK_WORDS, usage: S | CD | CS });
     this.vsmArgs = d.createBuffer({ size: 80, usage: S | GPUBufferUsage.INDIRECT });
     this.vsmArgsGroup = d.createBindGroup({ layout: this.vsmArgsLayout, entries: [{ binding: 0, resource: { buffer: this.vsmArgs } }] });
@@ -556,11 +563,11 @@ export class Renderer {
       vp.setBindGroup(2, this.vsmArgsGroup);
       const run = (name, x, y = 1) => { vp.setPipeline(this.vsm[name]); vp.dispatchWorkgroups(x, y); };
       const indirect = (name, offset) => { vp.setPipeline(this.vsm[name]); vp.dispatchWorkgroupsIndirect(this.vsmArgs, offset); };
-      run('mark', Math.ceil(width / 8), Math.ceil(height / 8));
+      run('mark', Math.ceil(width / 16), Math.ceil(height / 16));  // a 2x2 block per invocation
       // (nothing moves while the clock stands still.)
       if (this.movingCount && time !== prevTime) run('invalidate', Math.min(this.movingCount, 65535), Math.ceil(this.movingCount / 65535));
       run('alloc_slots', VSM_SLOTS / 64);
-      run('alloc_phys', VSM_SIDE * VSM_SIDE / 64);
+      run('alloc_phys', this.vsmSide * this.vsmSide / 64);
       run('alloc_assign', VSM_SLOTS / 64);
       run('args_alloc', 1);
       indirect('clear', 16);

@@ -58,33 +58,59 @@ fn touches(layer: u32, level: u32, center: vec2f, radius: f32) -> bool {
   return false;
 }
 
-// --- marking: a pixel's surface from depth alone.
-@compute @workgroup_size(8, 8)
-fn vsm_mark(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= frame.width || gid.y >= frame.height) { return; }
-  let ndc = vec2f((f32(gid.x) + 0.5) / f32(frame.width) * 2.0 - 1.0, 1.0 - (f32(gid.y) + 0.5) / f32(frame.height) * 2.0);
+// --- marking: a 2x2 block per invocation. each pixel marks its plain level; where the block is
+// one smooth surface, its normal from the four points marks the grazing level too.
+fn surface_point(px_in: vec2i, t: ptr<function, f32>) -> vec3f {
+  let px = vec2u(clamp(px_in, vec2i(0), vec2i(i32(frame.width), i32(frame.height)) - 1));
+  let ndc = vec2f((f32(px.x) + 0.5) / f32(frame.width) * 2.0 - 1.0, 1.0 - (f32(px.y) + 0.5) / f32(frame.height) * 2.0);
   let near_point = frame.inv_view_proj * vec4f(ndc, 1.0, 1.0);
   let origin = frame.origin.xyz;
   let dir = normalize(near_point.xyz / near_point.w - origin);
-  let z = max(textureLoad(hw_depth, vec2i(gid.xy), 0), bitcast<f32>(sw_depth[gid.x + gid.y * frame.width]));
-  var t = 0.0;
+  let z = max(textureLoad(hw_depth, px, 0), bitcast<f32>(sw_depth[px.x + px.y * frame.width]));
+  *t = -1.0;
   if (z > 0.0) {
     let center = frame.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
     let forward = normalize(center.xyz / center.w - origin);
-    t = frame.near_z / z / dot(dir, forward);
+    *t = frame.near_z / z / dot(dir, forward);
   } else if (dir.y < 0.0) {
-    t = -origin.y / dir.y;
-  } else {
-    return;
+    *t = -origin.y / dir.y;
   }
-  let level = vsm_level_for(t);
-  let texel = vsm_light_space(origin + dir * t).xy / vsm_texel(level);
+  return origin + dir * *t;
+}
+
+fn mark(level: u32, p: vec3f) {
+  let texel = vsm_light_space(p).xy / vsm_texel(level);
   // the lookup offsets a couple of texels and searches 12 around (compute.wgsl's MAX_PENUMBRA).
   let reach = 15.0;
   for (var k = 0u; k < 4u; k++) {
     let corner = texel + vec2f(f32(k & 1u), f32(k >> 1u)) * (2.0 * reach) - reach;
     let page = vec2i(floor(corner / f32(VSM_PAGE)));
     if (vsm_in_window(level, page)) { atomicStore(&entries[4u * vsm_slot(level, page) + 2u], frame.frame_index); }
+  }
+}
+
+@compute @workgroup_size(8, 8)
+fn vsm_mark(@builtin(global_invocation_id) gid: vec3u) {
+  let block = vec2i(gid.xy) * 2;
+  if (block.x >= i32(frame.width) || block.y >= i32(frame.height)) { return; }
+  var p: array<vec3f, 4>;
+  var t: array<f32, 4>;
+  for (var k = 0; k < 4; k++) {
+    var tk = 0.0;
+    p[k] = surface_point(block + vec2i(k & 1, k >> 1u), &tk);
+    t[k] = tk;
+    if (tk >= 0.0) { mark(vsm_level_for(tk), p[k]); }
+  }
+  for (var k = 0; k < 4; k++) {
+    if (t[k] < 0.0 || abs(t[k] - t[0]) > 0.02 * t[0]) { return; }
+  }
+  var n = normalize(cross(p[1] - p[0], p[2] - p[0]));
+  if (dot(n, p[0] - frame.origin.xyz) > 0.0) { n = -n; }
+  let nl = dot(n, VSM_SUN);
+  if (nl <= 0.0) { return; }
+  for (var k = 0; k < 4; k++) {
+    let level = vsm_level_for_lit(t[k], nl);
+    if (level != vsm_level_for(t[k])) { mark(level, p[k]); }
   }
 }
 
@@ -167,10 +193,14 @@ fn vsm_alloc_phys(@builtin(global_invocation_id) gid: vec3u) {
   let p = gid.x;
   if (p >= VSM_SIDE * VSM_SIDE) { return; }
   if (atomicLoad(&entries[VSM_PHYS + 2u * p + 1u]) == frame.frame_index) { return; }
+  // free first, then unneeded longest: pages needed every few frames (taa's jitter moves the
+  // marked edge) would otherwise be evicted and redrawn over and over.
   if (atomicLoad(&entries[VSM_PHYS + 2u * p]) == VSM_NONE) {
     atomicStore(&lists[VSM_UNOWNED + atomicAdd(&lists[1], 1u)], p);
-  } else {
+  } else if (frame.frame_index - atomicLoad(&entries[VSM_PHYS + 2u * p + 1u]) >= VSM_STALE) {
     atomicStore(&lists[VSM_EVICTABLE + atomicAdd(&lists[2], 1u)], p);
+  } else {
+    atomicStore(&lists[VSM_EVICTABLE + VSM_SLOTS / 2u + atomicAdd(&lists[7], 1u)], p);
   }
 }
 
@@ -179,11 +209,19 @@ fn vsm_alloc_assign(@builtin(global_invocation_id) gid: vec3u) {
   let k = gid.x;
   if (k >= atomicLoad(&lists[0])) { return; }
   let unowned = atomicLoad(&lists[1]);
-  if (k >= unowned + atomicLoad(&lists[2])) {
+  let stale = atomicLoad(&lists[2]);
+  if (k >= unowned + stale + atomicLoad(&lists[7])) {
     atomicAdd(&lists[6], 1u);
     return;
   }
-  let p = select(atomicLoad(&lists[VSM_EVICTABLE + k - unowned]), atomicLoad(&lists[VSM_UNOWNED + k]), k < unowned);
+  var p = 0u;
+  if (k < unowned) {
+    p = atomicLoad(&lists[VSM_UNOWNED + k]);
+  } else if (k < unowned + stale) {
+    p = atomicLoad(&lists[VSM_EVICTABLE + k - unowned]);
+  } else {
+    p = atomicLoad(&lists[VSM_EVICTABLE + VSM_SLOTS / 2u + k - unowned - stale]);
+  }
   let old = atomicLoad(&entries[VSM_PHYS + 2u * p]);
   if (old != VSM_NONE) { atomicStore(&entries[4u * old + 1u], VSM_NONE); }
   let slot = atomicLoad(&lists[VSM_REQUESTS + k]);
