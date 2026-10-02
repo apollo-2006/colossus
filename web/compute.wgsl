@@ -14,27 +14,137 @@
 // nearer of the two at each pixel.
 
 struct Counters {
-  work: atomic<u32>,
+  work: array<atomic<u32>, 2>,  // Work items, per pass
   hw: atomic<u32>,
   sw: atomic<u32>,
   instances_visible: atomic<u32>,
   clusters_tested: atomic<u32>,
   triangles: atomic<u32>,
   overflow: atomic<u32>,
-  pad: u32,
+  late_instances: atomic<u32>,  // Hidden in pass 1, for pass 2
+  late_clusters: atomic<u32>,
+  instances_occluded: atomic<u32>,
+  clusters_late: atomic<u32>,  // Drawn in pass 2
+  // Where each pass's clusters start in the lists: hardware [0, 3),
+  // software [3, 6), and each pass's work items [6, 8). Written by the args
+  // passes, read by the rasterizers.
+  pass_start: array<u32, 8>,
+}
+
+// Which pass (0 or 1), and for the pyramid builder, which level: from a
+// uniform buffer bound at an offset per dispatch, WebGPU having no push
+// constants.
+struct PassInfo {
+  pass_index: u32,
+  level: u32,
+  pad0: u32,
+  pad1: u32,
 }
 
 @group(1) @binding(0) var<storage, read_write> counters: Counters;
 @group(1) @binding(1) var<storage, read_write> work: array<vec2u>;        // (instance, first cluster)
 @group(1) @binding(2) var<storage, read_write> hw_visible: array<vec2u>;  // (instance, cluster)
 @group(1) @binding(3) var<storage, read_write> sw_visible: array<vec2u>;
-@group(1) @binding(4) var<storage, read_write> sw_depth: array<atomic<u32>>;
-@group(1) @binding(5) var<storage, read_write> sw_id: array<u32>;
+// The software rasterizer's depth per pixel, then its triangle per pixel:
+// one buffer, as WebGPU allows a stage few storage buffers.
+@group(1) @binding(4) var<storage, read_write> sw_buf: array<atomic<u32>>;
 @group(2) @binding(0) var hw_depth: texture_depth_2d;
 @group(2) @binding(1) var hw_id: texture_2d<u32>;
 @group(2) @binding(2) var out_image: texture_storage_2d<rgba8unorm, write>;
 @group(2) @binding(3) var shadow_map: texture_depth_2d;
 @group(2) @binding(4) var shadow_sampler: sampler_comparison;
+// The depth pyramid: level 0 half the screen, each texel the farthest
+// (smallest, depth being reversed) depth drawn over the pixels it covers.
+@group(2) @binding(5) var hzb: texture_2d<f32>;
+// For building it: the level below, and the level being written.
+@group(2) @binding(6) var hzb_src: texture_2d<f32>;
+@group(2) @binding(7) var hzb_dst: texture_storage_2d<r32float, write>;
+
+// The screen rectangle a sphere covers, in [0, 1] texture coordinates,
+// for a sphere in view space with z forward (Mara and McGuire 2013, as in
+// zeux's niagara). False if the sphere reaches the near plane.
+fn project_sphere(c: vec3f, r: f32, aabb: ptr<function, vec4f>) -> bool {
+  if (c.z < r + frame.near_z) { return false; }
+  let cr = c * r;
+  let czr2 = c.z * c.z - r * r;
+  let vx = sqrt(c.x * c.x + czr2);
+  let minx = (vx * c.x - cr.z) / (vx * c.z + cr.x);
+  let maxx = (vx * c.x + cr.z) / (vx * c.z - cr.x);
+  let vy = sqrt(c.y * c.y + czr2);
+  let miny = (vy * c.y - cr.z) / (vy * c.z + cr.y);
+  let maxy = (vy * c.y + cr.z) / (vy * c.z - cr.y);
+  let a = vec4f(minx * frame.p00, miny * frame.p11, maxx * frame.p00, maxy * frame.p11);
+  *aabb = a.xwzy * vec4f(0.5, -0.5, 0.5, -0.5) + vec4f(0.5);
+  return true;
+}
+
+// Whether a world-space sphere is certainly hidden: its nearest point is
+// farther than the farthest depth drawn anywhere in the rectangle it
+// covers. Pass 1 asks from last frame's camera, against last frame's
+// pyramid; pass 2 from this frame's.
+fn occluded(center: vec3f, radius: f32) -> bool {
+  if ((frame.flags & FLAG_OCCLUSION) == 0u) { return false; }
+  if (pass_info.pass_index == 0u && (frame.flags & FLAG_PREV_VALID) == 0u) { return false; }
+  var c = (frame.view * vec4f(center, 1.0)).xyz;
+  if (pass_info.pass_index == 0u) { c = (frame.prev_view * vec4f(center, 1.0)).xyz; }
+  c.z = -c.z;
+  var aabb: vec4f;
+  if (!project_sphere(c, radius, &aabb)) { return false; }
+  let screen = vec2f(f32(frame.width), f32(frame.height));
+  let lo = clamp(aabb.xy, vec2f(0.0), vec2f(1.0)) * screen;
+  let hi = clamp(aabb.zw, vec2f(0.0), vec2f(1.0)) * screen - 0.5;
+  // The finest level at which the rectangle spans at most 2 x 2 texels.
+  var level = 0u;
+  var t0: vec2i;
+  var t1: vec2i;
+  loop {
+    let s = exp2(f32(level + 1u));
+    t0 = vec2i(floor(lo / s));
+    t1 = vec2i(floor(max(hi, lo) / s));
+    if (all(t1 - t0 <= vec2i(1)) || level + 1u >= frame.hzb_levels) { break; }
+    level++;
+  }
+  let size = vec2i(textureDimensions(hzb, level)) - vec2i(1);
+  t0 = min(t0, size);
+  t1 = min(t1, size);
+  var far_depth = textureLoad(hzb, t0, level).x;
+  far_depth = min(far_depth, textureLoad(hzb, vec2i(t1.x, t0.y), level).x);
+  far_depth = min(far_depth, textureLoad(hzb, vec2i(t0.x, t1.y), level).x);
+  far_depth = min(far_depth, textureLoad(hzb, t1, level).x);
+  return frame.near_z / (c.z - radius) < far_depth;
+}
+
+// The depth pyramid's first level, from the hardware rasterizer's depth
+// and the software rasterizer's, the nearer of the two at each pixel; an
+// empty pixel counts as infinitely far.
+@compute @workgroup_size(8, 8)
+fn hzb_first(@builtin(global_invocation_id) gid: vec3u) {
+  let size = textureDimensions(hzb_dst);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  var far_depth = 1e30;
+  for (var k = 0u; k < 4u; k++) {
+    let q = gid.xy * 2u + vec2u(k & 1u, k >> 1u);
+    if (q.x < frame.width && q.y < frame.height) {
+      let d = max(textureLoad(hw_depth, q, 0), bitcast<f32>(atomicLoad(&sw_buf[q.x + q.y * frame.width])));
+      far_depth = min(far_depth, d);
+    }
+  }
+  textureStore(hzb_dst, gid.xy, vec4f(far_depth));
+}
+
+// Each level after, from the one before.
+@compute @workgroup_size(8, 8)
+fn hzb_down(@builtin(global_invocation_id) gid: vec3u) {
+  let size = textureDimensions(hzb_dst);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let src = textureDimensions(hzb_src);
+  var far_depth = 1e30;
+  for (var k = 0u; k < 4u; k++) {
+    let q = gid.xy * 2u + vec2u(k & 1u, k >> 1u);
+    if (q.x < src.x && q.y < src.y) { far_depth = min(far_depth, textureLoad(hzb_src, q, 0).x); }
+  }
+  textureStore(hzb_dst, gid.xy, vec4f(far_depth));
+}
 // Streaming: the frame each page was last drawn from, the pages asked for
 // this frame (page, priority as float bits), and when each was last asked.
 struct Requests {
@@ -44,9 +154,14 @@ struct Requests {
   pad2: u32,
   list: array<vec2u>,
 }
-@group(1) @binding(6) var<storage, read_write> page_used: array<u32>;
+// Per page: the frame it was last drawn from, then the frame it was last
+// asked for.
+@group(1) @binding(6) var<storage, read_write> page_stamps: array<atomic<u32>>;
+@group(1) @binding(9) var<uniform> pass_info: PassInfo;
+// What pass 1 found hidden: clusters (instance, cluster) first, then
+// instances (instance, 0) from max_visible on.
+@group(1) @binding(12) var<storage, read_write> late: array<vec2u>;
 @group(1) @binding(7) var<storage, read_write> requests: Requests;
-@group(1) @binding(8) var<storage, read_write> request_stamp: array<atomic<u32>>;
 
 // The LOD test with streaming, as viewer/shaders/common.glsl's: a cluster
 // is drawn when it is the right level, or when the finer clusters it
@@ -69,7 +184,8 @@ fn lod_test(inst: Instance, c: Cluster) -> Lod {
 }
 
 fn request_finer(c: Cluster, priority: f32) {
-  if (atomicExchange(&request_stamp[c.creator], frame.frame_index) == frame.frame_index) { return; }
+  let stamp = arrayLength(&page_stamps) / 2u + c.creator;
+  if (atomicExchange(&page_stamps[stamp], frame.frame_index) == frame.frame_index) { return; }
   let k = atomicAdd(&requests.count, 1u);
   if (k < frame.max_requests) { requests.list[k] = vec2u(c.creator, bitcast<u32>(priority)); }
 }
@@ -90,17 +206,31 @@ fn request_finer(c: Cluster, priority: f32) {
 var<workgroup> wg_first_item: u32;
 var<workgroup> wg_items: u32;
 var<workgroup> wg_first_cluster: u32;
+var<workgroup> wg_count: u32;
 
+// Pass 1 runs over every instance and tests occlusion against last
+// frame's depth; what it finds hidden is listed for pass 2, which runs
+// over that list only and tests against the depth pass 1 drew.
 @compute @workgroup_size(64)
 fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) lane: u32) {
-  let i = wid.y * 65535u + wid.x;
-  if (i >= frame.instance_count) { return; }
+  let pass_index = pass_info.pass_index;
+  if (lane == 0u) { wg_count = select(atomicLoad(&counters.late_instances), frame.instance_count, pass_index == 0u); }
+  let slot = wid.y * 65535u + wid.x;
+  if (slot >= workgroupUniformLoad(&wg_count)) { return; }
+  let i = select(late[frame.max_visible + slot].x, slot, pass_index == 0u);
   if (lane == 0u) {
     wg_items = 0u;
     let inst = instances[i];
     let m = meshes[inst.mesh];
     let center = to_world(inst, m.bounds.xyz);
-    if ((frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, m.bounds.w * inst.scale)) {
+    let radius = m.bounds.w * inst.scale;
+    var keep = pass_index != 0u || (frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, radius);
+    if (keep && occluded(center, radius)) {
+      if (pass_index == 0u) { late[frame.max_visible + atomicAdd(&counters.late_instances, 1u)] = vec2u(i, 0u); }
+      else { atomicAdd(&counters.instances_occluded, 1u); }
+      keep = false;
+    }
+    if (keep) {
       atomicAdd(&counters.instances_visible, 1u);
       let lc = to_world(inst, m.lod_bounds.xyz);
       let d = max(length(lc - frame.cull_origin.xyz) - m.lod_bounds.w * inst.scale, frame.near_z);
@@ -116,12 +246,12 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
       }
       var n = (m.cluster_count - lo + 63u) / 64u;
       var base = 0u;
-      if (n > 0u) { base = atomicAdd(&counters.work, n); }
+      if (n > 0u) { base = atomicAdd(&counters.work[pass_index], n); }
       if (base + n > frame.max_work) {
         atomicAdd(&counters.overflow, 1u);
         n = select(0u, frame.max_work - base, base < frame.max_work);
       }
-      wg_first_item = base;
+      wg_first_item = pass_index * frame.max_work + base;
       wg_items = n;
       wg_first_cluster = m.first_cluster + lo;
     }
@@ -138,9 +268,20 @@ fn rows(n: u32, at: u32) {
   args[at + 2u] = 1u;
 }
 
+// A pass's cluster culling dispatch: one workgroup per work item, and in
+// pass 2 one per 64 clusters pass 1 found hidden.
 @compute @workgroup_size(1)
 fn args_cull() {
-  rows(min(atomicLoad(&counters.work), frame.max_work), 0u);
+  let pass_index = pass_info.pass_index;
+  let items = min(atomicLoad(&counters.work[pass_index]), frame.max_work);
+  var n = items;
+  if (pass_index == 1u) { n += (min(atomicLoad(&counters.late_clusters), frame.max_visible) + 63u) / 64u; }
+  rows(n, pass_index * 4u);
+  counters.pass_start[6u + pass_index] = items;
+  if (pass_index == 0u) {
+    counters.pass_start[0] = 0u;
+    counters.pass_start[3] = 0u;
+  }
 }
 
 // --- Cluster culling: one workgroup per work item, one invocation per
@@ -163,13 +304,16 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
     atomicStore(&wg_triangles, 0u);
   }
   workgroupBarrier();
+  let pass_index = pass_info.pass_index;
   let item = wid.y * 65535u + wid.x;
   var draw = false;
   var software = false;
+  var hidden = false;
   var instance_id = 0u;
   var cluster_id = 0u;
-  if (item < min(atomicLoad(&counters.work), frame.max_work)) {
-    let w = work[item];
+  let items = counters.pass_start[6u + pass_index];
+  if (item < items) {
+    let w = work[pass_index * frame.max_work + item];
     let inst = instances[w.x];
     let m = meshes[inst.mesh];
     instance_id = w.x;
@@ -188,9 +332,13 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
         let view = center - frame.cull_origin.xyz;
         if (dot(view, axis) >= c.cone_cutoff * length(view) + r) { draw = false; }
       }
+      if (draw && occluded(center, r)) {
+        draw = false;
+        hidden = true;
+      }
       if (draw) {
         atomicAdd(&wg_triangles, c.triangle_count);
-        page_used[c.group] = frame.frame_index;
+        atomicStore(&page_stamps[c.group], frame.frame_index);
         // Pages are asked for by the view, not the shadow map: shadows
         // draw from whatever the view has loaded.
         if (lod.wants_finer && (frame.flags & FLAG_SHADOW_PASS) == 0u) { request_finer(c, lod.self_error); }
@@ -201,6 +349,34 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
                    2.0 * r * frame.lod_scale / d < frame.sw_max_pixels;
       }
     }
+  } else if (pass_index == 1u) {
+    // A piece of pass 1's hidden clusters: only occlusion is left to test.
+    let k = (item - items) * 64u + lane;
+    if (k < min(atomicLoad(&counters.late_clusters), frame.max_visible)) {
+      atomicAdd(&wg_tested, 1u);
+      let ic = late[k];
+      instance_id = ic.x;
+      cluster_id = ic.y;
+      let inst = instances[instance_id];
+      let c = clusters[cluster_id];
+      let center = to_world(inst, c.center);
+      let r = c.radius * inst.scale;
+      draw = !occluded(center, r);
+      if (draw) {
+        atomicAdd(&wg_triangles, c.triangle_count);
+        atomicAdd(&counters.clusters_late, 1u);
+        atomicStore(&page_stamps[c.group], frame.frame_index);
+        let lod = lod_test(inst, c);
+        if (lod.wants_finer) { request_finer(c, lod.self_error); }
+        let d = length(center - frame.origin.xyz) - r;
+        software = (frame.flags & FLAG_SOFTWARE) != 0u && d > frame.near_z * 2.0 &&
+                   2.0 * r * frame.lod_scale / d < frame.sw_max_pixels;
+      }
+    }
+  }
+  if (hidden && pass_index == 0u) {
+    let k = atomicAdd(&counters.late_clusters, 1u);
+    if (k < frame.max_visible) { late[k] = vec2u(instance_id, cluster_id); }
   }
   var slot = 0u;
   if (draw) {
@@ -227,15 +403,22 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
   }
 }
 
+// A pass's draws: the hardware draw (128 triangles' worth of vertices per
+// cluster, one instance per cluster) and the software dispatch, over the
+// clusters this pass added to each list.
 @compute @workgroup_size(1)
 fn args_draw() {
-  // drawIndirect: 128 triangles' worth of vertices per cluster, one
-  // instance per cluster.
-  args[4] = 384u;
-  args[5] = min(atomicLoad(&counters.hw), frame.max_visible);
-  args[6] = 0u;
-  args[7] = 0u;
-  rows(min(atomicLoad(&counters.sw), frame.max_visible), 8u);
+  let pass_index = pass_info.pass_index;
+  let hw_end = min(atomicLoad(&counters.hw), frame.max_visible);
+  let sw_end = min(atomicLoad(&counters.sw), frame.max_visible);
+  counters.pass_start[pass_index + 1u] = hw_end;
+  counters.pass_start[4u + pass_index] = sw_end;
+  let at = 8u + pass_index * 4u;
+  args[at] = 384u;
+  args[at + 1u] = hw_end - counters.pass_start[pass_index];
+  args[at + 2u] = 0u;
+  args[at + 3u] = 0u;
+  rows(sw_end - counters.pass_start[3u + pass_index], 16u + pass_index * 4u);
 }
 
 // --- The software rasterizer: one workgroup per small cluster, one
@@ -261,8 +444,8 @@ fn owns_edge(a: vec2i, b: vec2i) -> bool {
 }
 
 fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
-  let k = wid.y * 65535u + wid.x;
-  if (lane == 0u) { wg_valid = select(0u, 1u, k < min(atomicLoad(&counters.sw), frame.max_visible)); }
+  let k = counters.pass_start[3u + pass_info.pass_index] + wid.y * 65535u + wid.x;
+  if (lane == 0u) { wg_valid = select(0u, 1u, k < counters.pass_start[4u + pass_info.pass_index]); }
   if (workgroupUniformLoad(&wg_valid) == 0u) { return; }
   let v = sw_visible[k];
   let inst = instances[v.x];
@@ -324,9 +507,9 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
         let bits = bitcast<u32>(z);
         let at = row + u32(x);
         if (write_id) {
-          if (atomicLoad(&sw_depth[at]) == bits) { sw_id[at] = id; }
-        } else if (bits > atomicLoad(&sw_depth[at])) {
-          atomicMax(&sw_depth[at], bits);
+          if (atomicLoad(&sw_buf[at]) == bits) { atomicStore(&sw_buf[frame.width * frame.height + at], id); }
+        } else if (bits > atomicLoad(&sw_buf[at])) {
+          atomicMax(&sw_buf[at], bits);
         }
       }
       w0 += dx0; w1 += dx1; w2 += dx2;
@@ -449,7 +632,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
   let dir = normalize(near_point.xyz / near_point.w - origin);
 
   let hd = textureLoad(hw_depth, px, 0);
-  let sd_bits = atomicLoad(&sw_depth[gid.x + gid.y * frame.width]);
+  let sd_bits = atomicLoad(&sw_buf[gid.x + gid.y * frame.width]);
   let sd = bitcast<f32>(sd_bits);
   var found = false;
   var software = false;
@@ -463,7 +646,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     found = true;
     z = hd;
   } else if (sd_bits != 0u) {
-    id = sw_id[gid.x + gid.y * frame.width];
+    id = atomicLoad(&sw_buf[frame.width * frame.height + gid.x + gid.y * frame.width]);
     vc = sw_visible[id >> 7u];
     found = true;
     software = true;

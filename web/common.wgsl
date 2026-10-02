@@ -31,6 +31,15 @@ struct Frame {
   shadow_texel: f32,  // A shadow map texel's size in world units
   pad2: u32,
   pad3: u32,
+  // Occlusion culling: the depth pyramid's cameras. Pass 1 tests against
+  // last frame's pyramid from last frame's camera; pass 2 against this
+  // frame's, built after pass 1.
+  view: mat4x4f,
+  prev_view: mat4x4f,
+  p00: f32,  // Projection scale in x and y
+  p11: f32,
+  hzb_levels: u32,
+  pad4: u32,
 }
 
 // include/geometry_file.hpp's gpu_cluster, as paged (include/paged_file.hpp):
@@ -83,6 +92,8 @@ const FLAG_FRUSTUM = 2u;
 const FLAG_SOFTWARE = 4u;
 const FLAG_SHADOW_PASS = 8u;  // Culling and drawing for the shadow map
 const FLAG_SHADOWS = 16u;
+const FLAG_OCCLUSION = 32u;
+const FLAG_PREV_VALID = 64u;  // Last frame's pyramid fits this frame
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;

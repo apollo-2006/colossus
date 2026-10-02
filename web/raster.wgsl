@@ -6,6 +6,20 @@
 // (visible cluster, triangle) into an r32uint target, behind the depth test.
 
 @group(1) @binding(0) var<storage, read> hw_visible: array<vec2u>;
+struct PassInfo {
+  pass_index: u32,
+  level: u32,
+  pad0: u32,
+  pad1: u32,
+}
+@group(1) @binding(2) var<uniform> pass_info: PassInfo;
+// compute.wgsl's Counters, for where each pass's clusters start in
+// hw_visible (args_draw writes it).
+struct Counters {
+  counts: array<u32, 12>,
+  pass_start: array<u32, 8>,
+}
+@group(1) @binding(3) var<storage, read> counters: Counters;
 
 struct VertexOut {
   @builtin(position) position: vec4f,
@@ -13,8 +27,9 @@ struct VertexOut {
 }
 
 @vertex
-fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VertexOut {
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) local: u32) -> VertexOut {
   var out: VertexOut;
+  let ii = counters.pass_start[pass_info.pass_index] + local;
   let v = hw_visible[ii];
   let c = clusters[v.y];
   let tri = vi / 3u;
@@ -52,7 +67,7 @@ fn blit_fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
 // The shadow map's casters: positions only, for depth.
 @vertex
 fn shadow_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
-  let v = hw_visible[ii];
+  let v = hw_visible[counters.pass_start[0] + ii];
   let c = clusters[v.y];
   let tri = vi / 3u;
   if (tri >= c.triangle_count) { return vec4f(2.0, 2.0, 2.0, 1.0); }

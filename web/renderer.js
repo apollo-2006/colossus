@@ -9,12 +9,16 @@ import { Streamer } from './streamer.js';
 const MAX_WORK = 1 << 20;
 const MAX_VISIBLE = 1 << 20;
 const MAX_REQUESTS = 1 << 13;
-const FRAME_BYTES = 384;
+const FRAME_BYTES = 528;
+const PASS_STRIDE = 256;  // Dynamic uniform offsets must be multiples of this
+const MAX_HZB_LEVELS = 16;
+const STORAGE_BUFFERS_NEEDED = 14;
 const SHADOW_SIZE = 2048;
 const SHADOW_HALF = 8;  // The shadow map covers 16 x 16 units in front of the camera
 const SUN_DIR = [0.75, 0.5, 0.3].map((x) => x / Math.hypot(0.75, 0.5, 0.3));
 
-export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOW_PASS = 8, FLAG_SHADOWS = 16;
+export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOW_PASS = 8, FLAG_SHADOWS = 16, FLAG_OCCLUSION = 32;
+const FLAG_PREV_VALID = 64;
 
 async function source(name) {
   const r = await fetch(name);
@@ -27,17 +31,23 @@ export class Renderer {
     if (!navigator.gpu) return null;
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) return null;
+    // The culling passes bind 14 storage buffers to the compute stage; the
+    // default limit is 8, but desktop adapters allow at least 16.
+    if (adapter.limits.maxStorageBuffersPerShaderStage < STORAGE_BUFFERS_NEEDED)
+      throw new Error(`this GPU allows ${adapter.limits.maxStorageBuffersPerShaderStage} storage buffers per shader stage; the demo needs ${STORAGE_BUFFERS_NEEDED}`);
     const timestamps = adapter.features.has('timestamp-query');
     const device = await adapter.requestDevice({
       requiredFeatures: timestamps ? ['timestamp-query'] : [],
       requiredLimits: {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         maxBufferSize: adapter.limits.maxBufferSize,
-        maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 16),
+        maxStorageBuffersPerShaderStage: STORAGE_BUFFERS_NEEDED,
       },
     });
     const r = new Renderer();
     r.device = device;
+    device.addEventListener('uncapturederror', (e) => console.error('WebGPU:', e.error.message));
+    device.lost.then((info) => console.error('WebGPU device lost:', info.message));
     r.adapterInfo = adapter.info || {};
     r.timestamps = timestamps;
     r.canvas = canvas;
@@ -65,7 +75,10 @@ export class Renderer {
       entries: [{ binding: 0, visibility: C | V | F, buffer: { type: 'uniform' } },
         ...[1, 2, 3, 6, 7].map((b) => ro(b, C | V))],
     });
-    this.workLayout = d.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6, 7, 8].map(rw) });
+    const passInfo = (binding, visibility) => ({ binding, visibility, buffer: { type: 'uniform', hasDynamicOffset: true } });
+    this.workLayout = d.createBindGroupLayout({
+      entries: [...[0, 1, 2, 3, 4, 6, 7, 12].map(rw), passInfo(9, C)],
+    });
     this.imageLayout = d.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
@@ -73,10 +86,18 @@ export class Renderer {
         { binding: 2, visibility: C, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
         { binding: 3, visibility: C, texture: { sampleType: 'depth' } },
         { binding: 4, visibility: C, sampler: { type: 'comparison' } },
+        { binding: 5, visibility: C, texture: { sampleType: 'unfilterable-float' } },
+      ],
+    });
+    this.hzbLayout = d.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
+        { binding: 6, visibility: C, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 7, visibility: C, storageTexture: { access: 'write-only', format: 'r32float' } },
       ],
     });
     this.argsLayout = d.createBindGroupLayout({ entries: [rw(0)] });
-    this.rasterLayout = d.createBindGroupLayout({ entries: [ro(0, V)] });
+    this.rasterLayout = d.createBindGroupLayout({ entries: [ro(0, V), passInfo(2, V), ro(3, V)] });
     this.blitLayout = d.createBindGroupLayout({
       entries: [{ binding: 1, visibility: F, texture: { sampleType: 'float' } }],
     });
@@ -93,6 +114,9 @@ export class Renderer {
     this.swDepth = compute('sw_depth_pass', layout3);
     this.swId = compute('sw_id_pass', layout3);
     this.shade = compute('shade', layout3);
+    const hzbLayout = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.hzbLayout] });
+    this.hzbFirst = compute('hzb_first', hzbLayout);
+    this.hzbDown = compute('hzb_down', hzbLayout);
 
     this.raster = d.createRenderPipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.rasterLayout] }),
@@ -121,12 +145,20 @@ export class Renderer {
     const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
     this.frameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
     this.shadowFrameBuffer = d.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | CD });
-    this.counters = d.createBuffer({ size: 32, usage: S | CD | CS });
-    this.work = d.createBuffer({ size: MAX_WORK * 8, usage: S });
+    this.counters = d.createBuffer({ size: 96, usage: S | CD | CS });
+    // One entry per pass, then one per pyramid level: (pass, level).
+    this.passInfo = d.createBuffer({ size: PASS_STRIDE * (2 + MAX_HZB_LEVELS), usage: GPUBufferUsage.UNIFORM | CD });
+    for (let k = 0; k < 2 + MAX_HZB_LEVELS; k++)
+      d.queue.writeBuffer(this.passInfo, k * PASS_STRIDE, new Uint32Array([k < 2 ? k : 0, k < 2 ? 0 : k - 2, 0, 0]));
+    this.hzbDummy = d.createTexture({ size: [1, 1], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING });
+    this.prevValid = false;
+    this.work = d.createBuffer({ size: 2 * MAX_WORK * 8, usage: S });  // Per pass
     this.hwVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
     this.swVisible = d.createBuffer({ size: MAX_VISIBLE * 8, usage: S });
-    this.args = d.createBuffer({ size: 48, usage: S | GPUBufferUsage.INDIRECT });
-    this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
+    // [0, 8) culling dispatches per pass, [8, 16) hardware draws, [16, 24)
+    // software dispatches.
+    this.args = d.createBuffer({ size: 96, usage: S | GPUBufferUsage.INDIRECT });
+    this.readbacks = [0, 1, 2].map(() => ({ buffer: d.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | CD }), busy: false }));
     this.requests = d.createBuffer({ size: 16 + MAX_REQUESTS * 8, usage: S | CD | CS });
     this.frameIndex = 0;
     this.wanted = [];
@@ -181,8 +213,8 @@ export class Renderer {
     this.meshBuffer = upload(meshes);
     this.pageTable = d.createBuffer({ size: pages.length * 4, usage: S | CD });
     this.pool = d.createBuffer({ size: this.streamer.slotCount * this.streamer.slotBytes, usage: S | CD });
-    this.pageUsed = d.createBuffer({ size: pages.length * 4, usage: S | CD | CS });
-    this.requestStamp = d.createBuffer({ size: pages.length * 4, usage: S | CD });
+    // Per page, the frame it was last drawn from, then the frame it was last asked for.
+    this.pageStamps = d.createBuffer({ size: pages.length * 8, usage: S | CD | CS });
     this.streamReadbacks = [0, 1, 2].map(() => ({
       buffer: d.createBuffer({ size: 16 + MAX_REQUESTS * 8 + pages.length * 4, usage: GPUBufferUsage.MAP_READ | CD }), busy: false,
     }));
@@ -203,6 +235,10 @@ export class Renderer {
       this.fullDetail += this.models[p.model].leafTriangles;
     });
     this.instanceCount = placements.length;
+    this.late?.destroy();
+    this.late = d.createBuffer({ size: (MAX_VISIBLE + Math.max(1, placements.length)) * 8, usage: GPUBufferUsage.STORAGE });
+    this.workGroup = null;  // Remade with it on the next resize
+    this.width = 0;
     this.instanceBuffer?.destroy();
     this.instanceBuffer = d.createBuffer({ size: instances.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     d.queue.writeBuffer(this.instanceBuffer, 0, instances);
@@ -221,26 +257,49 @@ export class Renderer {
     const d = this.device;
     this.width = width;
     this.height = height;
-    for (const x of [this.swDepthBuffer, this.swIdBuffer, this.depthTexture, this.idTexture, this.image]) x?.destroy();
-    this.swDepthBuffer = d.createBuffer({ size: width * height * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    this.swIdBuffer = d.createBuffer({ size: width * height * 4, usage: GPUBufferUsage.STORAGE });
+    for (const x of [this.swBuffer, this.depthTexture, this.idTexture, this.image]) x?.destroy();
+    // The software rasterizer's depth, then its triangle ids.
+    this.swBuffer = d.createBuffer({ size: width * height * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const T = GPUTextureUsage;
     this.depthTexture = d.createTexture({ size: [width, height], format: 'depth32float', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
     this.idTexture = d.createTexture({ size: [width, height], format: 'r32uint', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
     this.image = d.createTexture({ size: [width, height], format: 'rgba8unorm', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING | T.COPY_SRC });
     this.workGroup = d.createBindGroup({
       layout: this.workLayout,
-      entries: [this.counters, this.work, this.hwVisible, this.swVisible, this.swDepthBuffer, this.swIdBuffer, this.pageUsed,
-        this.requests, this.requestStamp].map((buffer, binding) => ({ binding, resource: { buffer } })),
+      entries: [
+        ...[[0, this.counters], [1, this.work], [2, this.hwVisible], [3, this.swVisible], [4, this.swBuffer],
+          [6, this.pageStamps], [7, this.requests], [12, this.late]].map(([binding, buffer]) => ({ binding, resource: { buffer } })),
+        { binding: 9, resource: { buffer: this.passInfo, size: 16 } },
+      ],
     });
+    // The depth pyramid: level 0 half the screen (rounded up), each level
+    // half the last, down to 1 x 1.
+    this.hzb?.destroy();
+    const hw = Math.ceil(width / 2), hh = Math.ceil(height / 2);
+    this.hzbLevels = Math.min(MAX_HZB_LEVELS, Math.floor(Math.log2(Math.max(hw, hh))) + 1);
+    this.hzb = d.createTexture({ size: [hw, hh], format: 'r32float', mipLevelCount: this.hzbLevels,
+      usage: T.STORAGE_BINDING | T.TEXTURE_BINDING });
+    const level = (l) => this.hzb.createView({ baseMipLevel: l, mipLevelCount: 1 });
+    this.hzbGroups = [];
+    for (let l = 0; l < this.hzbLevels; l++)
+      this.hzbGroups.push(d.createBindGroup({
+        layout: this.hzbLayout,
+        entries: [{ binding: 0, resource: this.depthTexture.createView() },
+          { binding: 6, resource: l === 0 ? this.hzbDummy.createView() : level(l - 1) }, { binding: 7, resource: level(l) }],
+      }));
+    this.prevValid = false;
     this.imageGroup = d.createBindGroup({
       layout: this.imageLayout,
       entries: [{ binding: 0, resource: this.depthTexture.createView() }, { binding: 1, resource: this.idTexture.createView() },
         { binding: 2, resource: this.image.createView() }, { binding: 3, resource: this.shadowMap.createView() },
-        { binding: 4, resource: this.shadowSampler }],
+        { binding: 4, resource: this.shadowSampler }, { binding: 5, resource: this.hzb.createView() }],
     });
     this.argsGroup = d.createBindGroup({ layout: this.argsLayout, entries: [{ binding: 0, resource: { buffer: this.args } }] });
-    this.rasterGroup = d.createBindGroup({ layout: this.rasterLayout, entries: [{ binding: 0, resource: { buffer: this.hwVisible } }] });
+    this.rasterGroup = d.createBindGroup({
+      layout: this.rasterLayout,
+      entries: [{ binding: 0, resource: { buffer: this.hwVisible } }, { binding: 2, resource: { buffer: this.passInfo, size: 16 } },
+        { binding: 3, resource: { buffer: this.counters } }],
+    });
     this.blitGroup = d.createBindGroup({ layout: this.blitLayout, entries: [{ binding: 1, resource: this.image.createView() }] });
     this.emptyGroup = d.createBindGroup({ layout: this.blit.getBindGroupLayout(0), entries: [] });
   }
@@ -284,12 +343,26 @@ export class Renderer {
     const ff = new Float32Array(f), fu = new Uint32Array(f);
     ff.set(sunViewProj, 76);
     ff[93] = 2 * SHADOW_HALF / SHADOW_SIZE;  // shadow_texel
+    const view = lookTo(camera.eye, camera.forward, [0, 1, 0]);
+    ff.set(view, 96);
+    ff.set(this.prevValid ? this.prevView : view, 112);
+    ff[128] = proj[0];
+    ff[129] = proj[5];
+    fu[130] = this.hzbLevels;
+    this.prevView = view;
     ff.set(viewProj, 0);
     ff.set(invert(viewProj), 16);
     frustumPlanes(cullViewProj).forEach((p, k) => ff.set(p, 32 + 4 * k));
     ff.set([...cull.eye, 1], 52);
     ff.set([...camera.eye, 1], 56);
-    fu[60] = width; fu[61] = height; fu[62] = this.instanceCount; fu[63] = settings.flags;
+    fu[60] = width; fu[61] = height; fu[62] = this.instanceCount;
+    // Occlusion from the drawing camera says nothing about what a frozen
+    // culling camera would see.
+    let flags = settings.flags;
+    if (cull !== camera) flags &= ~FLAG_OCCLUSION;
+    if (this.prevValid) flags |= FLAG_PREV_VALID;
+    fu[63] = flags;
+    this.prevValid = true;
     ff[64] = height / (2 * Math.tan(camera.fov / 2));
     ff[65] = settings.threshold;
     ff[66] = camera.near;
@@ -309,72 +382,82 @@ export class Renderer {
     d.queue.writeBuffer(this.pageTable, 0, this.streamer.table);
 
     const enc = d.createCommandEncoder();
+    const ts = (begin, end) => (this.timestamps ? { timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: begin, endOfPassWriteIndex: end } } : {});
+    // Culls one pass: instances, then clusters, then the compute
+    // rasterizer's share; the hardware draw follows in its own render pass.
+    const cullPass = (scene, p, timestamps, software = true) => {
+      const cp = enc.beginComputePass(timestamps);
+      cp.setBindGroup(0, scene);
+      cp.setBindGroup(1, this.workGroup, [p * PASS_STRIDE]);
+      cp.setBindGroup(2, this.imageGroup);
+      cp.setBindGroup(3, this.argsGroup);
+      cp.setPipeline(this.instanceCull);
+      cp.dispatchWorkgroups(Math.min(this.instanceCount, 65535), Math.ceil(this.instanceCount / 65535));
+      cp.setPipeline(this.argsCull);
+      cp.dispatchWorkgroups(1);
+      cp.setPipeline(this.clusterCull);
+      cp.dispatchWorkgroupsIndirect(this.args, p * 16);
+      cp.setPipeline(this.argsDraw);
+      cp.dispatchWorkgroups(1);
+      if (software) {
+        cp.setPipeline(this.swDepth);
+        cp.dispatchWorkgroupsIndirect(this.args, 64 + p * 16);
+        cp.setPipeline(this.swId);
+        cp.dispatchWorkgroupsIndirect(this.args, 64 + p * 16);
+      }
+      cp.end();
+    };
+    const buildHzb = () => {
+      const hp = enc.beginComputePass();
+      hp.setBindGroup(0, this.sceneGroup);
+      for (let l = 0; l < this.hzbLevels; l++) {
+        hp.setBindGroup(1, this.workGroup, [(2 + l) * PASS_STRIDE]);
+        hp.setBindGroup(2, this.hzbGroups[l]);
+        hp.setPipeline(l === 0 ? this.hzbFirst : this.hzbDown);
+        hp.dispatchWorkgroups(Math.ceil(Math.max(1, Math.ceil(this.width / 2) >> l) / 8), Math.ceil(Math.max(1, Math.ceil(this.height / 2) >> l) / 8));
+      }
+      hp.end();
+    };
     if (shadows) {
-      // Cull with the sun's camera and draw the casters' depth, then the
-      // view starts over with the same lists.
+      // Cull with the sun's camera (one pass, no occlusion) and draw the
+      // casters' depth, then the view starts over with the same lists.
       enc.clearBuffer(this.counters);
-      let sp = enc.beginComputePass();
-      sp.setBindGroup(0, this.shadowSceneGroup);
-      sp.setBindGroup(1, this.workGroup);
-      sp.setBindGroup(2, this.imageGroup);
-      sp.setBindGroup(3, this.argsGroup);
-      sp.setPipeline(this.instanceCull);
-      sp.dispatchWorkgroups(Math.min(this.instanceCount, 65535), Math.ceil(this.instanceCount / 65535));
-      sp.setPipeline(this.argsCull);
-      sp.dispatchWorkgroups(1);
-      sp.setPipeline(this.clusterCull);
-      sp.dispatchWorkgroupsIndirect(this.args, 0);
-      sp.setPipeline(this.argsDraw);
-      sp.dispatchWorkgroups(1);
-      sp.end();
-      const rp = enc.beginRenderPass({
+      cullPass(this.shadowSceneGroup, 0, {}, false);
+      const sp = enc.beginRenderPass({
         colorAttachments: [],
         depthStencilAttachment: { view: this.shadowMap.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 },
       });
-      rp.setPipeline(this.shadowRaster);
-      rp.setBindGroup(0, this.shadowSceneGroup);
-      rp.setBindGroup(1, this.rasterGroup);
-      rp.drawIndirect(this.args, 16);
-      rp.end();
+      sp.setPipeline(this.shadowRaster);
+      sp.setBindGroup(0, this.shadowSceneGroup);
+      sp.setBindGroup(1, this.rasterGroup, [0]);
+      sp.drawIndirect(this.args, 32);
+      sp.end();
     }
     enc.clearBuffer(this.counters);
     enc.clearBuffer(this.requests, 0, 16);
-    enc.clearBuffer(this.swDepthBuffer);
-    const ts = (begin, end) => (this.timestamps ? { timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: begin, endOfPassWriteIndex: end } } : {});
+    enc.clearBuffer(this.swBuffer, 0, width * height * 4);
+    // Pass 1: what last frame's depth does not hide. Then the pyramid from
+    // what it drew, and pass 2: what pass 1 thought hidden but is not.
+    // Then the pyramid again, for next frame's pass 1.
+    for (let p = 0; p < 2; p++) {
+      cullPass(this.sceneGroup, p, p === 0 ? ts(0, 1) : {});
+      const rp = enc.beginRenderPass({
+        colorAttachments: [{ view: this.idTexture.createView(), loadOp: p === 0 ? 'clear' : 'load', storeOp: 'store', clearValue: [0, 0, 0, 0] }],
+        depthStencilAttachment: { view: this.depthTexture.createView(), depthLoadOp: p === 0 ? 'clear' : 'load', depthStoreOp: 'store', depthClearValue: 0 },
+        ...(p === 0 ? ts(2, 3) : {}),
+      });
+      rp.setPipeline(this.raster);
+      rp.setBindGroup(0, this.sceneGroup);
+      rp.setBindGroup(1, this.rasterGroup, [p * PASS_STRIDE]);
+      rp.drawIndirect(this.args, 32 + p * 16);
+      rp.end();
+      buildHzb();
+    }
 
-    let pass = enc.beginComputePass(ts(0, 1));
-    pass.setBindGroup(0, this.sceneGroup);
-    pass.setBindGroup(1, this.workGroup);
-    pass.setBindGroup(2, this.imageGroup);
-    pass.setBindGroup(3, this.argsGroup);
-    pass.setPipeline(this.instanceCull);
-    pass.dispatchWorkgroups(Math.min(this.instanceCount, 65535), Math.ceil(this.instanceCount / 65535));
-    pass.setPipeline(this.argsCull);
-    pass.dispatchWorkgroups(1);
-    pass.setPipeline(this.clusterCull);
-    pass.dispatchWorkgroupsIndirect(this.args, 0);
-    pass.setPipeline(this.argsDraw);
-    pass.dispatchWorkgroups(1);
-    pass.setPipeline(this.swDepth);
-    pass.dispatchWorkgroupsIndirect(this.args, 32);
-    pass.setPipeline(this.swId);
-    pass.dispatchWorkgroupsIndirect(this.args, 32);
-    pass.end();
-
-    const rp = enc.beginRenderPass({
-      colorAttachments: [{ view: this.idTexture.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }],
-      depthStencilAttachment: { view: this.depthTexture.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 0 },
-      ...ts(2, 3),
-    });
-    rp.setPipeline(this.raster);
-    rp.setBindGroup(0, this.sceneGroup);
-    rp.setBindGroup(1, this.rasterGroup);
-    rp.drawIndirect(this.args, 16);
-    rp.end();
-
+    let pass;
     pass = enc.beginComputePass(ts(4, 5));
     pass.setBindGroup(0, this.sceneGroup);
-    pass.setBindGroup(1, this.workGroup);
+    pass.setBindGroup(1, this.workGroup, [0]);
     pass.setBindGroup(2, this.imageGroup);
     pass.setPipeline(this.shade);
     pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -394,12 +477,12 @@ export class Renderer {
     const sb = this.streamReadbacks.find((x) => !x.busy);
     if (sb) {
       enc.copyBufferToBuffer(this.requests, 0, sb.buffer, 0, 16 + MAX_REQUESTS * 8);
-      enc.copyBufferToBuffer(this.pageUsed, 0, sb.buffer, 16 + MAX_REQUESTS * 8, this.pageUsed.size);
+      enc.copyBufferToBuffer(this.pageStamps, 0, sb.buffer, 16 + MAX_REQUESTS * 8, this.pageStamps.size / 2);
     }
     // Statistics and timings come back a few frames late, into whichever
     // readback buffer is free.
     const rb = this.readbacks.find((x) => !x.busy);
-    if (rb) enc.copyBufferToBuffer(this.counters, 0, rb.buffer, 0, 32);
+    if (rb) enc.copyBufferToBuffer(this.counters, 0, rb.buffer, 0, 64);
     const tb = this.timestamps && this.timeReadbacks.find((x) => !x.busy);
     if (tb) {
       enc.resolveQuerySet(this.querySet, 0, 6, this.queryResolve, 0);
@@ -424,7 +507,10 @@ export class Renderer {
         const u = new Uint32Array(rb.buffer.getMappedRange().slice(0));
         rb.buffer.unmap();
         rb.busy = false;
-        this.stats = { work: u[0], hw: u[1], sw: u[2], instances: u[3], tested: u[4], triangles: u[5], overflow: u[6] };
+        this.stats = {
+          work: u[0] + u[1], hw: u[2], sw: u[3], instances: u[4], tested: u[5], triangles: u[6], overflow: u[7],
+          hiddenLastFrame: u[9], instancesOccluded: u[10], late: u[11],
+        };
       });
     }
     if (tb) {
