@@ -52,6 +52,13 @@ struct PassInfo {
 // depth pyramid: level 0 half the screen, each texel the farthest (smallest,
 // reversed) depth it covers.
 @group(2) @binding(5) var hzb: texture_2d<f32>;
+@group(2) @binding(13) var ao_image: texture_2d<f32>;  // ao.wgsl, half resolution
+
+// ambient occlusion over a full-resolution pixel.
+fn occlusion(px: vec2u) -> f32 {
+  if ((frame.flags & FLAG_AO) == 0u) { return 1.0; }
+  return textureLoad(ao_image, min(px / 2u, textureDimensions(ao_image) - 1u), 0).x;
+}
 // building it: the level below, the level written.
 @group(2) @binding(6) var hzb_src: texture_2d<f32>;
 @group(2) @binding(7) var hzb_dst: texture_storage_2d<r32float, write>;
@@ -632,7 +639,7 @@ fn material(index: u32) -> Material {
 
 // lambert plus ggx specular, schlick fresnel, smith shadowing, sky in the
 // reflection.
-fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32) -> vec3f {
+fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32) -> vec3f {
   let f0 = mix(vec3f(0.04), m.albedo, m.metallic);
   let nl = max(dot(n, SUN_DIR), 0.0);
   let nv = max(dot(n, v), 1e-4);
@@ -648,9 +655,9 @@ fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32) -> vec3f {
   let fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
   let specular = 3.14159 * d * g * fresnel / max(4.0 * nl * nv, 1e-4);
   let diffuse = m.albedo * (1.0 - m.metallic) * (1.0 - fresnel);
-  let ambient = mix(vec3f(0.24, 0.22, 0.2), sky(vec3f(0.0, 1.0, 0.0)), n.y * 0.5 + 0.5) * 0.42;
+  let ambient = mix(vec3f(0.24, 0.22, 0.2), sky(vec3f(0.0, 1.0, 0.0)), n.y * 0.5 + 0.5) * 0.42 * ao;
   let env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
-  let env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8;
+  let env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8 * ao;
   return (diffuse + specular) * SUN_COLOR * nl * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
          m.albedo * m.metallic * ambient * 0.5;
 }
@@ -738,7 +745,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       let cell = abs(fract(hit.xz * 0.5) - 0.5);
       let line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
       let ground = mix(vec3f(0.42, 0.4, 0.37), vec3f(0.33, 0.31, 0.29), line) *
-                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0)) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45);
+                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0)) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45 * occlusion(gid.xy));
       color = mix(ground, color, 1.0 - exp(-t * 0.012));
     }
   } else {
@@ -791,10 +798,12 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     }
     let hit = origin + dir * t;
     let lit = select(0.0, sunlight(hit, n), dot(n, SUN_DIR) > 0.0);
-    color = shade_material(m, n, -dir, lit);
-    if (!behind) { color += pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic); }
+    let ao = occlusion(gid.xy);
+    color = shade_material(m, n, -dir, lit, ao);
+    if (!behind) { color += pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic) * ao; }
     color = mix(color, sky(dir), 1.0 - exp(-t * 0.012));
   }
+  if (frame.debug_mode == 8u && (found || dir.y < 0.0)) { color = vec3f(occlusion(gid.xy)); }  // occlusion alone
   textureStore(out_image, px, vec4f(srgb(aces(color)), 1.0));
 }
 
