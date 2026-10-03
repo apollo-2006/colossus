@@ -696,70 +696,148 @@ fn material(index: u32) -> Material {
     case 1u: { return Material(vec3f(0.66, 0.64, 0.6), 0.3, 0.0); }    // polished marble
     case 2u: { return Material(vec3f(0.62, 0.5, 0.38), 0.85, 0.0); }   // sandstone
     case 3u: { return Material(vec3f(0.58, 0.38, 0.22), 0.35, 1.0); }  // bronze
-    case 4u: { return Material(vec3f(0.95, 0.74, 0.36), 0.28, 1.0); }  // gold
+    case 4u: { return Material(vec3f(1.0, 0.7, 0.27), 0.28, 1.0); }    // gold
     case 5u: { return Material(vec3f(0.2, 0.2, 0.22), 0.45, 0.0); }    // dark granite
     default: { return Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }   // plaster
   }
 }
 
-// procedural surface detail, as shade.comp's: 3d value noise in the model's own
-// space over its radius, octaves finer than a pixel faded out.
-fn value_noise(p: vec3f) -> f32 {
+// procedural surface detail, as shade.comp's: 3d value noise with its gradient in the
+// model's own space over its radius, octaves finer than a pixel faded out; the gradient
+// tilts the normal.
+fn value_noise(p: vec3f) -> vec4f {
   let i = vec3i(floor(p));
   let f = p - floor(p);
   let u = f * f * (3.0 - 2.0 * f);
+  let du = 6.0 * f * (1.0 - f);
   var v: array<f32, 8>;
   for (var k = 0; k < 8; k++) {
     let c = i + vec3i(k & 1, (k >> 1u) & 1, k >> 2u);
     v[k] = f32(hash((u32(c.x) * 73856093u) ^ (u32(c.y) * 19349663u) ^ (u32(c.z) * 83492791u)) & 0xffffu) / 65535.0;
   }
-  return mix(mix(mix(v[0], v[1], u.x), mix(v[2], v[3], u.x), u.y), mix(mix(v[4], v[5], u.x), mix(v[6], v[7], u.x), u.y), u.z);
+  let k1 = v[1] - v[0];
+  let k2 = v[2] - v[0];
+  let k3 = v[4] - v[0];
+  let k4 = v[0] - v[1] - v[2] + v[3];
+  let k5 = v[0] - v[2] - v[4] + v[6];
+  let k6 = v[0] - v[1] - v[4] + v[5];
+  let k7 = -v[0] + v[1] + v[2] - v[3] + v[4] - v[5] - v[6] + v[7];
+  let value = v[0] + k1 * u.x + k2 * u.y + k3 * u.z + k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x + k7 * u.x * u.y * u.z;
+  let grad = du * vec3f(k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z, k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+                        k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+  return vec4f(value, grad);
 }
 
-fn fbm(p: vec3f, freq0: f32, pixel: f32) -> f32 {
-  var sum = 0.0;
+fn fbm_d(p: vec3f, freq0: f32, pixel: f32) -> vec4f {
+  var sum = vec4f(0.0);
   var amp = 0.5;
   var total = 0.0;
   var freq = freq0;
   for (var o = 0; o < 4; o++) {
     let fade = clamp(2.0 - 4.0 * freq * pixel, 0.0, 1.0);
-    sum += amp * fade * value_noise(p * freq + f32(o) * 17.3);
+    let n = value_noise(p * freq + f32(o) * 17.3);
+    sum += amp * fade * vec4f(n.x, n.yzw * freq);
     total += amp * fade;
     freq *= 2.0;
     amp *= 0.5;
   }
-  return select(0.5, sum / total, total > 0.0);
+  return select(vec4f(0.5, 0.0, 0.0, 0.0), sum / total, total > 0.0);
 }
 
-fn surface_detail(m0: Material, kind: u32, q: vec3f, pixel: f32) -> Material {
-  var m = m0;
-  if (kind == 1u) {  // marble veins
-    let vein = pow(1.0 - abs(sin((q.x * 5.0 + q.y * 8.0 + q.z * 3.0) + 5.0 * fbm(q, 2.0, pixel))), 30.0);
-    m.albedo = mix(m.albedo * (0.95 + 0.07 * fbm(q, 8.0, pixel)), vec3f(0.45, 0.46, 0.5), vein * 0.6);
-    m.roughness += 0.1 * vein;
-  } else if (kind == 2u) {  // sandstone strata and grain
-    let strata = fbm(vec3f(q.y * 14.0, q.x, q.z), 1.0, pixel * 14.0);
-    let grain = fbm(q, 60.0, pixel);
-    m.albedo *= 0.8 + 0.3 * strata + 0.15 * (grain - 0.5);
-    m.roughness = clamp(m.roughness + 0.1 * (grain - 0.5), 0.0, 1.0);
-  } else if (kind == 3u) {  // bronze patina
-    let patina = smoothstep(0.5, 0.68, fbm(q, 4.0, pixel));
-    m.albedo = mix(m.albedo, vec3f(0.24, 0.44, 0.36), patina);
-    m.metallic = mix(m.metallic, 0.0, patina);
-    m.roughness = mix(m.roughness, 0.75, patina);
-  } else if (kind == 4u) {  // gold polish
-    m.roughness = clamp(m.roughness + 0.2 * (fbm(q, 12.0, pixel) - 0.5), 0.05, 1.0);
-  } else if (kind == 5u) {  // granite speckles
-    m.albedo *= mix(0.55, 1.9, smoothstep(0.35, 0.65, fbm(q, 90.0, pixel)));
+fn fbm(p: vec3f, freq: f32, pixel: f32) -> f32 { return fbm_d(p, freq, pixel).x; }
+
+fn vein(phase: f32, sharp: f32, width: f32) -> f32 {
+  let line = pow(1.0 - abs(sin(phase)), sharp);
+  return mix(line, 1.0 / sharp, clamp(width * sharp * 0.5 - 0.5, 0.0, 1.0));
+}
+
+struct Detail {
+  m: Material,
+  grad: vec3f,  // height gradient, model space over its radius
+  wrap: f32,    // light past the terminator
+  coat: f32,    // polish lobe
+}
+
+fn surface_detail(m: Material, kind: u32, q: vec3f, pixel: f32, ao: f32, up: f32) -> Detail {
+  var d = Detail(m, vec3f(0.0), 0.0, 0.0);
+  let recess = clamp((0.88 - ao) / 0.45, 0.0, 1.0);
+  if (kind == 1u) {  // marble
+    let warp = fbm_d(q, 1.5, pixel);
+    let fine = fbm_d(q + 3.1, 5.0, pixel);
+    let axis = vec3f(12.0, 20.0, 7.0);
+    let phase = dot(q, axis) + 14.0 * warp.x + 4.0 * fine.x;
+    let width = length(axis + 14.0 * warp.yzw + 4.0 * fine.yzw) * pixel;
+    let veins = clamp(0.9 * vein(phase, 7.0, width) + 0.5 * vein(phase * 2.3 + 6.0 * fine.x, 16.0, width * 2.3), 0.0, 1.0);
+    let cloud = fbm(q + 9.0, 3.0, pixel);
+    d.m.albedo = m.albedo * mix(vec3f(0.97, 0.97, 1.0), vec3f(1.03, 1.0, 0.95), cloud);
+    d.m.albedo = mix(d.m.albedo, vec3f(0.3, 0.32, 0.37), veins);
+    d.m.albedo *= mix(vec3f(1.0), vec3f(0.86, 0.82, 0.76), recess);
+    d.m.roughness = 0.22 + 0.25 * recess;
+    d.grad = fine.yzw * 0.0015;
+    d.wrap = 0.45;
+    d.coat = 0.3 * (1.0 - recess);
+  } else if (kind == 2u) {  // sandstone
+    let warp = fbm_d(q, 1.5, pixel);
+    let strata = q.y * 9.0 + 0.7 * warp.x;
+    let band = fract(strata);
+    let layer = hash(u32(i32(floor(strata)) + 4096)) % 3u;
+    let next = hash(u32(i32(floor(strata)) + 4097)) % 3u;
+    var colours = array<vec3f, 3>(vec3f(0.68, 0.53, 0.38), vec3f(0.78, 0.68, 0.52), vec3f(0.6, 0.41, 0.29));
+    var albedo = mix(colours[layer], colours[next], smoothstep(0.8, 1.0, band));
+    let afar = clamp(pixel * 9.0, 0.0, 1.0);
+    albedo = mix(albedo, vec3f(0.7, 0.6, 0.47), afar);
+    let grain = fbm_d(q, 70.0, pixel);
+    let pits = fbm_d(q + 7.0, 22.0, pixel);
+    let pit = smoothstep(0.55, 0.75, pits.x);
+    d.m.albedo = albedo * (0.9 + 0.25 * (grain.x - 0.5)) * (1.0 - 0.25 * pit) * mix(1.0, 0.72, recess);
+    d.m.roughness = 0.92;
+    let ledge = smoothstep(0.0, 0.12, band) * (1.0 - smoothstep(0.85, 1.0, band));
+    d.grad = grain.yzw * 0.0025 + pits.yzw * 0.006 * pit + vec3f(0.0, 9.0, 0.0) * 0.004 * (ledge - 0.5) * (1.0 - afar);
+    d.wrap = 0.15;
+  } else if (kind == 3u) {  // bronze
+    let base = fbm_d(q, 3.0, pixel);
+    let crust = fbm_d(q + 11.0, 30.0, pixel);
+    let streaks = fbm(vec3f(q.x * 25.0, q.y * 1.2, q.z * 25.0), 1.0, pixel * 25.0);
+    var patina = smoothstep(0.35, 0.75, base.x * 0.6 + recess * 0.7 + max(up, 0.0) * 0.25);
+    patina = clamp(patina + 0.35 * smoothstep(0.55, 0.8, streaks) * (1.0 - abs(up)), 0.0, 1.0);
+    let wear = smoothstep(0.93, 1.0, ao) * smoothstep(0.55, 0.7, fbm(q, 8.0, pixel));
+    patina *= 1.0 - wear;
+    let metal = mix(mix(m.albedo, vec3f(0.3, 0.2, 0.12), 0.45 * base.x), vec3f(0.78, 0.53, 0.32), wear);
+    let green = mix(vec3f(0.2, 0.44, 0.38), vec3f(0.32, 0.5, 0.3), crust.x);
+    d.m.albedo = mix(metal, green, patina);
+    d.m.metallic = 1.0 - patina;
+    d.m.roughness = mix(mix(0.35, 0.18, wear), 0.8, patina);
+    d.grad = crust.yzw * 0.004 * patina;
+  } else if (kind == 4u) {  // gold
+    let hammer = fbm_d(q, 18.0, pixel);
+    d.m.albedo = mix(m.albedo, vec3f(0.25, 0.18, 0.1), recess * 0.8);
+    d.m.metallic = 1.0 - recess * 0.8;
+    d.m.roughness = mix(0.16 + 0.15 * (fbm(q, 40.0, pixel) - 0.5), 0.8, recess);
+    d.grad = hammer.yzw * 0.006;
+  } else if (kind == 5u) {  // dark granite
+    let a = value_noise(q * 140.0);
+    let b = value_noise(q * 230.0 + 5.0);
+    let mica = smoothstep(0.74, 0.8, b.x);
+    let feldspar = smoothstep(0.58, 0.64, a.x) * (1.0 - mica);
+    let quartz = vec3f(0.26, 0.26, 0.28);
+    let pink = vec3f(0.46, 0.36, 0.33);
+    let black = vec3f(0.03, 0.03, 0.035);
+    var albedo = mix(mix(quartz, pink, feldspar), black, mica);
+    albedo = mix(albedo, quartz * 0.62 + pink * 0.3 + black * 0.08, clamp(230.0 * pixel * 2.0 - 0.5, 0.0, 1.0));
+    d.m.albedo = albedo * mix(1.0, 0.8, recess);
+    d.m.roughness = mix(0.15, 0.4, max(feldspar, mica));
+    d.grad = b.yzw * 230.0 * 0.00015 * clamp(1.5 - 230.0 * pixel * 2.0, 0.0, 1.0);
+    d.coat = 0.4;
   }
-  return m;
+  return d;
 }
 
 // lambert plus ggx specular, schlick fresnel, smith shadowing, sky in the
 // reflection.
-fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32) -> vec3f {
+fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32, wrap: f32, coat: f32) -> vec3f {
   let f0 = mix(vec3f(0.04), m.albedo, m.metallic);
   let nl = max(dot(n, SUN_DIR), 0.0);
+  let nl_wrap = max((dot(n, SUN_DIR) + wrap) / (1.0 + wrap), 0.0);
   let nv = max(dot(n, v), 1e-4);
   let h = normalize(SUN_DIR + v);
   let nh = max(dot(n, h), 0.0);
@@ -776,8 +854,15 @@ fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32) -> vec3f {
   let ambient = mix(vec3f(0.24, 0.22, 0.2), sky(vec3f(0.0, 1.0, 0.0)), n.y * 0.5 + 0.5) * 0.42 * ao;
   let env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
   let env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8 * ao;
-  return (diffuse + specular) * SUN_COLOR * nl * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
-         m.albedo * m.metallic * ambient * 0.5;
+  // the coat: ggx at roughness 0.05, fresnel from 0.04.
+  let ca2 = 0.0025 * 0.0025;
+  let cd = nh * nh * (ca2 - 1.0) + 1.0;
+  let coat_f = coat * (0.04 + 0.96 * pow(1.0 - vh, 5.0));
+  let coat_env = coat * (0.04 + 0.96 * pow(1.0 - nv, 5.0));
+  let coat_spec = coat_f * ca2 / (4.0 * cd * cd * max(nv, 1e-4) * max(nl, 1e-4) + 1e-6) * nl;
+  let base = (diffuse * nl_wrap + specular * nl) * SUN_COLOR * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
+             m.albedo * m.metallic * ambient * 0.5;
+  return base * (1.0 - coat_env) + min(coat_spec, 50.0) * SUN_COLOR * lit + sky(reflect(-v, n)) * coat_env * ao;
 }
 
 // soft shadows, as vsm.glsl's: contact hardening (pcss) for a sun drawn 1.5 degrees wide.
@@ -980,10 +1065,19 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     if (behind) { n = -n; }
 
     var m = material(inst.material);
+    let ao = occlusion(gid.xy);
+    let geometric_n = n;
+    var wrap = 0.0;
+    var coat = 0.0;
     if (frame.debug_mode == 0u) {
       let radius = meshes[inst.mesh].bounds.w;
       let q = from_world(inst, origin + dir * t) / radius;
-      m = surface_detail(m, min(inst.material, 5u), q, t / (frame.lod_scale * inst.scale * radius));
+      let d = surface_detail(m, min(inst.material, 5u), q, t / (frame.lod_scale * inst.scale * radius), ao, n.y);
+      m = d.m;
+      wrap = d.wrap;
+      coat = d.coat;
+      let g = to_world_dir(inst, d.grad) / inst.scale;
+      n = normalize(n - (g - dot(g, n) * n));
     }
     if (frame.debug_mode != 0u) { m = Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }
     switch (frame.debug_mode) {
@@ -997,9 +1091,8 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       default: {}
     }
     let hit = origin + dir * t;
-    let lit = select(0.0, sunlight(hit, n, shadow_noise(gid.xy)), dot(n, SUN_DIR) > 0.0);
-    let ao = occlusion(gid.xy);
-    color = shade_material(m, n, -dir, lit, ao);
+    let lit = select(0.0, sunlight(hit, geometric_n, shadow_noise(gid.xy)), dot(geometric_n, SUN_DIR) > 0.0);
+    color = shade_material(m, n, -dir, lit, ao, wrap, coat);
     if (!behind) { color += pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic) * ao; }
     color = mix(color, sky(dir), 1.0 - exp(-t * 0.012));
   }

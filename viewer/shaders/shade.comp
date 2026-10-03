@@ -33,59 +33,130 @@ const Material materials[6] = Material[](
     Material(vec3(0.66, 0.64, 0.6), 0.3, 0.0),    // polished marble
     Material(vec3(0.62, 0.5, 0.38), 0.85, 0.0),   // sandstone
     Material(vec3(0.58, 0.38, 0.22), 0.35, 1.0),  // bronze
-    Material(vec3(0.95, 0.74, 0.36), 0.28, 1.0),  // gold
+    Material(vec3(1.0, 0.7, 0.27), 0.28, 1.0),    // gold
     Material(vec3(0.2, 0.2, 0.22), 0.45, 0.0));   // dark granite
 
 // procedural surface detail: the scans have no uvs, so 3d value noise in the model's own space
-// (scaled by its radius: the same on every statue, fixed to moving ones). octaves finer than
-// a pixel fade out.
-float value_noise(vec3 p) {
+// (over its radius: the same on every statue, fixed to moving ones). octaves finer than a pixel
+// fade out. noise comes with its gradient (quilez), which tilts the normal: relief.
+
+// value noise at p: (value 0 to 1, gradient).
+vec4 value_noise(vec3 p) {
     const ivec3 i = ivec3(floor(p));
-    const vec3 f = p - floor(p), u = f * f * (3.0 - 2.0 * f);
+    const vec3 f = p - floor(p), u = f * f * (3.0 - 2.0 * f), du = 6.0 * f * (1.0 - f);
     float v[8];
     for (int k = 0; k < 8; ++k) {
         const ivec3 c = i + ivec3(k & 1, (k >> 1) & 1, k >> 2);
         v[k] = float(hash(uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u) & 0xffffu) / 65535.0;
     }
-    return mix(mix(mix(v[0], v[1], u.x), mix(v[2], v[3], u.x), u.y), mix(mix(v[4], v[5], u.x), mix(v[6], v[7], u.x), u.y), u.z);
+    const float k1 = v[1] - v[0], k2 = v[2] - v[0], k3 = v[4] - v[0], k4 = v[0] - v[1] - v[2] + v[3];
+    const float k5 = v[0] - v[2] - v[4] + v[6], k6 = v[0] - v[1] - v[4] + v[5];
+    const float k7 = -v[0] + v[1] + v[2] - v[3] + v[4] - v[5] - v[6] + v[7];
+    const float value = v[0] + k1 * u.x + k2 * u.y + k3 * u.z + k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x + k7 * u.x * u.y * u.z;
+    const vec3 grad = du * vec3(k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z, k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+                                k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+    return vec4(value, grad);
 }
 
-// four octaves from `freq`, 0 to 1; `pixel` is a pixel's size in the same units.
-float fbm(vec3 p, float freq, float pixel) {
-    float sum = 0.0, amp = 0.5, total = 0.0;
+// four octaves from `freq`: (value 0 to 1, gradient in p's units). `pixel`: a pixel's size there.
+vec4 fbm_d(vec3 p, float freq, float pixel) {
+    vec4 sum = vec4(0.0);
+    float amp = 0.5, total = 0.0;
     for (int o = 0; o < 4; ++o) {
         const float fade = clamp(2.0 - 4.0 * freq * pixel, 0.0, 1.0);  // gone at half a cycle a pixel
-        sum += amp * fade * value_noise(p * freq + float(o) * 17.3);
+        const vec4 n = value_noise(p * freq + float(o) * 17.3);
+        sum += amp * fade * vec4(n.x, n.yzw * freq);
         total += amp * fade;
         freq *= 2.0;
         amp *= 0.5;
     }
-    return total > 0.0 ? sum / total : 0.5;
+    return total > 0.0 ? sum / total : vec4(0.5, 0.0, 0.0, 0.0);
 }
 
-// q: position in the model, over its radius. pixel: a pixel's size in those units.
-Material surface_detail(Material m, uint kind, vec3 q, float pixel) {
-    if (kind == 1u) {  // marble: grey veins folded by noise
-        const float vein = pow(1.0 - abs(sin((q.x * 5.0 + q.y * 8.0 + q.z * 3.0) + 5.0 * fbm(q, 2.0, pixel))), 30.0);
-        m.albedo = mix(m.albedo * (0.95 + 0.07 * fbm(q, 8.0, pixel)), vec3(0.45, 0.46, 0.5), vein * 0.6);
-        m.roughness += 0.1 * vein;
-    } else if (kind == 2u) {  // sandstone: strata along the height, fine grain
-        const float strata = fbm(vec3(q.y * 14.0, q.x, q.z), 1.0, pixel * 14.0);
-        const float grain = fbm(q, 60.0, pixel);
-        m.albedo *= 0.8 + 0.3 * strata + 0.15 * (grain - 0.5);
-        m.roughness = clamp(m.roughness + 0.1 * (grain - 0.5), 0.0, 1.0);
-    } else if (kind == 3u) {  // bronze: green patina in patches
-        const float patina = smoothstep(0.5, 0.68, fbm(q, 4.0, pixel));
-        m.albedo = mix(m.albedo, vec3(0.24, 0.44, 0.36), patina);
-        m.metallic = mix(m.metallic, 0.0, patina);
-        m.roughness = mix(m.roughness, 0.75, patina);
-    } else if (kind == 4u) {  // gold: polish varying
-        m.roughness = clamp(m.roughness + 0.2 * (fbm(q, 12.0, pixel) - 0.5), 0.05, 1.0);
-    } else if (kind == 5u) {  // granite: light and dark speckles
-        const float s = fbm(q, 90.0, pixel);
-        m.albedo *= mix(0.55, 1.9, smoothstep(0.35, 0.65, s));
+float fbm(vec3 p, float freq, float pixel) { return fbm_d(p, freq, pixel).x; }
+
+// a thin line where sin(phase) crosses 0, about 2 / sharp wide in phase; averaged out once a
+// pixel spans it (`width`, the phase's change across a pixel).
+float vein(float phase, float sharp, float width) {
+    const float line = pow(1.0 - abs(sin(phase)), sharp);
+    return mix(line, 1.0 / sharp, clamp(width * sharp * 0.5 - 0.5, 0.0, 1.0));
+}
+
+struct Detail {
+    Material m;
+    vec3 grad;   // height gradient, model space over its radius: tilts the normal
+    float wrap;  // light bleeding past the terminator (marble's translucency)
+    float coat;  // a sharp polish highlight over the rest
+};
+
+// q: position in the model, over its radius. pixel: a pixel's size in those units. ao: how
+// open the spot is (grime and patina gather in recesses). up: the world normal's height.
+Detail surface_detail(Material m, uint kind, vec3 q, float pixel, float ao, float up) {
+    Detail d = Detail(m, vec3(0.0), 0.0, 0.0);
+    const float recess = clamp((0.88 - ao) / 0.45, 0.0, 1.0);
+    if (kind == 1u) {  // polished marble: warped veins at two scales, warm and cool clouding
+        // a few veins across a statue's height, bent hard by two octaves of warp.
+        const vec4 warp = fbm_d(q, 1.5, pixel), fine = fbm_d(q + 3.1, 5.0, pixel);
+        const vec3 axis = vec3(12.0, 20.0, 7.0);
+        const float phase = dot(q, axis) + 14.0 * warp.x + 4.0 * fine.x;
+        const float width = length(axis + 14.0 * warp.yzw + 4.0 * fine.yzw) * pixel;  // the phase's change across a pixel
+        const float veins = clamp(0.9 * vein(phase, 7.0, width) + 0.5 * vein(phase * 2.3 + 6.0 * fine.x, 16.0, width * 2.3), 0.0, 1.0);
+        const float cloud = fbm(q + 9.0, 3.0, pixel);
+        d.m.albedo = m.albedo * mix(vec3(0.97, 0.97, 1.0), vec3(1.03, 1.0, 0.95), cloud);
+        d.m.albedo = mix(d.m.albedo, vec3(0.3, 0.32, 0.37), veins);
+        d.m.albedo *= mix(vec3(1.0), vec3(0.86, 0.82, 0.76), recess);  // dust in the folds
+        d.m.roughness = 0.22 + 0.25 * recess;
+        d.grad = fine.yzw * 0.0015;
+        d.wrap = 0.45;
+        d.coat = 0.3 * (1.0 - recess);
+    } else if (kind == 2u) {  // sandstone: warped strata of three colours in relief, grain, pits
+        const vec4 warp = fbm_d(q, 1.5, pixel);
+        const float strata = q.y * 9.0 + 0.7 * warp.x, band = fract(strata);
+        const uint layer = hash(uint(int(floor(strata)) + 4096)) % 3u, next = hash(uint(int(floor(strata)) + 4097)) % 3u;
+        const vec3 colours[3] = vec3[](vec3(0.68, 0.53, 0.38), vec3(0.78, 0.68, 0.52), vec3(0.6, 0.41, 0.29));
+        vec3 albedo = mix(colours[layer], colours[next], smoothstep(0.8, 1.0, band));
+        albedo = mix(albedo, vec3(0.7, 0.6, 0.47), clamp(pixel * 9.0, 0.0, 1.0));  // bands average out afar
+        const vec4 grain = fbm_d(q, 70.0, pixel), pits = fbm_d(q + 7.0, 22.0, pixel);
+        const float pit = smoothstep(0.55, 0.75, pits.x);
+        d.m.albedo = albedo * (0.9 + 0.25 * (grain.x - 0.5)) * (1.0 - 0.25 * pit) * mix(1.0, 0.72, recess);
+        d.m.roughness = 0.92;
+        // softer layers erode back: each band's top stands out a little.
+        const float ledge = smoothstep(0.0, 0.12, band) * (1.0 - smoothstep(0.85, 1.0, band));
+        d.grad = grain.yzw * 0.0025 + pits.yzw * 0.006 * pit + vec3(0.0, 9.0, 0.0) * 0.004 * (ledge - 0.5) * (1.0 - clamp(pixel * 9.0, 0.0, 1.0));
+        d.wrap = 0.15;
+    } else if (kind == 3u) {  // bronze: patina in recesses, on tops and in rain streaks; worn bright where exposed
+        const vec4 base = fbm_d(q, 3.0, pixel), crust = fbm_d(q + 11.0, 30.0, pixel);
+        const float streaks = fbm(vec3(q.x * 25.0, q.y * 1.2, q.z * 25.0), 1.0, pixel * 25.0);
+        float patina = smoothstep(0.35, 0.75, base.x * 0.6 + recess * 0.7 + max(up, 0.0) * 0.25);
+        patina = clamp(patina + 0.35 * smoothstep(0.55, 0.8, streaks) * (1.0 - abs(up)), 0.0, 1.0);
+        const float wear = smoothstep(0.93, 1.0, ao) * smoothstep(0.55, 0.7, fbm(q, 8.0, pixel));
+        patina *= 1.0 - wear;
+        const vec3 metal = mix(mix(m.albedo, vec3(0.3, 0.2, 0.12), 0.45 * base.x), vec3(0.78, 0.53, 0.32), wear);
+        const vec3 green = mix(vec3(0.2, 0.44, 0.38), vec3(0.32, 0.5, 0.3), crust.x);
+        d.m.albedo = mix(metal, green, patina);
+        d.m.metallic = 1.0 - patina;
+        d.m.roughness = mix(mix(0.35, 0.18, wear), 0.8, patina);
+        d.grad = crust.yzw * 0.004 * patina;
+    } else if (kind == 4u) {  // gold: hammered, grime in the recesses
+        const vec4 hammer = fbm_d(q, 18.0, pixel);
+        d.m.albedo = mix(m.albedo, vec3(0.25, 0.18, 0.1), recess * 0.8);
+        d.m.metallic = 1.0 - recess * 0.8;
+        d.m.roughness = mix(0.16 + 0.15 * (fbm(q, 40.0, pixel) - 0.5), 0.8, recess);
+        d.grad = hammer.yzw * 0.006;
+    } else if (kind == 5u) {  // dark granite: crisp quartz, feldspar and mica grains, polished
+        // one octave each, sharp thresholds: grains, not clouds. averaged out once a pixel spans one.
+        const vec4 a = value_noise(q * 140.0), b = value_noise(q * 230.0 + 5.0);
+        const float mica = smoothstep(0.74, 0.8, b.x), feldspar = smoothstep(0.58, 0.64, a.x) * (1.0 - mica);
+        const vec3 quartz = vec3(0.26, 0.26, 0.28), pink = vec3(0.46, 0.36, 0.33), black = vec3(0.03, 0.03, 0.035);
+        vec3 albedo = mix(mix(quartz, pink, feldspar), black, mica);
+        const vec3 average = quartz * 0.62 + pink * 0.3 + black * 0.08;
+        albedo = mix(albedo, average, clamp(230.0 * pixel * 2.0 - 0.5, 0.0, 1.0));
+        d.m.albedo = albedo * mix(1.0, 0.8, recess);
+        d.m.roughness = mix(0.15, 0.4, max(feldspar, mica));
+        d.grad = b.yzw * 230.0 * 0.00015 * clamp(1.5 - 230.0 * pixel * 2.0, 0.0, 1.0);
+        d.coat = 0.4;
     }
-    return m;
+    return d;
 }
 
 vec3 sky(vec3 dir) {
@@ -146,9 +217,11 @@ float sunlight(uvec2 px, Surface s) {
 }
 
 // lambert plus ggx specular, schlick fresnel, smith shadowing.
-vec3 shade_material(Material m, vec3 n, vec3 v, float lit, float ao) {
+// wrap: light bleeding past the terminator; coat: a clear polish lobe over the rest.
+vec3 shade_material(Material m, vec3 n, vec3 v, float lit, float ao, float wrap, float coat) {
     const vec3 f0 = mix(vec3(0.04), m.albedo, m.metallic);
     const float nl = max(dot(n, sun_dir), 0.0), nv = max(dot(n, v), 1e-4);
+    const float nl_wrap = max((dot(n, sun_dir) + wrap) / (1.0 + wrap), 0.0);
     const vec3 h = normalize(sun_dir + v);
     const float nh = max(dot(n, h), 0.0), vh = max(dot(v, h), 0.0);
     const float a = m.roughness * m.roughness, a2 = a * a;
@@ -163,8 +236,13 @@ vec3 shade_material(Material m, vec3 n, vec3 v, float lit, float ao) {
     // sky in the reflection, fading with roughness.
     const vec3 env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
     const vec3 env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8 * ao;
-    return (diffuse + specular) * sun_color * nl * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
-           m.albedo * m.metallic * ambient * 0.5;
+    // the coat: ggx at roughness 0.05, fresnel from 0.04; what it reflects the rest doesn't get.
+    const float ca2 = 0.0025 * 0.0025, cd = nh * nh * (ca2 - 1.0) + 1.0;
+    const float coat_f = coat * (0.04 + 0.96 * pow(1.0 - vh, 5.0)), coat_env = coat * (0.04 + 0.96 * pow(1.0 - nv, 5.0));
+    const float coat_spec = coat_f * ca2 / (4.0 * cd * cd * max(nv, 1e-4) * max(nl, 1e-4) + 1e-6) * nl;
+    const vec3 base = (diffuse * nl_wrap + specular * nl) * sun_color * lit + m.albedo * (1.0 - m.metallic) * ambient + env +
+                      m.albedo * m.metallic * ambient * 0.5;
+    return base * (1.0 - coat_env) + min(coat_spec, 50.0) * sun_color * lit + sky(reflect(-v, n)) * coat_env * ao;
 }
 
 float edge_distance(vec2 p, vec2 a, vec2 b) {
@@ -200,10 +278,19 @@ void main() {
         const Cluster c = load_cluster(s.vc.y);
         const uint vid = s.id >> 7;
         Material m = materials[min(inst.material, 5u)];
+        const float ao = occlusion(px);
+        vec3 n = s.n;
+        float wrap = 0.0, coat = 0.0;
         if (frame.debug_mode == 0u) {
             const float radius = meshes[inst.mesh].bounds.w;
             const vec3 q = from_world(inst, s.hit) / radius;
-            m = surface_detail(m, min(inst.material, 5u), q, s.t / (frame.lod_scale * inst.scale * radius));
+            const Detail d = surface_detail(m, min(inst.material, 5u), q, s.t / (frame.lod_scale * inst.scale * radius), ao, s.n.y);
+            m = d.m;
+            wrap = d.wrap;
+            coat = d.coat;
+            // the height gradient to world space (rotation; heights are in radii, so scale cancels).
+            const vec3 g = to_world_dir(inst, d.grad) / inst.scale;
+            n = normalize(s.n - (g - dot(g, s.n) * s.n));
         }
         if (frame.debug_mode != 0u) m = Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0);
         if (frame.debug_mode == 1u) m.albedo = hash_color(s.vc.y * 7919u + s.vc.x * 104729u);
@@ -215,10 +302,9 @@ void main() {
         else if (frame.debug_mode == 7u) m.albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
 
         const float lit = dot(s.n, sun_dir) > 0.0 ? sunlight(px, s) : 0.0;
-        const float ao = occlusion(px);
-        color = shade_material(m, s.n, -s.dir, lit, ao);
+        color = shade_material(m, n, -s.dir, lit, ao, wrap, coat);
         // from behind: no rim light, which would outline every sliver.
-        if (!s.behind) color += pow(1.0 - max(dot(s.n, -s.dir), 0.0), 4.0) * 0.25 * sky(s.n) * (1.0 - m.metallic) * ao;
+        if (!s.behind) color += pow(1.0 - max(dot(n, -s.dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic) * ao;
 
         if ((frame.flags & flag_wireframe) != 0u) {
             const vec2 p = vec2(px) + 0.5;

@@ -235,6 +235,7 @@ struct options {
     unsigned loader_threads = 8;  // 0: read pages on the render thread. mostly waiting on disk: nvme wants queue depth
     bool cold = false;         // evict the models from the os file cache first
     bool mixed_materials = true;
+    int material = -1;  // --materials NAME: every instance one material (shade.comp's table)
     float moving = 0;  // share of moving instances (animate() in common.glsl)
     bool full_res_shadows = false;
     bool prefetch = true;
@@ -445,6 +446,7 @@ void make_scene(const options& opt, scene& s) {
             inst.mesh = mesh;
             inst.scale = scale;
             inst.material = !opt.mixed_materials ? 0 : n == 1 ? 1 : mix[material_rng() % 20];
+            if (opt.material >= 0) inst.material = uint32_t(opt.material);
             // moving: bit 9 marks it, bit 8 the direction, low 8 bits the phase.
             if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
             s.moving += inst.anim != 0;
@@ -1868,7 +1870,15 @@ options parse(int argc, char** argv) {
         else if (a == "--no-ao") o.disable |= flag_ao;
         else if (a == "--hard-shadows") o.disable |= flag_soft_shadows;
         else if (a == "--full-res-shadows") o.full_res_shadows = true;
-        else if (a == "--materials") o.mixed_materials = next() != "plain";
+        else if (a == "--materials") {
+            const std::string m = next();
+            const char* names[] = {"plain", "marble", "sandstone", "bronze", "gold", "granite"};
+            const auto it = std::find(std::begin(names), std::end(names), m);
+            if (m != "mixed" && it == std::end(names))
+                throw std::runtime_error("--materials takes mixed, plain, marble, sandstone, bronze, gold or granite");
+            o.mixed_materials = m != "plain";
+            if (it != std::end(names) && m != "plain") o.material = int(it - std::begin(names));
+        }
         else if (a == "--moving") o.moving = std::stof(next());
         else if (a == "--pool-mb") o.pool_mb = std::clamp<uint64_t>(std::stoull(next()), 16, 4095);
         else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
