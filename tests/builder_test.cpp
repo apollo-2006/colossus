@@ -3,6 +3,7 @@
 // file round trip.
 #include "cluster.hpp"
 #include "dag.hpp"
+#include "deviation.hpp"
 #include "geometry_file.hpp"
 #include "lod_check.hpp"
 #include "mesh.hpp"
@@ -309,7 +310,44 @@ void test_packed_cones() {
     CHECK(wrong == 0);
 }
 
+// the deviation bound holds: at least the largest distance found by brute force from
+// thousands of random points on either mesh to the other, and close to it.
+void test_deviation_bound() {
+    std::printf("deviation bound\n");
+    const mesh m = bumpy_sphere(4);  // 2048 triangles
+    const std::vector<uint8_t> locked(m.positions.size(), 0);
+    const simplify_result r = simplify(m.positions, m.indices, locked, 300);
+    uint32_t seed = 7;
+    auto rand = [&] {
+        seed = seed * 1664525u + 1013904223u;
+        return float(seed >> 8) / float(1u << 24);
+    };
+    auto farthest = [&](const std::vector<uint32_t>& from, const std::vector<uint32_t>& to) {
+        float worst = 0;
+        for (size_t t = 0; t < from.size(); t += 3)
+            for (int k = 0; k < 40; ++k) {
+                float u = rand(), v = rand();
+                if (u + v > 1) { u = 1 - u; v = 1 - v; }
+                const vec3 a = m.positions[from[t]], b = m.positions[from[t + 1]], c = m.positions[from[t + 2]];
+                const vec3 p = a + (b - a) * u + (c - a) * v;
+                float best = INFINITY;
+                for (size_t s = 0; s < to.size(); s += 3)
+                    best = std::min(best, point_triangle_distance(p, m.positions[to[s]], m.positions[to[s + 1]], m.positions[to[s + 2]]));
+                worst = std::max(worst, best);
+            }
+        return worst;
+    };
+    const float brute = std::max(farthest(m.indices, r.indices), farthest(r.indices, m.indices));
+    const float sampled = sampled_deviation(m.positions, m.indices, r.indices);
+    const float bound = mesh_deviation(m.positions, m.indices, r.indices);
+    std::printf("  sampled %.6f, brute force %.6f, bound %.6f\n", sampled, brute, bound);
+    CHECK(bound >= brute);
+    CHECK(bound >= sampled);
+    CHECK(bound <= 1.25f * std::max(brute, sampled));
+}
+
 int main() {
+    test_deviation_bound();
     test_packed_cones();
     test_ply_and_obj();
     test_weld();

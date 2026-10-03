@@ -314,6 +314,11 @@ paged_geometry page(const geometry& g) {
     }
     for (const page_bounds& b : p.shared_bounds)
         if (b.radius < 0) throw std::logic_error("a page without bounds");
+    // what is drawn is snapped to the grid: each vertex moves at most half a step's
+    // diagonal, so the surface does too. the errors bound the drawn surface's distance
+    // from the original, so they carry it.
+    const float snapping = p.grid_step * std::sqrt(3.0f) * 0.5f;
+    for (size_t pg = 1; pg < p.shared_bounds.size(); ++pg) p.shared_bounds[pg].error += snapping;
     p.packed.reserve(p.clusters.size());
     for (gpu_cluster& c : p.clusters) {
         p.packed.push_back(pack_cluster(c));

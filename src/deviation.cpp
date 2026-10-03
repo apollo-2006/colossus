@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 float point_triangle_distance(vec3 p, vec3 a, vec3 b, vec3 c) {
     const vec3 ab = b - a, ac = c - a, ap = p - a;
@@ -34,8 +35,12 @@ struct triangle_grid {
     float cell = 1;
     int n[3] = {1, 1, 1};
     std::vector<std::vector<uint32_t>> cells;
+    // triangles around each vertex, for local searches.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> around;
 
     triangle_grid(const std::vector<vec3>& p, const std::vector<uint32_t>& i) : pos(p), idx(i) {
+        for (uint32_t t = 0; t < idx.size() / 3; ++t)
+            for (int k = 0; k < 3; ++k) around[idx[3 * t + k]].push_back(t);
         vec3 hi;
         lo = hi = pos[idx[0]];
         for (uint32_t v : idx) { lo = min(lo, pos[v]); hi = max(hi, pos[v]); }
@@ -61,7 +66,7 @@ struct triangle_grid {
 
     // distance to the nearest triangle: rings of cells outward until a ring is
     // farther than the best.
-    float nearest(vec3 p) const {
+    float nearest(vec3 p, uint32_t* which = nullptr) const {
         float best = INFINITY;
         int c[3];
         for (int a = 0; a < 3; ++a) c[a] = coord(p[a], a);
@@ -73,11 +78,36 @@ struct triangle_grid {
                     for (int x = c[0] - r; x <= c[0] + r; ++x) {
                         if (std::max({std::abs(x - c[0]), std::abs(y - c[1]), std::abs(z - c[2])}) != r) continue;
                         if (x < 0 || y < 0 || z < 0 || x >= n[0] || y >= n[1] || z >= n[2]) continue;
-                        for (uint32_t t : cells[(size_t(z) * n[1] + y) * n[0] + x])
-                            best = std::min(best, point_triangle_distance(p, pos[idx[3 * t]], pos[idx[3 * t + 1]], pos[idx[3 * t + 2]]));
+                        for (uint32_t t : cells[(size_t(z) * n[1] + y) * n[0] + x]) {
+                            const float d = point_triangle_distance(p, pos[idx[3 * t]], pos[idx[3 * t + 1]], pos[idx[3 * t + 2]]);
+                            if (d < best) {
+                                best = d;
+                                if (which) *which = t;
+                            }
+                        }
                     }
         }
         return best;
+    }
+
+    // distance to the nearest of the seeds' triangles and those around their corners: at least
+    // the true distance (so any bound built on it holds), and usually it.
+    float nearest_local(vec3 p, const uint32_t (&seeds)[3], uint32_t& which) const {
+        float best = INFINITY;
+        for (uint32_t s : seeds)
+            for (int k = 0; k < 3; ++k)
+                for (uint32_t t : around.at(idx[3 * s + k])) {
+                    const float d = distance_to(p, t);
+                    if (d < best) {
+                        best = d;
+                        which = t;
+                    }
+                }
+        return best;
+    }
+
+    float distance_to(vec3 p, uint32_t t) const {
+        return point_triangle_distance(p, pos[idx[3 * t]], pos[idx[3 * t + 1]], pos[idx[3 * t + 2]]);
     }
 };
 
@@ -103,10 +133,84 @@ float one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, c
     return worst;
 }
 
+// an upper bound on the largest distance from `from` to `to`, starting from the sampled one
+// (`worst`, a lower bound).
+float bounded_one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, const triangle_grid& to, float worst,
+                      float slack, float tolerance) {
+    struct piece {
+        vec3 p[3];
+        float d[3];
+        uint32_t near[3];  // each corner's nearest triangle
+        int depth;
+    };
+    // over a piece, the distance to one triangle is convex, so largest at a corner, and the
+    // distance to the mesh at most that: the corners' nearest triangles are the candidates.
+    auto piece_bound = [&](const piece& q) {
+        float best = INFINITY;
+        for (uint32_t t : q.near) {
+            float worst = 0;
+            for (int k = 0; k < 3 && worst < best; ++k) worst = std::max(worst, to.distance_to(q.p[k], t));
+            best = std::min(best, worst);
+        }
+        return best;
+    };
+    constexpr int max_depth = 6;  // 4096 pieces a triangle at most
+    const float spread = 1 / std::sqrt(3.0f);  // farthest from the nearest corner, per longest edge
+    float bound = worst;
+    std::vector<piece> stack;
+    for (size_t t = 0; t < from.size(); t += 3) {
+        piece first{};
+        for (int k = 0; k < 3; ++k) {
+            first.p[k] = pos[from[t + k]];
+            first.d[k] = to.nearest(first.p[k], &first.near[k]);
+        }
+        stack.push_back(first);
+        while (!stack.empty()) {
+            const piece q = stack.back();
+            stack.pop_back();
+            const float longest = std::max({length(q.p[1] - q.p[0]), length(q.p[2] - q.p[1]), length(q.p[0] - q.p[2])});
+            float upper = std::max({q.d[0], q.d[1], q.d[2]}) + longest * spread;
+            if (upper > worst * (1 + slack) && upper > tolerance) upper = std::min(upper, piece_bound(q));
+            if (upper <= worst * (1 + slack) || upper <= tolerance || q.depth == max_depth) {
+                bound = std::max(bound, upper);
+                continue;
+            }
+            // four halves: corners and midpoints, each sampled once.
+            vec3 m[3];
+            float dm[3];
+            uint32_t nm[3];
+            for (int k = 0; k < 3; ++k) {
+                m[k] = (q.p[k] + q.p[(k + 1) % 3]) * 0.5f;
+                // the local search, unless it finds the midpoint farther than the corners: then the
+                // true nearest may lie outside it, and an overestimate would raise `worst`.
+                dm[k] = to.nearest_local(m[k], q.near, nm[k]);
+                if (dm[k] > std::max({q.d[0], q.d[1], q.d[2]})) dm[k] = to.nearest(m[k], &nm[k]);
+                worst = std::max(worst, dm[k]);
+            }
+            const int d = q.depth + 1;
+            stack.push_back({{q.p[0], m[0], m[2]}, {q.d[0], dm[0], dm[2]}, {q.near[0], nm[0], nm[2]}, d});
+            stack.push_back({{m[0], q.p[1], m[1]}, {dm[0], q.d[1], dm[1]}, {nm[0], q.near[1], nm[1]}, d});
+            stack.push_back({{m[2], m[1], q.p[2]}, {dm[2], dm[1], q.d[2]}, {nm[2], nm[1], q.near[2]}, d});
+            stack.push_back({{m[0], m[1], m[2]}, {dm[0], dm[1], dm[2]}, {nm[0], nm[1], nm[2]}, d});
+        }
+    }
+    return std::max(bound, worst);
+}
+
 }  // namespace
 
-float mesh_deviation(const std::vector<vec3>& positions, const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+float sampled_deviation(const std::vector<vec3>& positions, const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
     if (a.empty() || b.empty()) return 0;
     const triangle_grid ga(positions, a), gb(positions, b);
     return std::max(one_way(positions, a, gb), one_way(positions, b, ga));
+}
+
+float mesh_deviation(const std::vector<vec3>& positions, const std::vector<uint32_t>& a, const std::vector<uint32_t>& b,
+                     float slack, float tolerance) {
+    if (a.empty() || b.empty()) return 0;
+    const triangle_grid ga(positions, a), gb(positions, b);
+    // the samples first: a high lower bound lets most triangles stop at once.
+    const float sampled = std::max(one_way(positions, a, gb), one_way(positions, b, ga));
+    return std::max(bounded_one_way(positions, a, gb, sampled, slack, tolerance),
+                    bounded_one_way(positions, b, ga, sampled, slack, tolerance));
 }

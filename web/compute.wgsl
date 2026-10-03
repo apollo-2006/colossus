@@ -307,9 +307,11 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
     }
     if (keep) {
       atomicAdd(&counters.instances_visible, 1u);
-      let lc = to_world(inst, m.lod_bounds.xyz);
-      let d = max(length(lc - frame.cull_origin.xyz) - m.lod_bounds.w * inst.scale, frame.near_z);
-      let limit = frame.lod_threshold * d / (inst.scale * frame.lod_scale);
+      // projected_error()'s worst over the sphere holding every lod sphere.
+      let lc = to_world(inst, m.lod_bounds.xyz) - frame.cull_origin.xyz;
+      let r = m.lod_bounds.w * inst.scale;
+      let z = max(dot(lc, frame.cull_planes[4].xyz) - r, frame.near_z);
+      let limit = frame.lod_threshold * z / (inst.scale * frame.lod_scale * projected_sec(lc, r));
       var lo = 0u;
       var hi = m.cluster_count;
       while (lo < hi) {

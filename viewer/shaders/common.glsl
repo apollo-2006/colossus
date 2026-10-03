@@ -367,11 +367,27 @@ bool sphere_in_frustum(vec3 c, float r) {
     return inside;
 }
 
-// pixels an error of world size `error` covers at a sphere's nearest point. a
-// group computes it from identical numbers, so it agrees.
+// the most pixels an error of world size `error` can move anywhere in a sphere. a point at p
+// (from the camera, depth z) moved by e moves on screen at most lod_scale * e * |p| / z^2 =
+// lod_scale * e * sec / z, sec of its angle off axis: the distance alone understated it by
+// sec^2 (2.2x in a 16:9 corner). over the sphere z >= depth - radius, and the angle is at
+// most the centre's plus the sphere's angular radius, and no more than the screen's corner
+// (points off screen draw nothing). a group computes it from identical numbers, so it agrees.
+float projected_sec(vec3 v, float radius) {
+    const float dist = length(v);
+    const float corner = sqrt(1.0 + (float(frame.width * frame.width + frame.height * frame.height)) /
+                                        (4.0 * frame.lod_scale * frame.lod_scale));
+    if (radius >= dist) return corner;
+    const float c = dot(v, frame.cull_planes[4].xyz) / dist, s = sqrt(max(1.0 - c * c, 0.0));
+    const float ca = sqrt(1.0 - (radius / dist) * (radius / dist)), sa = radius / dist;
+    const float cos_far = c * ca - s * sa;  // cos(centre angle + angular radius)
+    return cos_far <= 1.0 / corner ? corner : 1.0 / cos_far;
+}
+
 float projected_error(vec3 center, float radius, float error) {
-    const float d = length(center - frame.cull_origin.xyz) - radius;
-    return error * frame.lod_scale / max(d, frame.near_z);
+    const vec3 v = center - frame.cull_origin.xyz;
+    const float z = max(dot(v, frame.cull_planes[4].xyz) - radius, frame.near_z);  // plane 4: near, facing forward
+    return error * frame.lod_scale * projected_sec(v, radius) / z;
 }
 
 // screen rectangle of a view-space sphere (z forward) in [0, 1] texture

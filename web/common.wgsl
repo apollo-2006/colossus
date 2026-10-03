@@ -269,11 +269,24 @@ fn sphere_in_frustum(c: vec3f, r: f32) -> bool {
   return inside;
 }
 
-// pixels an error of world size `error` covers at a sphere's nearest point. a
-// group computes it from identical numbers, so it agrees.
+// the most pixels an error of world size `error` can move anywhere in a sphere, as
+// common.glsl's: lod_scale * e * sec / z, z >= depth - radius, sec of the sphere's
+// farthest angle off axis, no more than the screen corner's.
+fn projected_sec(v: vec3f, radius: f32) -> f32 {
+  let dist = length(v);
+  let corner = sqrt(1.0 + f32(frame.width * frame.width + frame.height * frame.height) / (4.0 * frame.lod_scale * frame.lod_scale));
+  if (radius >= dist) { return corner; }
+  let c = dot(v, frame.cull_planes[4].xyz) / dist;
+  let s = sqrt(max(1.0 - c * c, 0.0));
+  let sa = radius / dist;
+  let cos_far = c * sqrt(1.0 - sa * sa) - s * sa;  // cos(centre angle + angular radius)
+  return select(1.0 / cos_far, corner, cos_far <= 1.0 / corner);
+}
+
 fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
-  let d = length(center - frame.cull_origin.xyz) - radius;
-  return error * frame.lod_scale / max(d, frame.near_z);
+  let v = center - frame.cull_origin.xyz;
+  let z = max(dot(v, frame.cull_planes[4].xyz) - radius, frame.near_z);  // plane 4: near, facing forward
+  return error * frame.lod_scale * projected_sec(v, radius) / z;
 }
 
 fn hash(x0: u32) -> u32 {

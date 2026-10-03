@@ -298,17 +298,22 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 stuck[g] = 1;
                 return;
             }
-            float measured = mesh_deviation(out.positions, merged, s.indices);
-            if (measured > outlier_ratio * s.error) {
+            // choosing between the two simplifications by sampled distance (cheap, and the
+            // choice need not be proven), then proving the chosen one's: refined until within
+            // 10% of the worst found or under a millionth of the group (where the levels
+            // coincide, flat parts, a bound cannot reach 0).
+            float sampled = sampled_deviation(out.positions, merged, s.indices);
+            if (sampled > outlier_ratio * s.error) {
                 simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4);
                 if (!gentle.indices.empty() && gentle.indices.size() / 3 <= stuck_ratio * tris) {
-                    const float gentle_measured = mesh_deviation(out.positions, merged, gentle.indices);
-                    if (gentle_measured < measured) {
+                    const float gentle_sampled = sampled_deviation(out.positions, merged, gentle.indices);
+                    if (gentle_sampled < sampled) {
                         s = std::move(gentle);
-                        measured = gentle_measured;
+                        sampled = gentle_sampled;
                     }
                 }
             }
+            const float measured = mesh_deviation(out.positions, merged, s.indices, 0.1f, bounds.radius * 1e-6f);
             const float error = child_error + std::max(s.error, measured);
             make_clusters(s.indices, made[g]);
             for (lod_cluster& c : made[g]) {
