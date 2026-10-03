@@ -14,6 +14,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <unistd.h>
 
 namespace {
@@ -149,6 +150,27 @@ int main() {
         std::printf("  %zu of %zu pages resident\n", resident, file.pages.size());
         CHECK(resident == file.pages.size());
     }
+
+    // a read that fails (the file cut short under it) reaches the render thread as an
+    // exception from service(), not a loader thread's terminate.
+    for (unsigned threads : {0u, 2u}) {
+        std::printf("%u loader threads: pages past the end of the file\n", threads);
+        std::vector<stream_page> past = pages;
+        for (stream_page& p : past) p.file_offset += file.data_offset + file.data_size;
+        streamer s(past, file.deps, file.data_size * 2, threads);
+        bool thrown = false;
+        for (uint32_t frame = 1; frame <= 2000 && !thrown; ++frame) {
+            try {
+                s.service(frame, {{1, 1.0f}}, staging.data(), staging.size());
+            } catch (const std::runtime_error&) {
+                thrown = true;
+            }
+            if (threads) usleep(200);
+        }
+        std::printf("  %s\n", thrown ? "thrown on the render thread" : "never reported");
+        CHECK(thrown);
+    }
+
     close(fd);
     if (failures) {
         std::printf("%d checks failed\n", failures);

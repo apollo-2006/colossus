@@ -108,7 +108,7 @@ public:
     // publishes finished loads (into `staging`, at most staging_bytes), then
     // issues loads for requests (page, priority: higher first). returns the
     // copies from staging to the pool to record before culling; table() is then
-    // this frame's page table.
+    // this frame's page table. throws when a page's read failed.
     std::vector<copy> service(uint32_t frame, std::vector<std::pair<uint32_t, float>> requests, uint8_t* staging,
                               uint64_t staging_bytes, float threshold = INFINITY) {
         frame_ = frame;
@@ -179,6 +179,7 @@ private:
     struct job {
         uint32_t page;
         std::vector<uint8_t> data;
+        bool failed = false;  // the read did: published as an error on the render thread
         std::atomic<bool> done{false};
     };
     // one read covering pages close together in a file; each job gets its slice.
@@ -220,7 +221,14 @@ private:
         size_t done = 0;
         while (done < r.size) {
             const ssize_t n = pread(r.fd, buffer.data() + done, r.size - done, static_cast<off_t>(r.offset + done));
-            if (n <= 0) throw std::runtime_error("reading a page failed");
+            if (n <= 0) {
+                // not thrown here: on a loader thread that would terminate.
+                for (const auto& j : r.jobs) {
+                    j->failed = true;
+                    j->done.store(true, std::memory_order_release);
+                }
+                return;
+            }
             done += static_cast<size_t>(n);
         }
         for (const auto& j : r.jobs) {
@@ -280,10 +288,11 @@ private:
     }
 
     // publishes finished loads in issue order, stopping at the first still
-    // reading.
+    // reading. throws at a failed read.
     void publish(uint8_t* staging, uint64_t staging_bytes, std::vector<copy>& copies, uint64_t& used) {
         while (!issued_.empty() && issued_.front()->done.load(std::memory_order_acquire)) {
             job& j = *issued_.front();
+            if (j.failed) throw std::runtime_error("reading a page failed");
             const uint32_t size = pages_[j.page].size;
             if (used + size > staging_bytes) break;
             std::memcpy(staging + used, j.data.data(), size);
