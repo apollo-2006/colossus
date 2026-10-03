@@ -36,6 +36,58 @@ const Material materials[6] = Material[](
     Material(vec3(0.95, 0.74, 0.36), 0.28, 1.0),  // gold
     Material(vec3(0.2, 0.2, 0.22), 0.45, 0.0));   // dark granite
 
+// procedural surface detail: the scans have no uvs, so 3d value noise in the model's own space
+// (scaled by its radius: the same on every statue, fixed to moving ones). octaves finer than
+// a pixel fade out.
+float value_noise(vec3 p) {
+    const ivec3 i = ivec3(floor(p));
+    const vec3 f = p - floor(p), u = f * f * (3.0 - 2.0 * f);
+    float v[8];
+    for (int k = 0; k < 8; ++k) {
+        const ivec3 c = i + ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        v[k] = float(hash(uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u) & 0xffffu) / 65535.0;
+    }
+    return mix(mix(mix(v[0], v[1], u.x), mix(v[2], v[3], u.x), u.y), mix(mix(v[4], v[5], u.x), mix(v[6], v[7], u.x), u.y), u.z);
+}
+
+// four octaves from `freq`, 0 to 1; `pixel` is a pixel's size in the same units.
+float fbm(vec3 p, float freq, float pixel) {
+    float sum = 0.0, amp = 0.5, total = 0.0;
+    for (int o = 0; o < 4; ++o) {
+        const float fade = clamp(2.0 - 4.0 * freq * pixel, 0.0, 1.0);  // gone at half a cycle a pixel
+        sum += amp * fade * value_noise(p * freq + float(o) * 17.3);
+        total += amp * fade;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    return total > 0.0 ? sum / total : 0.5;
+}
+
+// q: position in the model, over its radius. pixel: a pixel's size in those units.
+Material surface_detail(Material m, uint kind, vec3 q, float pixel) {
+    if (kind == 1u) {  // marble: grey veins folded by noise
+        const float vein = pow(1.0 - abs(sin((q.x * 5.0 + q.y * 8.0 + q.z * 3.0) + 5.0 * fbm(q, 2.0, pixel))), 30.0);
+        m.albedo = mix(m.albedo * (0.95 + 0.07 * fbm(q, 8.0, pixel)), vec3(0.45, 0.46, 0.5), vein * 0.6);
+        m.roughness += 0.1 * vein;
+    } else if (kind == 2u) {  // sandstone: strata along the height, fine grain
+        const float strata = fbm(vec3(q.y * 14.0, q.x, q.z), 1.0, pixel * 14.0);
+        const float grain = fbm(q, 60.0, pixel);
+        m.albedo *= 0.8 + 0.3 * strata + 0.15 * (grain - 0.5);
+        m.roughness = clamp(m.roughness + 0.1 * (grain - 0.5), 0.0, 1.0);
+    } else if (kind == 3u) {  // bronze: green patina in patches
+        const float patina = smoothstep(0.5, 0.68, fbm(q, 4.0, pixel));
+        m.albedo = mix(m.albedo, vec3(0.24, 0.44, 0.36), patina);
+        m.metallic = mix(m.metallic, 0.0, patina);
+        m.roughness = mix(m.roughness, 0.75, patina);
+    } else if (kind == 4u) {  // gold: polish varying
+        m.roughness = clamp(m.roughness + 0.2 * (fbm(q, 12.0, pixel) - 0.5), 0.05, 1.0);
+    } else if (kind == 5u) {  // granite: light and dark speckles
+        const float s = fbm(q, 90.0, pixel);
+        m.albedo *= mix(0.55, 1.9, smoothstep(0.35, 0.65, s));
+    }
+    return m;
+}
+
 vec3 sky(vec3 dir) {
     const float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
     return mix(vec3(0.66, 0.68, 0.71), vec3(0.3, 0.42, 0.62), pow(t, 0.7)) * 0.9;
@@ -148,6 +200,11 @@ void main() {
         const Cluster c = load_cluster(s.vc.y);
         const uint vid = s.id >> 7;
         Material m = materials[min(inst.material, 5u)];
+        if (frame.debug_mode == 0u) {
+            const float radius = meshes[inst.mesh].bounds.w;
+            const vec3 q = from_world(inst, s.hit) / radius;
+            m = surface_detail(m, min(inst.material, 5u), q, s.t / (frame.lod_scale * inst.scale * radius));
+        }
         if (frame.debug_mode != 0u) m = Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0);
         if (frame.debug_mode == 1u) m.albedo = hash_color(s.vc.y * 7919u + s.vc.x * 104729u);
         else if (frame.debug_mode == 2u) m.albedo = hash_color(s.id * 2654435761u + s.vc.x);

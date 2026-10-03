@@ -702,6 +702,59 @@ fn material(index: u32) -> Material {
   }
 }
 
+// procedural surface detail, as shade.comp's: 3d value noise in the model's own
+// space over its radius, octaves finer than a pixel faded out.
+fn value_noise(p: vec3f) -> f32 {
+  let i = vec3i(floor(p));
+  let f = p - floor(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  var v: array<f32, 8>;
+  for (var k = 0; k < 8; k++) {
+    let c = i + vec3i(k & 1, (k >> 1u) & 1, k >> 2u);
+    v[k] = f32(hash((u32(c.x) * 73856093u) ^ (u32(c.y) * 19349663u) ^ (u32(c.z) * 83492791u)) & 0xffffu) / 65535.0;
+  }
+  return mix(mix(mix(v[0], v[1], u.x), mix(v[2], v[3], u.x), u.y), mix(mix(v[4], v[5], u.x), mix(v[6], v[7], u.x), u.y), u.z);
+}
+
+fn fbm(p: vec3f, freq0: f32, pixel: f32) -> f32 {
+  var sum = 0.0;
+  var amp = 0.5;
+  var total = 0.0;
+  var freq = freq0;
+  for (var o = 0; o < 4; o++) {
+    let fade = clamp(2.0 - 4.0 * freq * pixel, 0.0, 1.0);
+    sum += amp * fade * value_noise(p * freq + f32(o) * 17.3);
+    total += amp * fade;
+    freq *= 2.0;
+    amp *= 0.5;
+  }
+  return select(0.5, sum / total, total > 0.0);
+}
+
+fn surface_detail(m0: Material, kind: u32, q: vec3f, pixel: f32) -> Material {
+  var m = m0;
+  if (kind == 1u) {  // marble veins
+    let vein = pow(1.0 - abs(sin((q.x * 5.0 + q.y * 8.0 + q.z * 3.0) + 5.0 * fbm(q, 2.0, pixel))), 30.0);
+    m.albedo = mix(m.albedo * (0.95 + 0.07 * fbm(q, 8.0, pixel)), vec3f(0.45, 0.46, 0.5), vein * 0.6);
+    m.roughness += 0.1 * vein;
+  } else if (kind == 2u) {  // sandstone strata and grain
+    let strata = fbm(vec3f(q.y * 14.0, q.x, q.z), 1.0, pixel * 14.0);
+    let grain = fbm(q, 60.0, pixel);
+    m.albedo *= 0.8 + 0.3 * strata + 0.15 * (grain - 0.5);
+    m.roughness = clamp(m.roughness + 0.1 * (grain - 0.5), 0.0, 1.0);
+  } else if (kind == 3u) {  // bronze patina
+    let patina = smoothstep(0.5, 0.68, fbm(q, 4.0, pixel));
+    m.albedo = mix(m.albedo, vec3f(0.24, 0.44, 0.36), patina);
+    m.metallic = mix(m.metallic, 0.0, patina);
+    m.roughness = mix(m.roughness, 0.75, patina);
+  } else if (kind == 4u) {  // gold polish
+    m.roughness = clamp(m.roughness + 0.2 * (fbm(q, 12.0, pixel) - 0.5), 0.05, 1.0);
+  } else if (kind == 5u) {  // granite speckles
+    m.albedo *= mix(0.55, 1.9, smoothstep(0.35, 0.65, fbm(q, 90.0, pixel)));
+  }
+  return m;
+}
+
 // lambert plus ggx specular, schlick fresnel, smith shadowing, sky in the
 // reflection.
 fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32) -> vec3f {
@@ -927,6 +980,11 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     if (behind) { n = -n; }
 
     var m = material(inst.material);
+    if (frame.debug_mode == 0u) {
+      let radius = meshes[inst.mesh].bounds.w;
+      let q = from_world(inst, origin + dir * t) / radius;
+      m = surface_detail(m, min(inst.material, 5u), q, t / (frame.lod_scale * inst.scale * radius));
+    }
     if (frame.debug_mode != 0u) { m = Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }
     switch (frame.debug_mode) {
       case 1u: { m.albedo = hash_color(vc.y * 7919u + vc.x * 104729u); }
