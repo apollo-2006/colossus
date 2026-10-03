@@ -17,10 +17,11 @@ threshold and the crowd size there to play with.
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
 900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
-billion triangles at full detail, drawn at 1920x1080 in 0.93 ms on an rx 9070 xt, soft
-shadows, ambient occlusion and antialiasing included. about 3 million triangles reach
-the screen, from 15 mb of the 427 mb on disk. a million instances (17.6 trillion
-triangles) take about 1.3 ms, and instances can move.
+billion triangles at full detail, drawn at 1920x1080 in 1.33 ms on an rx 9070 xt, soft
+shadows, ambient occlusion, weathered stone and bronze, and antialiasing included. about
+4.8 million triangles reach the screen, from about 20 mb of the 427 mb on disk, each
+cluster provably within a pixel of the original. a million instances (17.6 trillion
+triangles) take 1.63 ms, and instances can move and sway.
 
 ## how it works
 
@@ -41,17 +42,22 @@ triangles) take about 1.3 ms, and instances can move.
   indexes the original vertices and the hierarchy shares one vertex buffer. no flips,
   no pinches (the link condition), no lost islands; hole rims only slide along
   themselves.
-* **measured errors that only grow.** a quadric is a mean and can understate the worst
-  spot, so each group is measured against what it replaced: a two-sided distance
-  sampled at vertices, edge midpoints and triangle centres. its error is its children's
-  plus the larger of that and the estimate; groups measuring over four times their
-  estimate are retried more gently. errors only grow toward the root, so
+* **proven errors that only grow.** a quadric is a mean and can understate the worst
+  spot, so each group's simplification is bounded against what it replaced
+  (`src/deviation.cpp`): an upper bound on the two-sided distance between them, not a
+  sample. over a piece of triangle the distance to one triangle of the other mesh is
+  convex, so at most its largest at the piece's corners; pieces whose bound could still
+  beat the worst distance found split in four, until every bound is within 10% of it.
+  a test checks it against brute force on random points. its error is its children's
+  plus the larger of that and the estimate, plus the grid snapping the pages store
+  (half a step's diagonal); groups sampling over four times their estimate are retried
+  more gently. errors only grow toward the root, so
   `own error on screen <= 1 pixel < parent error on screen` picks exactly one level on
   every path, one gpu thread per cluster, no tree to walk.
 * **checked for cracks.** every level uses the original vertices, so a crack is exact:
   an edge used by one cut triangle whose ends aren't both on a hole. `--check` tests 25
-  cuts. lucy builds 23 levels in 84 s, the dragon 21 in 21 s, every cut with 0 cracked
-  edges.
+  cuts. lucy builds 23 levels in about 10 minutes, the dragon 21 in 99 s (proving the
+  bounds is most of it; sampling took 84 and 21 s), every cut with 0 cracked edges.
 * **one small root.** near the top, thin parts and hole rims stall edge collapses (lucy
   used to stop at three roots of 313 triangles). nothing borders the last group, so
   vertex clustering takes over there, keeping duplicate triangles and hole vertices so
@@ -68,7 +74,11 @@ triangles) take about 1.3 ms, and instances can move.
    thousands of work items each, get a workgroup of their own (`expand.comp`).
 2. **cluster culling** (`cluster_cull.comp`): lod cut, frustum, normal cone, occlusion.
    it began as a task shader; on radv that took 1.13 ms for 630k clusters, as compute
-   0.39 ms.
+   0.39 ms. the lod cut projects an error honestly: a point at p moved by e moves at most
+   `lod_scale * e * |p| / z^2` pixels, which grows away from the screen's centre (2.2x in
+   a 16:9 corner), so a sphere is judged by its least depth and the angle of its point
+   farthest off axis, capped at the screen's corner. the usual `error / distance` was
+   up to about two pixels where it promised one.
 3. **two rasterizers.** clusters over 32 pixels go to mesh shaders; smaller ones to
    `sw_raster.comp`, a compute rasterizer, since pixel-sized triangles are what the
    hardware handles worst. both write `depth << 32 | (cluster, triangle)` into one
@@ -81,7 +91,15 @@ triangles) take about 1.3 ms, and instances can move.
    were last frame.
 5. **shading** (`shade.comp`) refetches each pixel's triangle and hits it with the
    pixel's ray for exact barycentrics. five materials (marble, sandstone, granite, bronze,
-   gold), lambert plus a ggx lobe. sky, reflected and rim light are scaled by
+   gold), lambert plus a ggx lobe. the scans carry no uvs, so their surfaces come from 3d
+   value noise in each model's own space, with its analytic gradient tilting the normal
+   for relief: veined marble with a soft, light-bleeding falloff and a polish, layered and
+   pitted sandstone, granite of quartz, feldspar and mica grains, hammered gold, and
+   bronze that patinates where it would: in recesses (from the ambient occlusion), on
+   upward faces and down rain streaks, worn back to bright metal on exposed parts.
+   octaves finer than a pixel fade out, so distant statues don't shimmer. 0.25 ms over
+   plain materials (`--materials plain`, or one of them for every statue with
+   `--materials bronze`). sky, reflected and rim light are scaled by
    ground-truth ambient occlusion (`ao.comp`, after jimenez and intel's xegtao): half
    resolution, two slices a pixel rotated each frame for taa to average, reading a small
    depth chain (`ao_depth.comp`) so far taps stay in cache. 0.08 ms; `--no-ao` or g.
@@ -118,8 +136,10 @@ triangles) take about 1.3 ms, and instances can move.
 7. **antialiasing** (`taa.comp`). eight sub-pixel offsets in turn, each pixel blended 10%
    into a history reprojected through last frame's camera (and a moving instance's last
    transform), catmull-rom sampled and clamped to the 3x3 neighbourhood. 0.05 to 0.07 ms.
-8. **streaming.** only bounds and errors stay resident; geometry lives in pages, one per
-   group, loaded into a fixed pool (`--pool-mb`, 1 gb by default) as the gpu asks. a
+8. **streaming.** only bounds and errors stay resident, 48 bytes a cluster: a group's
+   clusters share their bounds and error, so those sit once per page, and the normal
+   cone, offsets and counts pack into spare bits (lucy's resident data went from 50 mb to
+   22). geometry lives in pages, one per group, loaded into a fixed pool (`--pool-mb`, 1 gb by default) as the gpu asks. a
    cluster that would rather be its finer clusters requests their page, with its error
    on screen as priority; `viewer/streamer.hpp` loads the most wanted, evicting least
    recently used, on eight loader threads. pages close together in the file share a
@@ -133,10 +153,12 @@ triangles) take about 1.3 ms, and instances can move.
 
    the streamer also prefetches the pages below a request while they'd still be too
    coarse: each page knows its clusters' error, and a request's priority over its page's
-   error gives the screen scale for predicting its children's. from a cold file cache a
-   lucy close-up settles in 14 frames (48 ms), the crowd above in 19 (55 ms); with one read
-   per page, two loader threads, halving-guess prefetch and the shadow raster walking
-   whole triangles, they took 440 and 210 ms.
+   error gives the screen scale for predicting its children's. a shadow page drawn while
+   a cluster it needs is missing asks for that cluster's page itself (waiting on its
+   coarser stand-ins to ask could stall forever, their spheres being loose). from a cold
+   file cache a lucy close-up settles in 11 frames (about 38 ms), the crowd above in 12
+   (34 ms); with one read per page, two loader threads, halving-guess prefetch and the
+   shadow raster walking whole triangles, they took 440 and 210 ms.
 
    pages are bit-packed per cluster. positions snap to a grid over the model and store
    their offset from the cluster's corner in just the bits its extent needs per axis,
@@ -145,12 +167,12 @@ triangles) take about 1.3 ms, and instances can move.
    same grid point in each cluster, so quantizing opens no cracks. lucy's pages went
    from 460 mb to 337, the dragon's from 119 to 90.
 
-   the crowd above reads 15 mb and holds about 2,100 pages (the finer shadow levels ask
-   for finer geometry; before them it was 7 mb). a 300 frame flight with a 16 mb pool
-   evicts 29,457 pages and reads 214 mb in 11,174 reads (31,201 with a read per page),
-   and at frames 100, 200 and 300 shows exactly the same isolated empty pixels as a 1 gb
-   pool. from a cold file cache the render thread's worst frame in the streamer is 1.0 ms
-   with loader threads, 8 ms without (`--sync-loads`).
+   the crowd above reads about 20 mb. a 300 frame flight with a 16 mb pool evicts 15,029
+   pages and reads 114 mb in 7,552 reads, and at frames 100, 200 and 300 shows about as
+   many isolated empty pixels as a 1 gb pool (140 and 140, 109 and 110, 55 and 53, of
+   two million): the small pool's cut is coarser in places, not torn. from a cold file cache the render
+   thread's worst frame in the streamer is 3.4 ms with loader threads, 12.5 ms without
+   (`--sync-loads`).
 
 ### motion and scale
 
@@ -161,19 +183,29 @@ last transform, and the shadow maps redraw the pages it crossed.
 
 | instances | moving | shadow maps (soft) | ray traced (hard) |
 |---|---|---|---|
-| 900 | none | 0.93 ms | 0.93 ms |
-| 900 | 1% | 1.02 ms | 1.11 ms |
-| 900 | half | 1.74 ms | 1.22 ms |
-| 90,000 | 1% | 1.28 ms | 1.42 ms |
-| 1,000,000 | none | 1.28 ms | 1.43 ms |
-| 1,000,000 | 1% | 1.64 ms | 1.80 ms |
+| 900 | none | 1.34 ms | 1.33 ms |
+| 900 | 1% | 1.42 ms | 1.51 ms |
+| 900 | half | 1.80 ms | 1.42 ms |
+| 90,000 | 1% | 1.73 ms | 1.85 ms |
+| 1,000,000 | none | 1.63 ms | 1.73 ms |
+| 1,000,000 | 1% | 1.81 ms | 1.93 ms |
 
 the crowd view at 1920x1080, ambient occlusion on in both; runs vary by a few
 hundredths. half the crowd moving is where the shadow maps lose: 450 statues redrawn
 into their pages every frame. a ray traced refit on radv costs by the size of the whole
 structure (2.7k entries 0.25 ms, 270k 0.94 ms), so still instances get a structure of
 their own. at a million, occlusion culling is what makes it work: without it the view
-draws 72 million triangles in 2.44 ms.
+draws 103 million triangles in 2.81 ms.
+
+`--deforming f` makes a share of them sway like trees in wind: a bend growing with the
+square of the height and a ripple running up it (`deform()` in `common.glsl`), both
+sideways and functions of height alone. so a shared vertex moves the same in every
+cluster and cuts stay crack-free, and the bend inverts exactly, which antialiasing uses
+to find where a point was last frame. the guarantee holds too: the bend's slope is at
+most 0.128, a shear stretching lengths by at most 1.066, so errors are scaled by 1.07
+and every culling sphere grows by the farthest a point moves, a tenth of the radius.
+deforming instances share the moving instances' shadow layer: 1% of the crowd costs 1.43
+ms, a tenth 1.55, half 1.86.
 
 ![lucy, each cluster in its own colour](docs/clusters.png)
 
@@ -188,6 +220,11 @@ single instances mix levels as they recede.
 
 which rasterizer drew each pixel (view 8): orange compute, blue mesh shaders. only the
 nearest surfaces are worth the hardware.
+
+![lucy in each material: veined marble, layered sandstone, patinated bronze, hammered gold, speckled granite](docs/materials.png)
+
+one lucy in each material (`--materials marble` and so on): veined marble, layered
+sandstone, bronze greening in its folds, hammered gold, granite.
 
 ## in the browser
 
@@ -205,15 +242,20 @@ or push constants:
 * shadows are the viewer's virtual shadow maps, in a module of their own
   (`web/vsm.wgsl`) to keep the bind group small, their indirect arguments in their own
   buffer (a dispatch can't write the buffer it reads arguments from). soft shadows use
-  fewer taps than the viewer; ambient occlusion (`web/ao.wgsl`), materials and
-  antialiasing match it.
-* a quarter of the middle 30x30 instances move, and the crowd slider goes to a million.
+  fewer taps than the viewer; ambient occlusion (`web/ao.wgsl`), materials, deformation
+  and antialiasing match it.
+* cells and their instances are culled with a bind group of their own (the depth
+  pyramid, cells, cell lists) in place of the image group's buffers, which keeps every
+  stage within 16 storage buffers.
+* a quarter of the middle 30x30 instances move and some of the rest sway, and the crowd
+  slider goes to a million. `?still` starts with motion paused and the camera held, so
+  every load shows the same frame.
 
 the models are trimmed to 4 million triangles at their finest (`--max-triangles`): about
-4 mb of gzipped metadata each, up front, and about 55 mb of pages, streamed. in chrome on the
-rx 9070 xt at 1600x813, 900 instances take 0.98 ms of gpu time once streaming settles,
-1.35 ms with the middle moving, and a million 2.55 ms. it needs 16 storage buffers per
-shader stage, which desktop gpus allow. `web/build.sh` builds the models;
+2.6 mb of gzipped metadata each, up front, and about 55 mb of pages, streamed. in chrome
+on the rx 9070 xt at 1600x813, 900 instances take 1.30 ms of gpu time once streaming
+settles, 2.18 ms with the middle moving and swaying, and a million 2.16 ms. it needs 16
+storage buffers per shader stage, which desktop gpus allow. `web/build.sh` builds the models;
 `node tests/web_screenshot.mjs` renders the page headless.
 
 ## build & run
@@ -230,6 +272,8 @@ models/fetch.sh            # downloads lucy and the dragon (380 mb) and builds b
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30
 ./colossus --model models/lucy.cgeo                       # one lucy
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 1000 --moving 0.01
+./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30 --deforming 0.2
+./colossus --model models/lucy.cgeo --materials bronze    # one lucy, in bronze
 ./colossus_build any.ply out.cgeo --check                 # your own model, checked for cracks
 ```
 
@@ -256,7 +300,9 @@ make test
 cluster limits, the simplifier's locks and flips, and full hierarchies for a closed
 sphere, a holed sphere and a flat grid, crack-checked at 31 cuts, paged, written and read
 back exactly, shared vertices identical from every cluster. without the group locks, the
-crack check finds 39,095 cracked edges on the closed sphere alone.
+crack check finds 39,095 cracked edges on the closed sphere alone. it also checks the
+proven error against brute force on about 94,000 random points, and that packed normal
+cones never cull a view the exact cone keeps.
 
 `tests/streamer_test.cpp` runs 3,000 frames of random requests into a pool a tenth of a
 model (synchronous, loader threads, loader threads with prefetch), checking after every
@@ -270,31 +316,36 @@ streaming. shading includes shadows and antialiasing.
 
 | camera | frame | culling | raster | pass 2 | shadow pages | shading | triangles |
 |---|---|---|---|---|---|---|---|
-| beside lucy (top image) | 0.93 ms | 0.16 | 0.19 | 0.10 | 0.08 | 0.40 | 2.99m |
-| raised (lod image) | 1.05 ms | 0.09 | 0.26 | 0.09 | 0.09 | 0.53 | 4.33m |
-| ground level | 0.87 ms | 0.12 | 0.18 | 0.10 | 0.07 | 0.40 | 2.58m |
+| beside lucy (top image) | 1.33 ms | 0.16 | 0.28 | 0.10 | 0.08 | 0.70 | 4.77m |
+| raised (lod image) | 1.56 ms | 0.11 | 0.39 | 0.09 | 0.09 | 0.88 | 7.44m |
+| ground level | 1.24 ms | 0.15 | 0.23 | 0.12 | 0.08 | 0.67 | 3.85m |
 
-hard shadows: 0.84, 0.90 and 0.79 ms; no ambient occlusion: 0.85, 0.96 and 0.79; no
-shadows: 0.70, 0.72 and 0.65; ray traced (hard): 0.94, 1.11 and 0.86; no antialiasing:
-0.87, 0.99 and 0.80. the compute rasterizer saves 0.29 to 0.40 ms. occlusion culling
-removes 46% of the triangles at ground level (0.95 to 0.87 ms) and next to nothing from
-the raised camera, which sees over the crowd.
+plain materials: 1.08, 1.27 and 1.02 ms; hard shadows: 1.25, 1.43 and 1.17; no ambient
+occlusion: 1.25, 1.48 and 1.16; no shadows: 1.12, 1.26 and 1.03; ray traced (hard):
+1.32, 1.57 and 1.24; no antialiasing: 1.27, 1.50 and 1.17. the compute rasterizer saves
+0.21 to 0.37 ms. occlusion culling removes 54% of the triangles at ground level (1.42 to
+1.24 ms) and next to nothing from the raised camera, which sees over the crowd.
 
-early versions drew fewer triangles (0.86 million beside lucy); measured errors now
-refuse levels that strayed several pixels. the commit messages have every step's numbers.
+the triangle counts have climbed as the errors got honest: 0.86 million beside lucy
+when errors were quadric estimates, 2.99 million once measured by samples, 4.77 million
+now that both the error and its projection are proven. a threshold of two pixels
+(`--threshold 2`, or ]) draws 2.34 million in 1.21 ms, about the old picture. the commit
+messages have every step's numbers.
 
 ## limitations
 
-* the error is sampled at vertices, edge midpoints and triangle centres, so a narrow
-  spike between samples can slip through: a close bound, not a proof.
-* from a cold file cache refinement takes about 50 ms, a request round per few levels.
-* motion is rigid and built in: nothing deforms. many moving instances are costly in the
-  shadow maps: half the crowd redraws about 500 pages a frame, 0.86 ms.
+* the bound is proven for the geometry, not for shading: a normal or a shadow can still
+  shift by more than a pixel's worth where they depend on detail the cut removed.
+* proving the bounds makes building slow, about 10 minutes for lucy.
+* motion and deformation are built in and procedural: no skinning, no animation data.
+  many moving or swaying instances are costly in the shadow maps (half the crowd redraws
+  about 500 pages a frame, 0.77 ms), and ray traced shadows (`--shadows rt`) see swaying
+  statues rigid.
 * shadow pages draw from streamed geometry too, so shadows sharpen with everything else,
   and a page that finds the pool full falls back a level.
-* materials are a few parameters per instance, with no textures.
-* the browser has no instance cells, and its shadow pages wait on http streaming (a still
-  view settles within 40 seconds headless, over local http).
+* materials are procedural, chosen per instance: there are no texture maps, since the
+  scans have no uvs.
+* there is no global illumination beyond ambient occlusion and the sky.
 
 ## models
 
