@@ -250,6 +250,12 @@ or push constants:
 * a quarter of the middle 30x30 instances move and some of the rest sway, and the crowd
   slider goes to a million. `?still` starts with motion paused and the camera held, so
   every load shows the same frame.
+* without webgpu, or on a gpu with fewer than 16 storage buffers per stage (most phones),
+  the page shows frames from the native viewer instead (`web/gallery/`, from `docs/` by
+  `web/gallery.sh`), and `web/flythrough.mp4` at the top if there is one: a capture of
+  either renderer, made small with `ffmpeg -i capture.mkv -vf scale=1280:-2 -c:v libx264
+  -crf 26 -preset slow -an -movflags +faststart web/flythrough.mp4`. `?fallback` shows it
+  anywhere.
 
 the models are trimmed to 4 million triangles at their finest (`--max-triangles`): about
 2.6 mb of gzipped metadata each, up front, and about 55 mb of pages, streamed. in chrome

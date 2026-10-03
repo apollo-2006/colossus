@@ -67,13 +67,29 @@ export const camera = {
   },
 };
 
+// in place of the demo: frames from the native viewer, and the flythrough video if there is
+// one. for browsers without webgpu, gpus without enough storage buffers, and ?fallback.
+function fallback(reason) {
+  for (const id of ['view', 'panel', 'loading']) $(id)?.remove();
+  document.body.classList.add('fallback');
+  $('fallback-reason').textContent = reason;
+  $('fallback').hidden = false;
+  fetch('flythrough.mp4', { method: 'HEAD' }).then((r) => { if (r.ok) $('fallback-video').hidden = false; }, () => {});
+}
+
 async function main() {
   const canvas = $('view');
-  const renderer = await Renderer.create(canvas);
-  if (!renderer) {
-    $('loading').textContent = 'This page needs WebGPU (Chrome or Edge 113+, or Safari 26). Your browser does not offer it.';
-    return;
+  if (new URLSearchParams(location.search).has('fallback')) return fallback('The live demo is off for this visit (?fallback).');
+  let renderer;
+  try {
+    renderer = await Renderer.create(canvas);
+  } catch (e) {
+    console.error(e);
+    return fallback(`The live demo cannot run here: ${e.message}.`);
   }
+  if (!renderer)
+    return fallback(navigator.gpu ? 'This browser has WebGPU but found no GPU it can use, so the live demo cannot run here. This is what it draws.'
+      : 'Your browser does not offer WebGPU, which the live demo needs. This is what it draws.');
   const progress = MODELS.map(() => [0, 0]);
   const models = await Promise.all(MODELS.map((url, i) => fetchModel(url, (got, total) => {
     progress[i] = [got, total];

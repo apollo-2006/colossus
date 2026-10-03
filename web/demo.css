@@ -33,3 +33,17 @@ a { color: var(--accent); }
 @media (max-width: 640px) {
   #panel { top: auto; bottom: 16px; left: 16px; right: 16px; width: auto; max-height: 45%; }
 }
+
+/* the fallback (app.js): frames from the native viewer instead of the demo. */
+body.fallback { height: auto; background: #10141b; }
+#fallback { max-width: 880px; margin: 0 auto; padding: 40px 16px 56px; }
+#fallback h1 { font-size: 26px; margin-bottom: 6px; }
+#fallback .reason { margin: 0 0 10px; color: var(--accent); }
+#fallback .lede { font-size: 15px; margin-bottom: 24px; }
+#fallback video, #fallback img { display: block; width: 100%; height: auto; border-radius: 10px; background: #1b212b; }
+#fallback video { margin-bottom: 28px; }
+#fallback figure { margin: 0 0 28px; }
+#fallback figcaption { margin-top: 8px; color: var(--muted); font-size: 13px; }
+#fallback footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #2a313d; color: var(--muted); font-size: 13px; }
+#fallback footer p { margin: 0 0 8px; }
+#fallback [hidden] { display: none; }

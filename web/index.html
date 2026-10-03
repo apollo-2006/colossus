@@ -56,6 +56,53 @@
     <a href="https://github.com/apollo-2006/colossus">native viewer</a> draws all 28M of Lucy's, with mesh
     shaders and ray traced shadows. Lucy and the dragon: Stanford 3D Scanning Repository.</p>
 </aside>
+<!-- shown instead of the demo when the browser has no webgpu, or the gpu too few storage
+     buffers (app.js), or with ?fallback. flythrough.mp4, if present, plays at the top. -->
+<main id="fallback" hidden>
+  <header>
+    <h1>colossus</h1>
+    <p class="reason" id="fallback-reason"></p>
+    <p class="lede">Virtualized geometry from scratch, as in Nanite: every cluster of every statue picks the
+      coarsest detail within a pixel of the original. These are frames from the native Vulkan viewer, on an
+      RX 9070 XT.</p>
+  </header>
+  <video id="fallback-video" controls muted loop playsinline preload="none" poster="gallery/crowd.jpg" hidden>
+    <source src="flythrough.mp4" type="video/mp4">
+  </video>
+  <figure>
+    <img src="gallery/crowd.jpg" width="1280" height="720" alt="900 instances of Lucy and the XYZ RGB dragon in sunlight, shadowed by virtual shadow maps">
+    <figcaption>900 statues of Lucy and the XYZ RGB dragon: 15.9 billion triangles at full detail, drawn at
+      1920x1080 in 1.33 ms with soft shadows, ambient occlusion and antialiasing. About 4.8 million reach the
+      screen.</figcaption>
+  </figure>
+  <figure>
+    <img src="gallery/lod_levels.jpg" width="1280" height="720" alt="the crowd coloured by LOD level, blue for full detail through red to magenta for the coarsest" loading="lazy">
+    <figcaption>LOD levels, blue for full detail through red to magenta for the coarsest. Near dragons draw mid
+      levels, distant statues the coarsest, and single statues mix levels as they recede.</figcaption>
+  </figure>
+  <figure>
+    <img src="gallery/clusters.jpg" width="1280" height="720" alt="Lucy, each cluster in its own colour" loading="lazy">
+    <figcaption>Lucy, each cluster of up to 128 triangles in its own colour. Clusters are grouped, simplified
+      and grouped again into a hierarchy where any mix of levels joins without cracks.</figcaption>
+  </figure>
+  <figure>
+    <img src="gallery/rasterizers.jpg" width="1280" height="720" alt="the crowd coloured by rasterizer: orange for compute, blue for hardware" loading="lazy">
+    <figcaption>Which rasterizer drew each pixel: orange a compute rasterizer, blue mesh shaders. Pixel-sized
+      triangles are what hardware handles worst, so only the nearest surfaces get it.</figcaption>
+  </figure>
+  <figure>
+    <img src="gallery/materials.jpg" width="1280" height="418" alt="Lucy in each material: veined marble, layered sandstone, patinated bronze, hammered gold, speckled granite" loading="lazy">
+    <figcaption>The scans have no UVs, so materials come from noise in each model's own space: veined marble,
+      layered sandstone, bronze greening in its folds, hammered gold, granite.</figcaption>
+  </figure>
+  <footer>
+    <p>To fly through it yourself you need WebGPU: Chrome or Edge 113 or later on a desktop, Safari 26, or
+      Firefox 141 or later on Windows, and a GPU that allows 16 storage buffers per shader stage, as desktop
+      GPUs do.</p>
+    <p><a href="https://github.com/apollo-2006/colossus">Source, numbers and the native viewer on GitHub</a>.
+      Lucy and the dragon: Stanford 3D Scanning Repository.</p>
+  </footer>
+</main>
 <script type="module" src="app.js"></script>
 </body>
 </html>
