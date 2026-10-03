@@ -75,21 +75,28 @@ function fallback(reason) {
   $('fallback-reason').textContent = reason;
   $('fallback').hidden = false;
   fetch('flythrough.mp4', { method: 'HEAD' }).then((r) => { if (r.ok) $('fallback-video').hidden = false; }, () => {});
+  // the live part: one statue in webgl2 (lite.js), where there is webgl2.
+  $('lite').hidden = false;
+  import('./lite.js').then(({ startLite }) => startLite($('lite-view'), {
+    model: $('lite-model'), mode: $('lite-mode'), threshold: $('lite-threshold'), thresholdLabel: $('lite-threshold-label'),
+    triangles: $('lite-triangles'), full: $('lite-full'), clusters: $('lite-clusters'), pages: $('lite-pages'), cpu: $('lite-cpu'),
+    status: $('lite-status'),
+  })).then((ok) => { if (!ok) $('lite').hidden = true; }, (e) => { console.error(e); $('lite').hidden = true; });
 }
 
 async function main() {
   const canvas = $('view');
-  if (new URLSearchParams(location.search).has('fallback')) return fallback('The live demo is off for this visit (?fallback).');
+  if (new URLSearchParams(location.search).has('fallback')) return fallback('The full demo is off for this visit (?fallback).');
   let renderer;
   try {
     renderer = await Renderer.create(canvas);
   } catch (e) {
     console.error(e);
-    return fallback(`The live demo cannot run here: ${e.message}.`);
+    return fallback(`The full demo cannot run here: ${e.message}.`);
   }
   if (!renderer)
-    return fallback(navigator.gpu ? 'This browser has WebGPU but found no GPU it can use, so the live demo cannot run here. This is what it draws.'
-      : 'Your browser does not offer WebGPU, which the live demo needs. This is what it draws.');
+    return fallback(navigator.gpu ? 'This browser has WebGPU but found no GPU it can use, so the full demo cannot run here.'
+      : 'Your browser does not offer WebGPU, which the full demo needs.');
   const progress = MODELS.map(() => [0, 0]);
   const models = await Promise.all(MODELS.map((url, i) => fetchModel(url, (got, total) => {
     progress[i] = [got, total];

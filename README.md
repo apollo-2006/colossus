@@ -251,8 +251,11 @@ or push constants:
   slider goes to a million. `?still` starts with motion paused and the camera held, so
   every load shows the same frame.
 * without webgpu, or on a gpu with fewer than 16 storage buffers per stage (most phones),
-  the page shows frames from the native viewer instead (`web/gallery/`, from `docs/` by
-  `web/gallery.sh`), and `web/flythrough.mp4` at the top if there is one: a capture of
+  the page falls back to `web/lite.js`: one statue in webgl2, streamed by the same
+  streamer, every cluster taking the same lod test on the cpu (no crowd, compute
+  rasterizer or shadows), with the cluster and lod views and the error slider. below it,
+  frames from the native viewer (`web/gallery/`, from `docs/` by `web/gallery.sh`), and
+  `web/flythrough.mp4` above them if there is one: a capture of
   either renderer, made small with `ffmpeg -i capture.mkv -vf scale=1280:-2 -c:v libx264
   -crf 26 -preset slow -an -movflags +faststart web/flythrough.mp4`. `?fallback` shows it
   anywhere.

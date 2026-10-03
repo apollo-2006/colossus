@@ -40,7 +40,7 @@ export class Streamer {
     for (let p = 0; p < stamps.length; p++) if (stamps[p] > this.lastUsed[p]) this.lastUsed[p] = stamps[p];
   }
 
-  // publishes finished loads, issues new ones. returns pool uploads ({slot, data});
+  // publishes finished loads, issues new ones. returns pool uploads ({slot, page, data});
   // this.table is then the frame's page table.
   service(frame, requests, threshold) {
     this.frame = frame;
@@ -50,7 +50,7 @@ export class Streamer {
       const j = this.issued.shift();
       this.loading[j.page] = 0;
       this.table[j.page] = this.slotOf[j.page] * this.slotBytes / 4;
-      uploads.push({ slot: this.slotOf[j.page], data: j.data });
+      uploads.push({ slot: this.slotOf[j.page], page: j.page, data: j.data });
       used += j.data.byteLength;
       this.stats.loaded++;
       this.stats.bytes += j.data.byteLength;

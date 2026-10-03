@@ -47,3 +47,16 @@ body.fallback { height: auto; background: #10141b; }
 #fallback footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #2a313d; color: var(--muted); font-size: 13px; }
 #fallback footer p { margin: 0 0 8px; }
 #fallback [hidden] { display: none; }
+/* the fallback's live view (lite.js). */
+#lite { margin: 0 0 32px; }
+#lite-view { display: block; width: 100%; aspect-ratio: 16 / 10; max-height: 70vh; border-radius: 10px; background: #9fb0c4;
+  touch-action: none; cursor: grab; }
+#lite-view:active { cursor: grabbing; }
+.lite-bar { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: end; margin-top: 10px; }
+.lite-bar label { margin: 0; }
+.lite-bar select { display: inline-block; width: auto; margin: 0 0 0 6px; }
+.lite-bar .lite-threshold { flex: 1; min-width: 180px; }
+.lite-stats { grid-template-columns: auto 1fr auto 1fr; gap: 3px 14px; margin: 12px 0 8px; font-size: 13px; }
+.lite-note { margin: 0; color: var(--muted); font-size: 13px; }
+#lite-status:not(:empty) { color: var(--accent); margin-right: 6px; }
+@media (max-width: 640px) { .lite-stats { grid-template-columns: auto 1fr; } }

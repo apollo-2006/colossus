@@ -63,9 +63,28 @@
     <h1>colossus</h1>
     <p class="reason" id="fallback-reason"></p>
     <p class="lede">Virtualized geometry from scratch, as in Nanite: every cluster of every statue picks the
-      coarsest detail within a pixel of the original. These are frames from the native Vulkan viewer, on an
-      RX 9070 XT.</p>
+      coarsest detail within a pixel of the original. Below, a lighter live version, then frames from the native
+      Vulkan viewer on an RX 9070 XT.</p>
   </header>
+  <section id="lite" hidden>
+    <canvas id="lite-view"></canvas>
+    <div class="lite-bar">
+      <label>model <select id="lite-model"><option value="models/lucy">Lucy</option><option value="models/dragon">dragon</option></select></label>
+      <label>view <select id="lite-mode"><option value="0">shaded</option><option value="1">clusters</option><option value="2">LOD level</option></select></label>
+      <label class="lite-threshold">error allowed <span id="lite-threshold-label">1 px</span>
+        <input id="lite-threshold" type="range" min="-2" max="5" step="1" value="0"></label>
+    </div>
+    <dl class="lite-stats">
+      <dt>triangles drawn</dt><dd id="lite-triangles">...</dd>
+      <dt>at full detail</dt><dd id="lite-full">...</dd>
+      <dt>clusters drawn</dt><dd id="lite-clusters">...</dd>
+      <dt>streamed in</dt><dd id="lite-pages">...</dd>
+      <dt>picking and drawing</dt><dd id="lite-cpu">...</dd>
+    </dl>
+    <p class="lite-note"><span id="lite-status"></span>A lighter version in WebGL2: one statue, streamed page by page,
+      every cluster picking the coarsest level within the error allowed, as the full demo does, but on the CPU and
+      without the crowd, the compute rasterizer or shadows. Drag to turn it, scroll or pinch to zoom.</p>
+  </section>
   <video id="fallback-video" controls muted loop playsinline preload="none" poster="gallery/crowd.jpg" hidden>
     <source src="flythrough.mp4" type="video/mp4">
   </video>
