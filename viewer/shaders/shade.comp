@@ -282,14 +282,17 @@ void main() {
         vec3 n = s.n;
         float wrap = 0.0, coat = 0.0;
         if (frame.debug_mode == 0u) {
-            const float radius = meshes[inst.mesh].bounds.w;
-            const vec3 q = from_world(inst, s.hit) / radius;
+            const vec4 bounds = meshes[inst.mesh].bounds;
+            const float radius = bounds.w;
+            // detail is fixed to the rest surface: a swaying statue's grain bends with it.
+            const vec3 drawn = from_world(inst, s.hit);
+            const vec3 q = undeform(inst, bounds, drawn, frame.time) / radius;
             const Detail d = surface_detail(m, min(inst.material, 5u), q, s.t / (frame.lod_scale * inst.scale * radius), ao, s.n.y);
             m = d.m;
             wrap = d.wrap;
             coat = d.coat;
             // the height gradient to world space (rotation; heights are in radii, so scale cancels).
-            const vec3 g = to_world_dir(inst, d.grad) / inst.scale;
+            const vec3 g = to_world_dir(inst, deform_gradient(inst, bounds, drawn, d.grad, frame.time)) / inst.scale;
             n = normalize(s.n - (g - dot(g, s.n) * s.n));
         }
         if (frame.debug_mode != 0u) m = Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0);

@@ -277,12 +277,18 @@ vec3 undeform(Instance inst, vec4 bounds, vec3 p, float t) {
     return p - deform_offset(inst, bounds, p.y, t, slope);
 }
 
-// a model-space normal at drawn point p: the shear's inverse transpose, n - up (slope . n).
-vec3 deform_normal(Instance inst, vec4 bounds, vec3 p, vec3 n, float t) {
-    if (!deforming(inst)) return n;
+// a model-space gradient at drawn point p (of something fixed to the rest surface): the
+// shear's inverse transpose, g - up (slope . g).
+vec3 deform_gradient(Instance inst, vec4 bounds, vec3 p, vec3 g, float t) {
+    if (!deforming(inst)) return g;
     vec3 slope;
     deform_offset(inst, bounds, p.y, t, slope);
-    return normalize(n - vec3(0.0, dot(slope, n), 0.0));
+    return g - vec3(0.0, dot(slope, g), 0.0);
+}
+
+// a model-space normal at drawn point p, the same way.
+vec3 deform_normal(Instance inst, vec4 bounds, vec3 p, vec3 n, float t) {
+    return deforming(inst) ? normalize(deform_gradient(inst, bounds, p, n, t)) : n;
 }
 
 // how far a deforming instance's points move (model units), and how much its errors grow.

@@ -281,10 +281,16 @@ fn undeform(inst: Instance, bounds: vec4f, p: vec3f, t: f32) -> vec3f {
   return p - deform_offset(inst, bounds, p.y, t).offset;
 }
 
+// a gradient fixed to the rest surface, at drawn point p: the shear's inverse transpose.
+fn deform_gradient(inst: Instance, bounds: vec4f, p: vec3f, g: vec3f, t: f32) -> vec3f {
+  if (!deforming(inst)) { return g; }
+  let slope = deform_offset(inst, bounds, p.y, t).slope;
+  return g - vec3f(0.0, dot(slope, g), 0.0);
+}
+
 fn deform_normal(inst: Instance, bounds: vec4f, p: vec3f, n: vec3f, t: f32) -> vec3f {
   if (!deforming(inst)) { return n; }
-  let slope = deform_offset(inst, bounds, p.y, t).slope;
-  return normalize(n - vec3f(0.0, dot(slope, n), 0.0));
+  return normalize(deform_gradient(inst, bounds, p, n, t));
 }
 
 fn deform_reach_of(inst: Instance) -> f32 { return select(0.0, DEFORM_REACH * meshes[inst.mesh].bounds.w, deforming(inst)); }

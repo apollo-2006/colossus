@@ -1076,13 +1076,15 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     var wrap = 0.0;
     var coat = 0.0;
     if (frame.debug_mode == 0u) {
-      let radius = meshes[inst.mesh].bounds.w;
-      let q = from_world(inst, origin + dir * t) / radius;
+      let radius = bounds.w;
+      // detail is fixed to the rest surface: a swaying statue's grain bends with it.
+      let drawn = from_world(inst, origin + dir * t);
+      let q = undeform(inst, bounds, drawn, frame.time) / radius;
       let d = surface_detail(m, min(inst.material, 5u), q, t / (frame.lod_scale * inst.scale * radius), ao, n.y);
       m = d.m;
       wrap = d.wrap;
       coat = d.coat;
-      let g = to_world_dir(inst, d.grad) / inst.scale;
+      let g = to_world_dir(inst, deform_gradient(inst, bounds, drawn, d.grad, frame.time)) / inst.scale;
       n = normalize(n - (g - dot(g, n) * n));
     }
     if (frame.debug_mode != 0u) { m = Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }
