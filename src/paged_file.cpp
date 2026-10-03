@@ -367,6 +367,7 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
     read_vec(f, p.pages);
     read_vec(f, p.deps);
     read_vec(f, p.levels);
+    if (p.packed.empty()) throw std::runtime_error(path + ": no clusters");
     if (p.shared_bounds.size() != p.pages.size()) throw std::runtime_error(path + ": page bounds out of range");
     for (const packed_cluster& c : p.packed)
         if (c.group >= p.pages.size() || (c.creator != no_page && c.creator >= p.pages.size()))

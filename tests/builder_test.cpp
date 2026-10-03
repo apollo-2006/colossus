@@ -147,6 +147,13 @@ void test_weld() {
     CHECK(m.triangle_count() == 2);
 }
 
+// an empty model trims to itself, with no errors to search.
+void test_trim_empty() {
+    std::printf("trim of an empty model\n");
+    const geometry g = trim(geometry{}, 10);
+    CHECK(g.clusters.empty());
+}
+
 void test_clusters() {
     std::printf("clustering\n");
     const mesh m = bumpy_sphere(6);  // 32k triangles
@@ -351,6 +358,7 @@ int main() {
     test_packed_cones();
     test_ply_and_obj();
     test_weld();
+    test_trim_empty();
     test_clusters();
     test_simplify();
     test_hierarchy("closed sphere", bumpy_sphere(7));

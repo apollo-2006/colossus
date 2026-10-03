@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 #include <string>
 
 int main(int argc, char** argv) {
@@ -39,6 +40,7 @@ int main(int argc, char** argv) {
         mesh m = load_mesh(in);
         std::printf("read %s: %zu vertices, %zu triangles (%.1fs)\n", in.c_str(), m.positions.size(), m.triangle_count(), since());
         weld(m);
+        if (m.triangle_count() == 0) throw std::runtime_error(in + ": no triangles");
         normalize_placement(m, up_z);
         std::printf("welded: %zu vertices, %zu triangles (%.1fs)\n", m.positions.size(), m.triangle_count(), since());
         const lod_mesh lod = build_lod(m, true);

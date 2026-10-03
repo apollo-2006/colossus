@@ -83,6 +83,7 @@ geometry pack(const lod_mesh& lod) {
 }
 
 geometry trim(const geometry& g, size_t max_triangles) {
+    if (g.clusters.empty()) return g;  // nothing to trim, and no errors to search
     auto triangles_at = [&](float t) {
         size_t n = 0;
         for (const gpu_cluster& c : g.clusters)
