@@ -309,8 +309,9 @@ export class Renderer {
         const p = placements[k], b = this.models[p.model].bounds, m = p.matrix;
         const origin = [m[3], m[7], m[11]];
         let c = [0, 1, 2].map((r) => m[4 * r] * b[0] + m[4 * r + 1] * b[1] + m[4 * r + 2] * b[2] + origin[r]);
-        let radius = b[3] * p.scale;
-        if (p.anim) {
+        // deforming: points move up to the reach (DEFORM_REACH in common.wgsl).
+        let radius = b[3] * (p.anim & 1024 ? 1.1 : 1) * p.scale;
+        if (p.anim & 512) {
           radius += Math.hypot(c[0] - origin[0], c[1] - origin[1], c[2] - origin[2]) + 0.2;
           c = origin;
         }

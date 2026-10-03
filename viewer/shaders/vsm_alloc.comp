@@ -69,8 +69,9 @@ void main() {
         const uint i = moving_instances[group];
         const Instance now = load_instance(i), then = load_prev_instance(i);
         const Mesh m = meshes[now.mesh];
-        invalidate(to_world(then, m.bounds.xyz), m.bounds.w * now.scale, gl_LocalInvocationIndex);
-        invalidate(to_world(now, m.bounds.xyz), m.bounds.w * now.scale, gl_LocalInvocationIndex);
+        const float radius = (m.bounds.w + deform_reach_of(now)) * now.scale;
+        invalidate(to_world(then, m.bounds.xyz), radius, gl_LocalInvocationIndex);
+        invalidate(to_world(now, m.bounds.xyz), radius, gl_LocalInvocationIndex);
     } else if (push.level == 0u) {
         if (k >= vsm_slots) return;
         const VsmEntry e = vsm_entries[k];

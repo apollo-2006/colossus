@@ -177,8 +177,11 @@ struct Lod {
 fn lod_test(inst: Instance, c: Cluster) -> Lod {
   let s = inst.scale;
   var r: Lod;
-  r.self_error = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s);
-  let coarse_enough = projected_error(to_world(inst, c.parent_center), c.parent_radius * s, c.parent_error * s) > frame.lod_threshold;
+  // a deforming instance: points up to its reach away, errors stretched (deform()).
+  let reach = deform_reach_of(inst);
+  let stretch = deform_stretch_of(inst);
+  r.self_error = projected_error(to_world(inst, c.lod_center), (c.lod_radius + reach) * s, c.lod_error * s * stretch);
+  let coarse_enough = projected_error(to_world(inst, c.parent_center), (c.parent_radius + reach) * s, c.parent_error * s * stretch) > frame.lod_threshold;
   let finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
   r.wants_finer = r.self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
   r.draw = page_table[c.group] != NO_PAGE && coarse_enough && (r.self_error <= frame.lod_threshold || !finer_resident);
@@ -295,7 +298,7 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
     let inst = load_instance(i);
     let m = meshes[inst.mesh];
     let center = to_world(inst, m.bounds.xyz);
-    let radius = m.bounds.w * inst.scale;
+    let radius = (m.bounds.w + deform_reach_of(inst)) * inst.scale;
     var keep = hidden_before || (frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, radius);
     // pass 1: was it hidden last frame, where it was last frame.
     var then = center;
@@ -309,9 +312,9 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
       atomicAdd(&counters.instances_visible, 1u);
       // projected_error()'s worst over the sphere holding every lod sphere.
       let lc = to_world(inst, m.lod_bounds.xyz) - frame.cull_origin.xyz;
-      let r = m.lod_bounds.w * inst.scale;
+      let r = (m.lod_bounds.w + deform_reach_of(inst)) * inst.scale;
       let z = max(dot(lc, frame.cull_planes[4].xyz) - r, frame.near_z);
-      let limit = frame.lod_threshold * z / (inst.scale * frame.lod_scale * projected_sec(lc, r));
+      let limit = frame.lod_threshold * z / (inst.scale * deform_stretch_of(inst) * frame.lod_scale * projected_sec(lc, r));
       var lo = 0u;
       var hi = m.cluster_count;
       while (lo < hi) {
@@ -462,9 +465,9 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       let lod = lod_test(inst, c);
       draw = lod.draw;
       let center = to_world(inst, c.center);
-      let r = c.radius * s;
+      let r = (c.radius + deform_reach_of(inst)) * s;
       if (draw && (frame.flags & FLAG_FRUSTUM) != 0u) { draw = sphere_in_frustum(center, r); }
-      if (draw && (frame.flags & FLAG_CONE) != 0u && c.cone_cutoff < 1.0) {
+      if (draw && (frame.flags & FLAG_CONE) != 0u && c.cone_cutoff < 1.0 && !deforming(inst)) {
         let axis = normalize(to_world_dir(inst, c.cone_axis));
         let view = center - frame.cull_origin.xyz;
         if (dot(view, axis) >= c.cone_cutoff * length(view) + r) { draw = false; }
@@ -497,7 +500,7 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       let inst = load_instance(instance_id);
       let c = load_cluster(cluster_id);
       let center = to_world(inst, c.center);
-      let r = c.radius * inst.scale;
+      let r = (c.radius + deform_reach_of(inst)) * inst.scale;
       draw = !occluded(center, r);
       if (draw) {
         atomicAdd(&wg_triangles, c.triangle_count);
@@ -585,7 +588,8 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   let inst = load_instance(v.x);
   let c = load_cluster(v.y);
   if (lane < c.vertex_count) {
-    let clip = frame.view_proj * vec4f(to_world(inst, cluster_position(c, meshes[inst.mesh].grid, lane)), 1.0);
+    let m = meshes[inst.mesh];
+    let clip = frame.view_proj * vec4f(to_world(inst, deform(inst, m.bounds, cluster_position(c, m.grid, lane), frame.time)), 1.0);
     let ndc = clip.xy / clip.w;
     // pixels run down; clip space up.
     let px = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(f32(frame.width), f32(frame.height));
@@ -1036,9 +1040,10 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let i1 = (packed >> 8u) & 255u;
     let i2 = (packed >> 16u) & 255u;
     let grid = meshes[inst.mesh].grid;
-    let p0 = to_world(inst, cluster_position(c, grid, i0));
-    let p1 = to_world(inst, cluster_position(c, grid, i1));
-    let p2 = to_world(inst, cluster_position(c, grid, i2));
+    let bounds = meshes[inst.mesh].bounds;
+    let p0 = to_world(inst, deform(inst, bounds, cluster_position(c, grid, i0), frame.time));
+    let p1 = to_world(inst, deform(inst, bounds, cluster_position(c, grid, i1), frame.time));
+    let p2 = to_world(inst, deform(inst, bounds, cluster_position(c, grid, i2), frame.time));
     // ray against the triangle's plane, for exact barycentrics.
     let e1 = p1 - p0;
     let e2 = p2 - p0;
@@ -1058,7 +1063,8 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let n0 = cluster_normal(c, i0);
     let n1 = cluster_normal(c, i1);
     let n2 = cluster_normal(c, i2);
-    var n = normalize(to_world_dir(inst, n0 * (1.0 - bu - bv) + n1 * bu + n2 * bv));
+    let model_n = deform_normal(inst, bounds, from_world(inst, origin + dir * t), n0 * (1.0 - bu - bv) + n1 * bu + n2 * bv, frame.time);
+    var n = normalize(to_world_dir(inst, model_n));
     // from behind (inside a fold, through a scan hole): light the visible side,
     // no rim light, which would outline every sliver.
     let behind = dot(n, dir) > 0.0;
@@ -1181,7 +1187,11 @@ fn taa(@builtin(global_invocation_id) gid: vec3u) {
         instance = sw_visible[atomicLoad(&sw_buf[frame.width * frame.height + gid.x + gid.y * frame.width]) >> 7u].x;
       }
       let inst = load_instance(instance);
-      if (inst.anim != 0u) { p = to_world(load_prev_instance(instance), from_world(inst, p)); }
+      if (inst.anim != 0u) {
+        let bounds = meshes[inst.mesh].bounds;
+        let rest = undeform(inst, bounds, from_world(inst, p), frame.time);
+        p = to_world(load_prev_instance(instance), deform(inst, bounds, rest, frame.prev_time));
+      }
       prev = frame.prev_view_proj * vec4f(p, 1.0);
     } else if (dir.y < 0.0) {
       prev = frame.prev_view_proj * vec4f(origin + dir * (-origin.y / dir.y), 1.0);

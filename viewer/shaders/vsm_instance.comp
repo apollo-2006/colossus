@@ -15,7 +15,7 @@ void main() {
     const Instance inst = load_instance(i);
     const Mesh m = meshes[inst.mesh];
     const vec2 center = vsm_light_space(to_world(inst, m.bounds.xyz)).xy;
-    const float radius = m.bounds.w * inst.scale;
+    const float radius = (m.bounds.w + deform_reach_of(inst)) * inst.scale;
     // still instances draw the still layer, moving ones the moving.
     const uint layer = inst.anim != 0u ? vsm_moving : vsm_still;
     uint levels = vsm_rendered_levels[layer];
@@ -23,7 +23,7 @@ void main() {
         const uint level = findLSB(levels);
         levels &= levels - 1u;
         if (!vsm_touches(layer, level, center, radius)) continue;
-        const float limit = frame.lod_threshold * vsm_texel(level) / inst.scale;
+        const float limit = frame.lod_threshold * vsm_texel(level) / (inst.scale * deform_stretch_of(inst));
         uint lo = 0, hi = m.cluster_count;
         while (lo < hi) {
             const uint mid = (lo + hi) / 2;

@@ -182,7 +182,7 @@ fn load_cluster(i: u32) -> Cluster {
 // frame's pyramid and image have it.
 fn animate(inst_in: Instance, t: f32) -> Instance {
   var inst = inst_in;
-  if (inst.anim == 0u) { return inst; }
+  if ((inst.anim & 512u) == 0u) { return inst; }
   let phase = f32(inst.anim & 255u) * (6.2831853 / 256.0);
   let turn = phase + t * select(0.7, -0.7, (inst.anim & 256u) != 0u);
   let c = cos(turn);
@@ -238,6 +238,57 @@ fn read_bits(at: u32, bit: u32, count: u32) -> u32 {
   if (s + count > 32u) { v |= pool[w + 1u] << (32u - s); }
   return v & ((1u << count) - 1u);
 }
+
+// deforming instances (anim bit 10) sway, as common.glsl's deform(): a bend growing with
+// the square of the height and a ripple up it, sideways, functions of height alone (crack
+// free, exactly invertible). slope <= 0.128: lengths stretch <= 1.066, points move <= 0.1 r.
+const DEFORM_A = 0.08;
+const DEFORM_B = 0.02;
+const DEFORM_K = 9.0;
+const DEFORM_REACH = 0.1;
+const DEFORM_STRETCH = 1.07;
+
+fn deforming(inst: Instance) -> bool { return (inst.anim & 1024u) != 0u; }
+
+// the sideways offset at model height y and its slope along the height.
+struct DeformOffset {
+  offset: vec3f,
+  slope: vec3f,
+}
+
+fn deform_offset(inst: Instance, bounds: vec4f, y: f32, t: f32) -> DeformOffset {
+  let r = bounds.w;
+  let h = clamp((y - (bounds.y - r)) / (2.0 * r), 0.0, 1.0);
+  let phase = f32(inst.anim & 255u) * (6.2831853 / 256.0);
+  let heading = phase * 3.0;
+  let dir = vec3f(cos(heading), 0.0, sin(heading));
+  let perp = vec3f(-dir.z, 0.0, dir.x);
+  let sway = sin(1.3 * t + phase);
+  let arg = DEFORM_K * h - 2.2 * t + phase;
+  var d: DeformOffset;
+  d.slope = dir * (DEFORM_A * h * sway) + perp * (DEFORM_B * (sin(arg) + h * DEFORM_K * cos(arg)) * 0.5);
+  d.offset = dir * (DEFORM_A * r * h * h * sway) + perp * (DEFORM_B * r * h * sin(arg));
+  return d;
+}
+
+fn deform(inst: Instance, bounds: vec4f, p: vec3f, t: f32) -> vec3f {
+  if (!deforming(inst)) { return p; }
+  return p + deform_offset(inst, bounds, p.y, t).offset;
+}
+
+fn undeform(inst: Instance, bounds: vec4f, p: vec3f, t: f32) -> vec3f {
+  if (!deforming(inst)) { return p; }
+  return p - deform_offset(inst, bounds, p.y, t).offset;
+}
+
+fn deform_normal(inst: Instance, bounds: vec4f, p: vec3f, n: vec3f, t: f32) -> vec3f {
+  if (!deforming(inst)) { return n; }
+  let slope = deform_offset(inst, bounds, p.y, t).slope;
+  return normalize(n - vec3f(0.0, dot(slope, n), 0.0));
+}
+
+fn deform_reach_of(inst: Instance) -> f32 { return select(0.0, DEFORM_REACH * meshes[inst.mesh].bounds.w, deforming(inst)); }
+fn deform_stretch_of(inst: Instance) -> f32 { return select(1.0, DEFORM_STRETCH, deforming(inst)); }
 
 fn cluster_position(c: Cluster, grid: vec4f, k: u32) -> vec3f {
   let b = cluster_widths(c);

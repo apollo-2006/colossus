@@ -162,7 +162,8 @@ void main() {
     const float texel = vsm_texel(level);
     if (t == 0u) together_count = 0u;
     if (t < c.vertex_count) {
-        const vec3 p = vsm_light_space(to_world(inst, cluster_position(page_table[c.group], c, meshes[inst.mesh].grid, t)));
+        const Mesh m = meshes[inst.mesh];
+        const vec3 p = vsm_light_space(to_world(inst, deform(inst, m.bounds, cluster_position(page_table[c.group], c, m.grid, t), frame.time)));
         snapped[t] = ivec2(round(p.xy / texel * 16.0));
         depth[t] = p.z;
     }

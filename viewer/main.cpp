@@ -237,6 +237,7 @@ struct options {
     bool mixed_materials = true;
     int material = -1;  // --materials NAME: every instance one material (shade.comp's table)
     float moving = 0;  // share of moving instances (animate() in common.glsl)
+    float deforming = 0;  // share of deforming instances (deform() in common.glsl)
     bool full_res_shadows = false;
     bool prefetch = true;
     bool merge_reads = true;   // pages close in the file share a read
@@ -447,8 +448,10 @@ void make_scene(const options& opt, scene& s) {
             inst.scale = scale;
             inst.material = !opt.mixed_materials ? 0 : n == 1 ? 1 : mix[material_rng() % 20];
             if (opt.material >= 0) inst.material = uint32_t(opt.material);
-            // moving: bit 9 marks it, bit 8 the direction, low 8 bits the phase.
+            // moving: bit 9 marks it, bit 8 the direction, low 8 bits the phase. deforming: bit 10
+            // (deform() in common.glsl), shadows and motion vectors as for movers.
             if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
+            if (opt.deforming > 0 && chance(motion_rng) < opt.deforming) inst.anim |= 1024u | (inst.anim ? 0u : motion_rng() & 255u);
             s.moving += inst.anim != 0;
             placed[size_t(z) * n + x] = inst;
             s.instanced_triangles += leaf_triangles[mesh];
@@ -469,8 +472,9 @@ void make_scene(const options& opt, scene& s) {
                     vec3 c = origin;
                     for (int r = 0; r < 3; ++r)
                         (&c.x)[r] += inst.rows[r][0] * local.x + inst.rows[r][1] * local.y + inst.rows[r][2] * local.z;
-                    float radius = m.bounds[3] * inst.scale;
-                    if (inst.anim) {
+                    // deforming: points move up to the reach (deform_reach in common.glsl).
+                    float radius = (m.bounds[3] * ((inst.anim & 1024u) ? 1.1f : 1.0f)) * inst.scale;
+                    if (inst.anim & 512u) {
                         radius += length(c - origin) + 0.2f;
                         c = origin;
                     }
@@ -1880,6 +1884,7 @@ options parse(int argc, char** argv) {
             if (it != std::end(names) && m != "plain") o.material = int(it - std::begin(names));
         }
         else if (a == "--moving") o.moving = std::stof(next());
+        else if (a == "--deforming") o.deforming = std::stof(next());
         else if (a == "--pool-mb") o.pool_mb = std::clamp<uint64_t>(std::stoull(next()), 16, 4095);
         else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
         else if (a == "--warmup") o.warmup = std::stoi(next());

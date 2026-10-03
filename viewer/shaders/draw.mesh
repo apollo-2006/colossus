@@ -23,7 +23,8 @@ void main() {
 
     const uint k = gl_LocalInvocationIndex;
     if (k < c.vertex_count) {
-        const vec3 p = cluster_position(page_table[c.group], c, meshes[inst.mesh].grid, k);
+        const Mesh m = meshes[inst.mesh];
+        const vec3 p = deform(inst, m.bounds, cluster_position(page_table[c.group], c, m.grid, k), frame.time);
         gl_MeshVerticesEXT[k].gl_Position = frame.view_proj * vec4(to_world(inst, p), 1.0);
     }
     if (k < c.triangle_count) {

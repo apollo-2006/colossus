@@ -78,7 +78,11 @@ void main() {
         vec3 p = frame.origin.xyz + dir * t;
         const uint instance = visible[uint(v & 0xffffffffu) >> 7].x;
         const Instance inst = load_instance(instance);
-        if (inst.anim != 0u) p = to_world(load_prev_instance(instance), from_world(inst, p));
+        if (inst.anim != 0u) {
+            const vec4 bounds = meshes[inst.mesh].bounds;
+            const vec3 rest = undeform(inst, bounds, from_world(inst, p), frame.time);
+            p = to_world(load_prev_instance(instance), deform(inst, bounds, rest, frame.prev_time));
+        }
         prev = frame.prev_view_proj * vec4(p, 1.0);
     } else if (dir.y < 0.0) {
         prev = frame.prev_view_proj * vec4(frame.origin.xyz + dir * (-frame.origin.y / dir.y), 1.0);

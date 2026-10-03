@@ -56,7 +56,7 @@ struct Instance {
     uint mesh;
     float scale;
     uint material;  // into shade.comp's materials
-    uint anim;      // 0: still. else moving (animate()): phase in low 8 bits, bit 8 reverses
+    uint anim;      // 0: still. phase in low 8 bits; bit 8 reverses; bit 9 moves (animate()); bit 10 deforms (deform())
 };
 
 layout(set = 0, binding = 0, scalar) uniform Frame {
@@ -227,7 +227,7 @@ layout(set = 0, binding = 7, scalar) readonly buffer Instances { Instance instan
 // time: no uploads. its last frame transform (load_prev_instance) is where last
 // frame's pyramid and image have it.
 Instance animate(Instance inst, float t) {
-    if (inst.anim == 0u) return inst;
+    if ((inst.anim & 512u) == 0u) return inst;
     const float phase = float(inst.anim & 255u) * (6.2831853 / 256.0);
     const float turn = phase + t * ((inst.anim & 256u) != 0u ? -0.7 : 0.7);
     const float c = cos(turn), s = sin(turn);
@@ -239,6 +239,55 @@ Instance animate(Instance inst, float t) {
     inst.rows[2] = vec4(-s * r0 + c * r2, inst.rows[2].w + drift.y);
     return inst;
 }
+
+// a deforming instance sways like a tree in wind: a bend growing with the square of the height
+// and a ripple running up it, both sideways and functions of model height alone. so a shared
+// vertex moves the same in every cluster (cuts stay crack-free), and it inverts exactly
+// (subtract the offset at the same height). with h the height over the model's diameter 2r:
+//   offset = dir * a r h^2 sin(1.3 t + phase) + perp * b r h sin(k h - 2.2 t + phase)
+// its slope along the height is at most sqrt(a^2 + (b (1 + k) / 2)^2) = 0.128, a shear that
+// stretches lengths by at most (s + sqrt(s^2 + 4)) / 2 = 1.066: errors grow by deform_stretch,
+// and nothing moves more than deform_reach (a + b) of the radius.
+const float deform_a = 0.08, deform_b = 0.02, deform_k = 9.0;
+const float deform_reach = 0.1, deform_stretch = 1.07;
+
+bool deforming(Instance inst) { return (inst.anim & 1024u) != 0u; }
+
+// the sideways offset at model height y, and its slope along the height.
+vec3 deform_offset(Instance inst, vec4 bounds, float y, float t, out vec3 slope) {
+    const float r = bounds.w, h = clamp((y - (bounds.y - r)) / (2.0 * r), 0.0, 1.0);
+    const float phase = float(inst.anim & 255u) * (6.2831853 / 256.0), heading = phase * 3.0;
+    const vec3 dir = vec3(cos(heading), 0.0, sin(heading)), perp = vec3(-dir.z, 0.0, dir.x);
+    const float sway = sin(1.3 * t + phase), arg = deform_k * h - 2.2 * t + phase;
+    slope = dir * (deform_a * h * sway) + perp * (deform_b * (sin(arg) + h * deform_k * cos(arg)) * 0.5);
+    return dir * (deform_a * r * h * h * sway) + perp * (deform_b * r * h * sin(arg));
+}
+
+// a model-space point as drawn at time t.
+vec3 deform(Instance inst, vec4 bounds, vec3 p, float t) {
+    if (!deforming(inst)) return p;
+    vec3 slope;
+    return p + deform_offset(inst, bounds, p.y, t, slope);
+}
+
+// the rest position of a point drawn at time t: the offset is sideways, so the height is kept.
+vec3 undeform(Instance inst, vec4 bounds, vec3 p, float t) {
+    if (!deforming(inst)) return p;
+    vec3 slope;
+    return p - deform_offset(inst, bounds, p.y, t, slope);
+}
+
+// a model-space normal at drawn point p: the shear's inverse transpose, n - up (slope . n).
+vec3 deform_normal(Instance inst, vec4 bounds, vec3 p, vec3 n, float t) {
+    if (!deforming(inst)) return n;
+    vec3 slope;
+    deform_offset(inst, bounds, p.y, t, slope);
+    return normalize(n - vec3(0.0, dot(slope, n), 0.0));
+}
+
+// how far a deforming instance's points move (model units), and how much its errors grow.
+float deform_reach_of(Instance inst) { return deforming(inst) ? deform_reach * meshes[inst.mesh].bounds.w : 0.0; }
+float deform_stretch_of(Instance inst) { return deforming(inst) ? deform_stretch : 1.0; }
 
 // cells of up to 64 neighbouring instances, culled first (cell_cull.comp): a
 // sphere over all, consecutive instances.
@@ -449,10 +498,12 @@ bool occluded(vec3 center, float radius) {
 // while their stand-ins are (viewer/streamer.hpp), so one level per path.
 // wants_finer: drawn only for want of finer clusters.
 bool lod_test(Instance inst, Cluster c, out bool wants_finer, out float self_error) {
-    const float s = inst.scale;
-    self_error = projected_error(to_world(inst, c.lod_center), c.lod_radius * s, c.lod_error * s);
-    const bool coarse_enough = projected_error(to_world(inst, c.parent_center), c.parent_radius * s, c.parent_error * s) >
-                               frame.lod_threshold;
+    // a deforming instance: points up to its reach away, errors stretched (deform()).
+    const float s = inst.scale, reach = deform_reach_of(inst), stretch = deform_stretch_of(inst);
+    self_error = projected_error(to_world(inst, c.lod_center), (c.lod_radius + reach) * s, c.lod_error * s * stretch);
+    const bool coarse_enough =
+        projected_error(to_world(inst, c.parent_center), (c.parent_radius + reach) * s, c.parent_error * s * stretch) >
+        frame.lod_threshold;
     const bool finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
     wants_finer = self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
     return page_table[c.group] != NO_PAGE && coarse_enough && (self_error <= frame.lod_threshold || !finer_resident);

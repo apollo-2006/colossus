@@ -37,11 +37,11 @@ void main() {
             const float s = inst.scale;
             draw = lod_test(inst, c, wants_finer, self_error);
             const vec3 center = to_world(inst, c.center);
-            const float r = c.radius * s;
+            const float r = (c.radius + deform_reach_of(inst)) * s;
             if (draw && (frame.flags & flag_frustum_culling) != 0u) draw = sphere_in_frustum(center, r);
             // all triangles face away when the view direction lies in the cone:
-            // include/dag.hpp.
-            if (draw && (frame.flags & flag_cone_culling) != 0u && c.cone_cutoff < 1.0) {
+            // include/dag.hpp. (a deforming instance's normals turn: no cone.)
+            if (draw && (frame.flags & flag_cone_culling) != 0u && c.cone_cutoff < 1.0 && !deforming(inst)) {
                 const vec3 axis = normalize(to_world_dir(inst, c.cone_axis));
                 const vec3 view = center - frame.cull_origin.xyz;
                 if (dot(view, axis) >= c.cone_cutoff * length(view) + r) draw = false;
@@ -63,7 +63,7 @@ void main() {
             cluster_id = ic.y;
             const Instance inst = load_instance(instance_id);
             const Cluster c = load_cluster(cluster_id);
-            draw = !occluded(to_world(inst, c.center), c.radius * inst.scale);
+            draw = !occluded(to_world(inst, c.center), (c.radius + deform_reach_of(inst)) * inst.scale);
             hidden = !draw;
             if (draw) lod_test(inst, c, wants_finer, self_error);
         }
@@ -101,7 +101,7 @@ void main() {
         vec3 vc = (frame.view * vec4(to_world(inst, c.center), 1.0)).xyz;
         vc.z = -vc.z;
         vec4 aabb;
-        if (project_sphere(vc, c.radius * inst.scale, aabb)) {
+        if (project_sphere(vc, (c.radius + deform_reach_of(inst)) * inst.scale, aabb)) {
             const vec2 size = (aabb.zw - aabb.xy) * vec2(frame.width, frame.height);
             software = max(size.x, size.y) < frame.sw_max_pixels;
         }

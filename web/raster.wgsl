@@ -39,7 +39,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) local: u32) -> Ve
   }
   let packed = cluster_triangle(c, tri);
   let inst = load_instance(v.x);
-  let p = cluster_position(c, meshes[inst.mesh].grid, (packed >> (8u * (vi % 3u))) & 255u);
+  let p = deform(inst, meshes[inst.mesh].bounds, cluster_position(c, meshes[inst.mesh].grid, (packed >> (8u * (vi % 3u))) & 255u), frame.time);
   out.position = frame.view_proj * vec4f(to_world(inst, p), 1.0);
   return out;
 }

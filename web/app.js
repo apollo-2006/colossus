@@ -39,7 +39,9 @@ export function crowd(n, models, spacing = 1.25) {
       // marks it, bit 8 the direction, low 8 bits the phase. only the middle: a
       // million-strong crowd is not a quarter million moving shadows.
       const middle = Math.abs(x - (n - 1) / 2) < 15 && Math.abs(z - (n - 1) / 2) < 15;
-      const anim = n > 1 && middle && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
+      let anim = n > 1 && middle && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
+      // and some of the rest of the middle sway (deform() in common.wgsl, bit 10).
+      if (n > 1 && middle && !anim && motionRand() < 0.15) anim = 1024 | Math.floor(motionRand() * 256);
       out.push({ model: (z * n + x) % models, scale, material, anim, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
     }
   // in cells of 8 x 8 neighbours, each cell's instances consecutive (the renderer culls cells

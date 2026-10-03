@@ -163,8 +163,9 @@ fn vsm_invalidate(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_i
   let now = load_instance(i);
   let then = load_prev_instance(i);
   let m = meshes[now.mesh];
-  invalidate(to_world(then, m.bounds.xyz), m.bounds.w * now.scale, lane);
-  invalidate(to_world(now, m.bounds.xyz), m.bounds.w * now.scale, lane);
+  let radius = (m.bounds.w + deform_reach_of(now)) * now.scale;
+  invalidate(to_world(then, m.bounds.xyz), radius, lane);
+  invalidate(to_world(now, m.bounds.xyz), radius, lane);
 }
 
 @compute @workgroup_size(64)
@@ -284,14 +285,14 @@ fn vsm_instance(@builtin(global_invocation_id) gid: vec3u) {
   let inst = load_instance(i);
   let m = meshes[inst.mesh];
   let center = vsm_light_space(to_world(inst, m.bounds.xyz)).xy;
-  let radius = m.bounds.w * inst.scale;
+  let radius = (m.bounds.w + deform_reach_of(inst)) * inst.scale;
   let layer = select(VSM_STILL, VSM_MOVING, inst.anim != 0u);
   var levels = atomicLoad(&lists[4u + layer]);
   while (levels != 0u) {
     let level = firstTrailingBit(levels);
     levels &= levels - 1u;
     if (!touches(layer, level, center, radius)) { continue; }
-    let limit = frame.lod_threshold * vsm_texel(level) / inst.scale;
+    let limit = frame.lod_threshold * vsm_texel(level) / (inst.scale * deform_stretch_of(inst));
     var lo = 0u;
     var hi = m.cluster_count;
     while (lo < hi) {
@@ -362,14 +363,15 @@ fn vsm_cluster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
   if (cluster >= m.first_cluster + m.cluster_count) { return; }
   let c = load_cluster(cluster);
   let texel = vsm_texel(level);
-  let self_error = c.lod_error * inst.scale / texel;
-  let coarse_enough = c.parent_error * inst.scale / texel > frame.lod_threshold;
+  let stretch = deform_stretch_of(inst);
+  let self_error = c.lod_error * inst.scale * stretch / texel;
+  let coarse_enough = c.parent_error * inst.scale * stretch / texel > frame.lod_threshold;
   let finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
   let wants_finer = self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
   let loaded = page_table[c.group] != NO_PAGE;
   if (!coarse_enough || (self_error > frame.lod_threshold && finer_resident)) { return; }
   let center = vsm_light_space(to_world(inst, c.center)).xy;
-  let radius = c.radius * inst.scale;
+  let radius = (c.radius + deform_reach_of(inst)) * inst.scale;
   if (!touches(layer, level, center, radius)) { return; }
   // a stand-in, or unloaded: its pages render again next frame (the moving
   // layer does anyway).
@@ -577,7 +579,8 @@ fn vsm_raster(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
   let texel = vsm_texel(level);
   if (t == 0u) { atomicStore(&together_count, 0u); }
   if (valid && t < c.vertex_count) {
-    let p = vsm_light_space(to_world(inst, cluster_position(c, meshes[inst.mesh].grid, t)));
+    let m = meshes[inst.mesh];
+    let p = vsm_light_space(to_world(inst, deform(inst, m.bounds, cluster_position(c, m.grid, t), frame.time)));
     snapped[t] = vec2i(round(p.xy / texel * 16.0));
     depth[t] = p.z;
   }
