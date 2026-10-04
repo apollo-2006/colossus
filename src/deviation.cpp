@@ -4,25 +4,36 @@
 #include <cmath>
 #include <unordered_map>
 
-float point_triangle_distance(vec3 p, vec3 a, vec3 b, vec3 c) {
+namespace {
+
+float squared(vec3 v) { return dot(v, v); }
+
+// the squared distance: comparisons need no square root.
+float point_triangle_distance_squared(vec3 p, vec3 a, vec3 b, vec3 c) {
     const vec3 ab = b - a, ac = c - a, ap = p - a;
     const float d1 = dot(ab, ap), d2 = dot(ac, ap);
-    if (d1 <= 0 && d2 <= 0) return length(p - a);
+    if (d1 <= 0 && d2 <= 0) return squared(p - a);
     const vec3 bp = p - b;
     const float d3 = dot(ab, bp), d4 = dot(ac, bp);
-    if (d3 >= 0 && d4 <= d3) return length(p - b);
+    if (d3 >= 0 && d4 <= d3) return squared(p - b);
     const float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0 && d1 >= 0 && d3 <= 0) return length(p - (a + ab * (d1 / (d1 - d3))));
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) return squared(p - (a + ab * (d1 / (d1 - d3))));
     const vec3 cp = p - c;
     const float d5 = dot(ab, cp), d6 = dot(ac, cp);
-    if (d6 >= 0 && d5 <= d6) return length(p - c);
+    if (d6 >= 0 && d5 <= d6) return squared(p - c);
     const float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0 && d2 >= 0 && d6 <= 0) return length(p - (a + ac * (d2 / (d2 - d6))));
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) return squared(p - (a + ac * (d2 / (d2 - d6))));
     const float va = d3 * d6 - d5 * d4;
     if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0)
-        return length(p - (b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)))));
+        return squared(p - (b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)))));
     const float denom = 1 / (va + vb + vc);
-    return length(p - (a + ab * (vb * denom) + ac * (vc * denom)));
+    return squared(p - (a + ab * (vb * denom) + ac * (vc * denom)));
+}
+
+}  // namespace
+
+float point_triangle_distance(vec3 p, vec3 a, vec3 b, vec3 c) {
+    return std::sqrt(point_triangle_distance_squared(p, a, b, c));
 }
 
 namespace {
@@ -35,12 +46,21 @@ struct triangle_grid {
     float cell = 1;
     int n[3] = {1, 1, 1};
     std::vector<std::vector<uint32_t>> cells;
+    // each triangle's bounding sphere: a query skips a triangle whose sphere is farther than the
+    // best found.
+    std::vector<vec3> centres;
+    std::vector<float> radii;
     // triangles around each vertex, for local searches.
     std::unordered_map<uint32_t, std::vector<uint32_t>> around;
 
     triangle_grid(const std::vector<vec3>& p, const std::vector<uint32_t>& i) : pos(p), idx(i) {
-        for (uint32_t t = 0; t < idx.size() / 3; ++t)
+        for (uint32_t t = 0; t < idx.size() / 3; ++t) {
             for (int k = 0; k < 3; ++k) around[idx[3 * t + k]].push_back(t);
+            const vec3 a = pos[idx[3 * t]], b = pos[idx[3 * t + 1]], c = pos[idx[3 * t + 2]];
+            const vec3 centre = (a + b + c) * (1.0f / 3);
+            centres.push_back(centre);
+            radii.push_back(std::sqrt(std::max({squared(a - centre), squared(b - centre), squared(c - centre)})) * 1.0001f);
+        }
         vec3 hi;
         lo = hi = pos[idx[0]];
         for (uint32_t v : idx) { lo = min(lo, pos[v]); hi = max(hi, pos[v]); }
@@ -67,7 +87,7 @@ struct triangle_grid {
     // distance to the nearest triangle: rings of cells outward until a ring is
     // farther than the best.
     float nearest(vec3 p, uint32_t* which = nullptr) const {
-        float best = INFINITY;
+        float best = INFINITY, best_squared = INFINITY;
         int c[3];
         for (int a = 0; a < 3; ++a) c[a] = coord(p[a], a);
         const int limit = std::max({n[0], n[1], n[2]});
@@ -79,9 +99,12 @@ struct triangle_grid {
                         if (std::max({std::abs(x - c[0]), std::abs(y - c[1]), std::abs(z - c[2])}) != r) continue;
                         if (x < 0 || y < 0 || z < 0 || x >= n[0] || y >= n[1] || z >= n[2]) continue;
                         for (uint32_t t : cells[(size_t(z) * n[1] + y) * n[0] + x]) {
-                            const float d = point_triangle_distance(p, pos[idx[3 * t]], pos[idx[3 * t + 1]], pos[idx[3 * t + 2]]);
-                            if (d < best) {
-                                best = d;
+                            const float reach = best + radii[t];
+                            if (squared(p - centres[t]) > reach * reach) continue;  // its sphere is farther
+                            const float d = point_triangle_distance_squared(p, pos[idx[3 * t]], pos[idx[3 * t + 1]], pos[idx[3 * t + 2]]);
+                            if (d < best_squared) {
+                                best_squared = d;
+                                best = std::sqrt(d);
                                 if (which) *which = t;
                             }
                         }
@@ -93,17 +116,17 @@ struct triangle_grid {
     // distance to the nearest of the seeds' triangles and those around their corners: at least
     // the true distance (so any bound built on it holds), and usually it.
     float nearest_local(vec3 p, const uint32_t (&seeds)[3], uint32_t& which) const {
-        float best = INFINITY;
+        float best_squared = INFINITY;
         for (uint32_t s : seeds)
             for (int k = 0; k < 3; ++k)
                 for (uint32_t t : around.at(idx[3 * s + k])) {
-                    const float d = distance_to(p, t);
-                    if (d < best) {
-                        best = d;
+                    const float d = point_triangle_distance_squared(p, pos[idx[3 * t]], pos[idx[3 * t + 1]], pos[idx[3 * t + 2]]);
+                    if (d < best_squared) {
+                        best_squared = d;
                         which = t;
                     }
                 }
-        return best;
+        return std::sqrt(best_squared);
     }
 
     float distance_to(vec3 p, uint32_t t) const {
