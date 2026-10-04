@@ -22,18 +22,30 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # the web models take about two hours here (proving the error bounds), so they are kept
+      # between runs and built again only when the builder's sources change.
+      - name: Cache the web models
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: web/models
+          key: web-models-${{ hashFiles('src/**', 'include/**', 'tools/**', 'web/build.sh', 'web/split.py', 'Makefile') }}
       - name: Build the builder
+        if: steps.models.outputs.cache-hit != 'true'
         run: make -j"$(nproc)" colossus_build
       # scans are 380 mb from stanford: cache them between runs.
       - uses: actions/cache@v4
+        if: steps.models.outputs.cache-hit != 'true'
         with:
           path: |
             models/lucy.ply
             models/xyzrgb_dragon.ply
           key: stanford-scans-v1
       - name: Download the scans
+        if: steps.models.outputs.cache-hit != 'true'
         run: models/fetch.sh --download-only dragon lucy
       - name: Build the web models
+        if: steps.models.outputs.cache-hit != 'true'
         run: web/build.sh
       - uses: actions/upload-pages-artifact@v3
         with:
