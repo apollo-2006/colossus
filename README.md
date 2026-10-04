@@ -17,11 +17,12 @@ threshold and the crowd size there to play with.
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
 900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
-billion triangles at full detail, drawn at 1920x1080 in 1.33 ms on an rx 9070 xt, soft
-shadows, ambient occlusion, weathered stone and bronze, and antialiasing included. about
+billion triangles at full detail, drawn at 1920x1080 in 1.45 ms on an rx 9070 xt, soft
+shadows, bounce light, ambient occlusion, weathered stone and bronze, and antialiasing
+included. about
 4.8 million triangles reach the screen, from about 20 mb of the 427 mb on disk, each
 cluster provably within a pixel of the original. a million instances (17.6 trillion
-triangles) take 1.63 ms, and instances can move and sway.
+triangles) take 1.79 ms, and instances can move and sway.
 
 ## how it works
 
@@ -102,7 +103,18 @@ triangles) take 1.63 ms, and instances can move and sway.
    `--materials bronze`). sky, reflected and rim light are scaled by
    ground-truth ambient occlusion (`ao.comp`, after jimenez and intel's xegtao): half
    resolution, two slices a pixel rotated each frame for taa to average, reading a small
-   depth chain (`ao_depth.comp`) so far taps stay in cache. 0.08 ms; `--no-ao` or g.
+   depth chain (`ao_depth.comp`) so far taps stay in cache; `--no-ao` or g.
+
+   the same pass gathers bounce light, the light arriving from anything but the sun and
+   sky. the ground is the biggest source: it's shaded analytically and isn't in any
+   depth buffer, so four rays down each pixel's cosine lobe land on it, and each takes
+   the ground's light where it lands, in sun or in a statue's shadow (a hard lookup in
+   the shadow maps). nearby surfaces bounce in screen space: each horizon sample that
+   newly hides part of the sky sends, over that part's cosine weight, the light it showed
+   last frame (taa's history, reprojected, its tone curve undone), so bounces add up over
+   frames. sunlit ground warms the statues' shadow sides and light carries into the folds.
+   0.17 ms; `--no-bounce` or b. ray traced shadows (`--shadows rt`) skip it, since the
+   ground's shadows come from the shadow maps.
 6. **shadows: virtual shadow maps** (`vsm.glsl`, `vsm_*.comp`). the sun's depth lives in
    a clipmap around the camera: 14 levels of 32x32 pages of 128x128 texels, the finest
    texel 1/4096 of a unit and each level's twice the last's, backed by a pool of physical
@@ -183,19 +195,19 @@ last transform, and the shadow maps redraw the pages it crossed.
 
 | instances | moving | shadow maps (soft) | ray traced (hard) |
 |---|---|---|---|
-| 900 | none | 1.34 ms | 1.33 ms |
-| 900 | 1% | 1.42 ms | 1.51 ms |
-| 900 | half | 1.80 ms | 1.42 ms |
-| 90,000 | 1% | 1.73 ms | 1.85 ms |
-| 1,000,000 | none | 1.63 ms | 1.73 ms |
-| 1,000,000 | 1% | 1.81 ms | 1.93 ms |
+| 900 | none | 1.47 ms | 1.35 ms |
+| 900 | 1% | 1.55 ms | 1.53 ms |
+| 900 | half | 1.92 ms | 1.64 ms |
+| 90,000 | 1% | 1.81 ms | 1.90 ms |
+| 1,000,000 | none | 1.79 ms | 1.84 ms |
+| 1,000,000 | 1% | 1.95 ms | 2.00 ms |
 
-the crowd view at 1920x1080, ambient occlusion on in both; runs vary by a few
-hundredths. half the crowd moving is where the shadow maps lose: 450 statues redrawn
+the crowd view at 1920x1080, ambient occlusion on in both and bounce light with the shadow
+maps only; runs vary by a few hundredths. half the crowd moving is where the shadow maps lose: 450 statues redrawn
 into their pages every frame. a ray traced refit on radv costs by the size of the whole
 structure (2.7k entries 0.25 ms, 270k 0.94 ms), so still instances get a structure of
 their own. at a million, occlusion culling is what makes it work: without it the view
-draws 103 million triangles in 2.81 ms.
+draws 103 million triangles in 2.91 ms.
 
 `--deforming f` makes a share of them sway like trees in wind: a bend growing with the
 square of the height and a ripple running up it (`deform()` in `common.glsl`), both
@@ -204,8 +216,8 @@ cluster and cuts stay crack-free, and the bend inverts exactly, which antialiasi
 to find where a point was last frame. the guarantee holds too: the bend's slope is at
 most 0.128, a shear stretching lengths by at most 1.066, so errors are scaled by 1.07
 and every culling sphere grows by the farthest a point moves, a tenth of the radius.
-deforming instances share the moving instances' shadow layer: 1% of the crowd costs 1.43
-ms, a tenth 1.55, half 1.86.
+deforming instances share the moving instances' shadow layer: 1% of the crowd costs 1.55
+ms, a tenth 1.65, half 2.07.
 
 ![lucy, each cluster in its own colour](docs/clusters.png)
 
@@ -262,8 +274,8 @@ or push constants:
 
 the models are trimmed to 4 million triangles at their finest (`--max-triangles`): about
 2.6 mb of gzipped metadata each, up front, and about 55 mb of pages, streamed. in chrome
-on the rx 9070 xt at 1600x813, 900 instances take 1.30 ms of gpu time once streaming
-settles, 2.18 ms with the middle moving and swaying, and a million 2.16 ms. it needs 16
+on the rx 9070 xt at 1600x813, 900 instances take 1.38 ms of gpu time once streaming
+settles, 2.16 ms with the middle moving and swaying, and a million 2.06 ms. it needs 16
 storage buffers per shader stage, which desktop gpus allow. `web/build.sh` builds the models;
 `node tests/web_screenshot.mjs` renders the page headless.
 
@@ -293,7 +305,7 @@ models/fetch.sh            # downloads lucy and the dragon (380 mb) and builds b
 | [ and ] | halve or double the error threshold (1 pixel) |
 | f | freeze culling, then fly out and watch it |
 | c v o r h x | cone culling, frustum culling, occlusion, compute rasterizer, shadows, antialiasing |
-| j g | soft shadows, ambient occlusion |
+| j g b | soft shadows, ambient occlusion, bounce light |
 | t, p | wireframe; print the camera as a `--camera` argument |
 
 `--headless --frames n --screenshot out.png` renders without a window and prints the
@@ -325,20 +337,21 @@ streaming. shading includes shadows and antialiasing.
 
 | camera | frame | culling | raster | pass 2 | shadow pages | shading | triangles |
 |---|---|---|---|---|---|---|---|
-| beside lucy (top image) | 1.33 ms | 0.16 | 0.28 | 0.10 | 0.08 | 0.70 | 4.77m |
-| raised (lod image) | 1.56 ms | 0.11 | 0.39 | 0.09 | 0.09 | 0.88 | 7.44m |
-| ground level | 1.24 ms | 0.15 | 0.23 | 0.12 | 0.08 | 0.67 | 3.85m |
+| beside lucy (top image) | 1.45 ms | 0.16 | 0.27 | 0.10 | 0.07 | 0.86 | 4.77m |
+| raised (lod image) | 1.65 ms | 0.11 | 0.37 | 0.09 | 0.08 | 1.00 | 7.44m |
+| ground level | 1.35 ms | 0.14 | 0.22 | 0.11 | 0.07 | 0.80 | 3.92m |
 
-plain materials: 1.08, 1.27 and 1.02 ms; hard shadows: 1.25, 1.43 and 1.17; no ambient
-occlusion: 1.25, 1.48 and 1.16; no shadows: 1.12, 1.26 and 1.03; ray traced (hard):
-1.32, 1.57 and 1.24; no antialiasing: 1.27, 1.50 and 1.17. the compute rasterizer saves
-0.21 to 0.37 ms. occlusion culling removes 54% of the triangles at ground level (1.42 to
-1.24 ms) and next to nothing from the raised camera, which sees over the crowd.
+no bounce light: 1.28, 1.51 and 1.20 ms; plain materials: 1.23, 1.39 and 1.15; hard
+shadows: 1.38, 1.54 and 1.28; no ambient occlusion (nor bounce light): 1.20, 1.41 and
+1.11; no shadows: 1.15, 1.28 and 1.06; ray traced (hard, no bounce light): 1.34, 1.58 and
+1.25; no antialiasing: 1.33, 1.53 and 1.23. the compute rasterizer saves 0.28 to 0.39
+ms. occlusion culling removes 53% of the triangles at ground level (1.52 to 1.35 ms) and
+next to nothing from the raised camera, which sees over the crowd.
 
 the triangle counts have climbed as the errors got honest: 0.86 million beside lucy
 when errors were quadric estimates, 2.99 million once measured by samples, 4.77 million
 now that both the error and its projection are proven. a threshold of two pixels
-(`--threshold 2`, or ]) draws 2.34 million in 1.21 ms, about the old picture. the commit
+(`--threshold 2`, or ]) draws 2.34 million in 1.35 ms, about the old picture. the commit
 messages have every step's numbers.
 
 ## limitations
@@ -354,7 +367,8 @@ messages have every step's numbers.
   and a page that finds the pool full falls back a level.
 * materials are procedural, chosen per instance: there are no texture maps, since the
   scans have no uvs.
-* there is no global illumination beyond ambient occlusion and the sky.
+* bounce light is one bounce off the ground plus what's on screen: a surface off screen or
+  behind another bounces nothing, and light from the statues doesn't reach the ground.
 
 ## models
 

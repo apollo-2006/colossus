@@ -17,5 +17,5 @@ done
 python3 docs/strip.py docs/materials.png 610 150 380 620 /tmp/colossus_{marble,sandstone,bronze,gold,granite}.png
 rm -f /tmp/colossus_{marble,sandstone,bronze,gold,granite}.png
 python3 docs/recompress.py docs/*.png
-# the web demo's fallback frames, when imagemagick is around.
-if command -v convert >/dev/null; then web/gallery.sh; fi
+# the web demo's fallback frames, when imagemagick or ffmpeg is around.
+if command -v convert >/dev/null || command -v ffmpeg >/dev/null; then web/gallery.sh; fi
