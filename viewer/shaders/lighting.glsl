@@ -30,10 +30,15 @@ vec3 ground_radiance(float lit, float ao) {
 // the ground, lit as it is drawn. rays down a cosine lobe find where they land and whether that
 // spot is in shadow, so the sunlit ground warms what faces it and the ground in a statue's own
 // shadow does not. four rays a pixel, turned each frame for taa to average.
+// the plain ambient: sky above, a fixed grey below.
+vec3 plain_ambient(vec3 n, float ao) {
+    return mix(vec3(0.24, 0.22, 0.2) * 0.42, sky(vec3(0.0, 1.0, 0.0)) * 0.42, n.y * 0.5 + 0.5) * ao;
+}
+
 vec3 ambient_light(vec3 p, vec3 n, float ao, float noise) {
     const vec3 up_light = sky(vec3(0.0, 1.0, 0.0)) * 0.42;
     const uint needs = flag_bounce | flag_vsm | flag_shadows;  // the ground's shadows come from the shadow maps
-    if ((frame.flags & needs) != needs) return mix(vec3(0.24, 0.22, 0.2) * 0.42, up_light, n.y * 0.5 + 0.5) * ao;
+    if ((frame.flags & needs) != needs) return plain_ambient(n, ao);
     const vec3 t = normalize(abs(n.y) < 0.9 ? cross(n, vec3(0, 1, 0)) : cross(n, vec3(1, 0, 0))), b = cross(n, t);
     vec3 sum = vec3(0.0);
     for (uint k = 0u; k < 4u; ++k) {

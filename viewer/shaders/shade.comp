@@ -20,11 +20,11 @@ float occlusion(uvec2 px) {
     return imageLoad(ao_in, min(ivec2(px / 2u), imageSize(ao_in) - 1)).a;
 }
 
-// light from all but the sun at a pixel: ao.comp's, or without it unoccluded here.
-vec3 indirect_light(uvec2 px, vec3 p, vec3 n) {
+// light from all but the sun at a pixel: ao.comp's, or without that pass the plain sky and grey
+// ground (the bounce is computed there, at half resolution: at full here it cost twice as much).
+vec3 indirect_light(uvec2 px, vec3 n) {
     if ((frame.flags & flag_ao) != 0u) return imageLoad(ao_in, min(ivec2(px / 2u), imageSize(ao_in) - 1)).rgb;
-    const float noise = fract(52.9829189 * fract(dot(vec2(px) + float(frame.frame_index % 64u) * 7.123, vec2(0.06711056, 0.00583715))));
-    return ambient_light(p, n, 1.0, noise);
+    return plain_ambient(n, 1.0);
 }
 
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -304,7 +304,7 @@ void main() {
         else if (frame.debug_mode == 7u) m.albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
 
         const float lit = dot(s.n, sun_dir) > 0.0 ? sunlight(px, s) : 0.0;
-        color = shade_material(m, n, -s.dir, lit, ao, wrap, coat, indirect_light(px, s.hit, n));
+        color = shade_material(m, n, -s.dir, lit, ao, wrap, coat, indirect_light(px, n));
         // from behind: no rim light, which would outline every sliver.
         if (!s.behind) color += pow(1.0 - max(dot(n, -s.dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic) * ao;
 
