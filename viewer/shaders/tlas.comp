@@ -1,7 +1,9 @@
 #version 460
 // moves the moving instances in the shadow scene: writes each entry of their
 // top level (one per instance and copy) this frame's transform; main.cpp
-// refits.
+// refits. a swaying instance (deform() in common.glsl) gets its bend's chord as
+// a shear: exact at its foot and top, within 0.03 of its radius between, where
+// the true bend curves (the copies are fixed geometry, so no closer fit).
 #include "common.glsl"
 
 layout(local_size_x = 64) in;
@@ -14,6 +16,20 @@ void main() {
     if (e * 16u >= as_instances.length()) return;
     const uint at = e * 16u;
     const Instance inst = load_instance(as_instances[at + 12u] & 0xffffffu);
+    mat3x4 rows = mat3x4(inst.rows[0], inst.rows[1], inst.rows[2]);
+    if (deforming(inst)) {
+        // p + g (p.y - foot), g the offset at the top over the height: y's column gains L g,
+        // the translation -L g foot.
+        const vec4 bounds = meshes[inst.mesh].bounds;
+        const float foot = bounds.y - bounds.w;
+        vec3 slope;
+        const vec3 g = deform_offset(inst, bounds, bounds.y + bounds.w, frame.time, slope) / (2.0 * bounds.w);
+        for (uint r = 0u; r < 3u; ++r) {
+            const float lg = dot(inst.rows[r].xyz, g);
+            rows[r].y += lg;
+            rows[r].w -= lg * foot;
+        }
+    }
     for (uint r = 0u; r < 3u; ++r)
-        for (uint c = 0u; c < 4u; ++c) as_instances[at + r * 4u + c] = floatBitsToUint(inst.rows[r][c]);
+        for (uint c = 0u; c < 4u; ++c) as_instances[at + r * 4u + c] = floatBitsToUint(rows[r][c]);
 }

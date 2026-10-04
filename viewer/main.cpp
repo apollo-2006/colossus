@@ -90,6 +90,9 @@ const uint32_t vis_frag_spv[] = {
 const uint32_t shade_spv[] = {
 #include "shade.comp.inc"
 };
+const uint32_t ao_rt_spv[] = {
+#include "ao_rt.comp.inc"
+};
 const uint32_t shade_rt_spv[] = {
 #include "shade_rt.comp.inc"
 };
@@ -552,7 +555,7 @@ public:
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
         for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_, cell_cull_,
                             vsm_mark_, vsm_alloc_, vsm_clear_, vsm_args_pipeline_, vsm_instance_, vsm_expand_, vsm_cluster_,
-                            vsm_raster_, ao_pipeline_, ao_depth_pipeline_})
+                            vsm_raster_, ao_pipeline_, ao_rt_pipeline_, ao_depth_pipeline_})
             vkDestroyPipeline(ctx_.device, p, nullptr);
         vkDestroySampler(ctx_.device, sampler_, nullptr);
         for (accel* a : {&tlas_, &tlas_moving_}) {
@@ -883,7 +886,9 @@ public:
             }
             const gpu_push back{0, 0};
             vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof back, &back);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ao_pipeline_);
+            // the ray query variant only for ray traced shadows: it costs 0.05 ms even unused.
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              ao_rt_pipeline_ && !(fr.flags & flag_vsm) ? ao_rt_pipeline_ : ao_pipeline_);
             vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
             compute_barrier(cmd);
         }
@@ -1083,7 +1088,7 @@ private:
     static constexpr uint32_t ao_depth_levels = 4;
     vk::image ao_depth_;                               // ao_depth.comp's chain
     std::array<VkImageView, ao_depth_levels> ao_depth_views_{};
-    VkPipeline ao_pipeline_ = VK_NULL_HANDLE, ao_depth_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline ao_pipeline_ = VK_NULL_HANDLE, ao_rt_pipeline_ = VK_NULL_HANDLE, ao_depth_pipeline_ = VK_NULL_HANDLE;
     VkSampler history_sampler_ = VK_NULL_HANDLE;
     float prev_view_proj_[16] = {};
     float prev_time_ = 0;
@@ -1579,6 +1584,7 @@ private:
         expand_ = compute_pipeline(expand_spv, sizeof expand_spv);
         cell_cull_ = compute_pipeline(cell_cull_spv, sizeof cell_cull_spv);
         ao_pipeline_ = compute_pipeline(ao_spv, sizeof ao_spv);
+        if (ctx_.ray_query) ao_rt_pipeline_ = compute_pipeline(ao_rt_spv, sizeof ao_rt_spv);
         ao_depth_pipeline_ = compute_pipeline(ao_depth_spv, sizeof ao_depth_spv);
         vsm_mark_ = compute_pipeline(vsm_mark_spv, sizeof vsm_mark_spv);
         vsm_alloc_ = compute_pipeline(vsm_alloc_spv, sizeof vsm_alloc_spv);

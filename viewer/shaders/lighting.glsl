@@ -1,5 +1,5 @@
 // light from everything but the sun, shared by shading (shade.comp) and the indirect pass
-// (ao.comp). include after vsm.glsl.
+// (ao.comp). include after vsm.glsl (and, with RAY_QUERY, surface.glsl).
 
 vec3 aces(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -35,10 +35,25 @@ vec3 plain_ambient(vec3 n, float ao) {
     return mix(vec3(0.24, 0.22, 0.2) * 0.42, sky(vec3(0.0, 1.0, 0.0)) * 0.42, n.y * 0.5 + 0.5) * ao;
 }
 
+// sunlight on a ground point, hard edged: from the shadow maps, or a ray at the coarsest shadow
+// copy (a bounce needs no finer).
+float ground_lit(vec3 g) {
+    if ((frame.flags & flag_vsm) != 0u) return vsm_hard_shadow(g, vec3(0.0, 1.0, 0.0), length(g - frame.origin.xyz));
+#ifdef RAY_QUERY
+    return trace_sun(g, vec3(0.0, 1.0, 0.0), 1e-3 + frame.shadow_lod_error[2] * 1.15 * 1.5, 4u);
+#else
+    return 1.0;
+#endif
+}
+
 vec3 ambient_light(vec3 p, vec3 n, float ao, float noise) {
     const vec3 up_light = sky(vec3(0.0, 1.0, 0.0)) * 0.42;
-    const uint needs = flag_bounce | flag_vsm | flag_shadows;  // the ground's shadows come from the shadow maps
-    if ((frame.flags & needs) != needs) return plain_ambient(n, ao);
+#ifdef RAY_QUERY
+    const bool ground_shadows = true;
+#else
+    const bool ground_shadows = (frame.flags & flag_vsm) != 0u;
+#endif
+    if ((frame.flags & (flag_bounce | flag_shadows)) != (flag_bounce | flag_shadows) || !ground_shadows) return plain_ambient(n, ao);
     const vec3 t = normalize(abs(n.y) < 0.9 ? cross(n, vec3(0, 1, 0)) : cross(n, vec3(1, 0, 0))), b = cross(n, t);
     vec3 sum = vec3(0.0);
     for (uint k = 0u; k < 4u; ++k) {
@@ -50,8 +65,7 @@ vec3 ambient_light(vec3 p, vec3 n, float ao, float noise) {
             continue;
         }
         const vec3 g = p + dir * (-p.y / dir.y);
-        const float lit = vsm_hard_shadow(g, vec3(0.0, 1.0, 0.0), length(g - frame.origin.xyz));
-        sum += ground_radiance(lit, 1.0);
+        sum += ground_radiance(ground_lit(g), 1.0);
     }
     return sum * 0.25 * ao;
 }

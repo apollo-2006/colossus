@@ -13,6 +13,7 @@
 // out: rgb the indirect light, a the occlusion.
 #extension GL_EXT_shader_atomic_int64 : require
 #include "common.glsl"
+#include "surface.glsl"
 #include "vsm.glsl"
 #include "lighting.glsl"
 

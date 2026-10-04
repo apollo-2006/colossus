@@ -28,12 +28,17 @@ $(OBJ_DIR)/shaders/%.inc: viewer/shaders/% $(SHADER_INCLUDES)
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -O -mfmt=num -o $@ $<
 
+# ao.comp again, with ray queries (the bounce's ground shadows under --shadows rt).
+$(OBJ_DIR)/shaders/ao_rt.comp.inc: viewer/shaders/ao.comp $(SHADER_INCLUDES)
+	@mkdir -p $(OBJ_DIR)/shaders
+	glslc --target-env=vulkan1.3 -DRAY_QUERY -O -mfmt=num -o $@ $<
+
 # shade.comp again, with ray queries.
 $(OBJ_DIR)/shaders/shade_rt.comp.inc: viewer/shaders/shade.comp $(SHADER_INCLUDES)
 	@mkdir -p $(OBJ_DIR)/shaders
 	glslc --target-env=vulkan1.3 -DRAY_QUERY -O -mfmt=num -o $@ $<
 
-colossus: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(OBJ_DIR)/shaders/shade_rt.comp.inc $(LIB_OBJS)
+colossus: viewer/main.cpp viewer/vk.hpp viewer/png.hpp $(SPIRV) $(OBJ_DIR)/shaders/shade_rt.comp.inc $(OBJ_DIR)/shaders/ao_rt.comp.inc $(LIB_OBJS)
 	$(CXX) $(CXXFLAGS) -Wno-missing-field-initializers $(INCLUDES) -I$(OBJ_DIR)/shaders viewer/main.cpp $(LIB_OBJS) -o $@ -lvulkan -lglfw
 
 tests/builder_test: tests/builder_test.cpp $(LIB_OBJS)
