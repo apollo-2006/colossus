@@ -52,7 +52,7 @@ vec3 level_color(uint level) {
 void main() {
   vec3 n = normalize(v_normal);
   vec3 to_eye = normalize(eye - v_position);
-  if (dot(n, to_eye) < 0.0) n = -n;
+  if (!gl_FrontFacing) n = -n;
   vec3 albedo = mode == 1 ? hash_color(v_info & 0xffffffu)
               : mode == 2 ? level_color(v_info >> 24u)
                           : vec3(0.82, 0.8, 0.76);
@@ -63,6 +63,39 @@ void main() {
   float spec = mode == 0 ? pow(max(dot(n, h), 0.0), 48.0) * 0.25 : 0.0;
   vec3 c = albedo * (diffuse * vec3(1.0, 0.96, 0.9) * 0.85 + sky * 0.55) + spec;
   color = vec4(pow(c, vec3(1.0 / 1.1)), 1.0);
+}`;
+
+// antialiasing after the 4x msaa resolve: fxaa (lottes 2009, the console variant), for thin
+// creases msaa samples cannot hold, which showed as dotted lines along the folds.
+const POST_VERTEX = `#version 300 es
+out vec2 uv;
+void main() {
+  vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+  uv = p * 0.5 + 0.5;
+  gl_Position = vec4(p, 0.0, 1.0);
+}`;
+
+const POST_FRAGMENT = `#version 300 es
+precision highp float;
+in vec2 uv;
+uniform sampler2D image;
+uniform vec2 texel;
+out vec4 color;
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+void main() {
+  vec3 m = texture(image, uv).rgb;
+  float nw = luma(texture(image, uv + vec2(-1.0, -1.0) * texel).rgb), ne = luma(texture(image, uv + vec2(1.0, -1.0) * texel).rgb);
+  float sw = luma(texture(image, uv + vec2(-1.0, 1.0) * texel).rgb), se = luma(texture(image, uv + vec2(1.0, 1.0) * texel).rgb);
+  float lm = luma(m);
+  float lo = min(lm, min(min(nw, ne), min(sw, se))), hi = max(lm, max(max(nw, ne), max(sw, se)));
+  if (hi - lo < max(0.0312, hi * 0.125)) { color = vec4(m, 1.0); return; }
+  vec2 dir = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
+  float reduce = max((nw + ne + sw + se) * 0.03125, 1.0 / 128.0);
+  dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), -8.0, 8.0) * texel;
+  vec3 a = 0.5 * (texture(image, uv - dir / 6.0).rgb + texture(image, uv + dir / 6.0).rgb);
+  vec3 b = a * 0.5 + 0.25 * (texture(image, uv - dir * 0.5).rgb + texture(image, uv + dir * 0.5).rgb);
+  float lb = luma(b);
+  color = vec4(lb < lo || lb > hi ? a : b, 1.0);
 }`;
 
 function compile(gl, type, source) {
@@ -205,8 +238,42 @@ function multiply(a, b) {
 // starts the view in `canvas`, with `ui` its controls and readouts (index.html's #lite). false
 // without webgl2.
 export async function startLite(canvas, ui) {
-  const gl = canvas.getContext('webgl2', { antialias: true });
+  const gl = canvas.getContext('webgl2', { antialias: false });
   if (!gl) return false;
+  // the scene into a 4x multisampled target, resolved into a texture that fxaa reads.
+  const post = gl.createProgram();
+  gl.attachShader(post, compile(gl, gl.VERTEX_SHADER, POST_VERTEX));
+  gl.attachShader(post, compile(gl, gl.FRAGMENT_SHADER, POST_FRAGMENT));
+  gl.linkProgram(post);
+  if (!gl.getProgramParameter(post, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(post));
+  const postLoc = { image: gl.getUniformLocation(post, 'image'), texel: gl.getUniformLocation(post, 'texel') };
+  const samples = Math.min(4, gl.getParameter(gl.MAX_SAMPLES));
+  const fbo = { width: 0, height: 0, msaa: gl.createFramebuffer(), color: gl.createRenderbuffer(), depth: gl.createRenderbuffer(),
+    resolved: gl.createFramebuffer(), texture: gl.createTexture() };
+  const sizeTarget = (width, height) => {
+    if (fbo.width === width && fbo.height === height) return;
+    fbo.width = width;
+    fbo.height = height;
+    gl.bindRenderbuffer(gl.RENDERBUFFER, fbo.color);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, width, height);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, fbo.depth);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, width, height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.msaa);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, fbo.color);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, fbo.depth);
+    // immutable storage, made again at each size (a resolve blit wants formats matched exactly).
+    gl.deleteTexture(fbo.texture);
+    fbo.texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, fbo.texture);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.resolved);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fbo.texture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  };
   const program = gl.createProgram();
   gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX));
   gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAGMENT));
@@ -350,6 +417,8 @@ export async function startLite(canvas, ui) {
     // pages the streamer let go of.
     for (const [p, b] of gpu) if (!streamer.resident(p)) { gl.deleteVertexArray(b.vao); gl.deleteBuffer(b.vbo); gl.deleteBuffer(b.ibo); gpu.delete(p); }
 
+    sizeTarget(width, height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.msaa);
     gl.viewport(0, 0, width, height);
     gl.clearColor(0.62, 0.69, 0.77, 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -384,6 +453,18 @@ export async function startLite(canvas, ui) {
       }
     }
     gl.bindVertexArray(null);
+    // resolve the samples, then fxaa onto the canvas.
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fbo.msaa);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fbo.resolved);
+    gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(post);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fbo.texture);
+    gl.uniform1i(postLoc.image, 0);
+    gl.uniform2f(postLoc.texel, 1 / width, 1 / height);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     cpu += performance.now() - t0;
     frames++;
