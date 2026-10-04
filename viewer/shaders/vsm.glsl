@@ -222,7 +222,7 @@ vec2 vogel(uint k, uint n, float angle) {
 // sizes the penumbra from the gap to the average blocker; under a texel, 2x2 bilinear taps,
 // else vogel taps rotated by `noise` (taa averages them). a tap without a physical page sends
 // the lookup up a level.
-float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
+float vsm_lookup_with(vec3 p, vec3 n, float t, float noise, bool soft, out uint used) {
     for (uint level = vsm_level_for(t, dot(n, sun_dir)); level < vsm_levels; ++level) {
         used = level;
         const float texel = vsm_texel(level);
@@ -242,7 +242,6 @@ float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
         }
         bool complete = true;
         float blockers = 0.0, count = 0.0;
-        const bool soft = (frame.flags & flag_soft_shadows) != 0u;
         for (uint k = 0u; k < vsm_search_taps && complete && soft; ++k) {
             uint stored;
             complete = vsm_texel_depth(level, ivec2(floor(centre + vogel(k, vsm_search_taps, angle) * vsm_max_penumbra)), home, home_phys, home_moving, stored);
@@ -279,6 +278,16 @@ float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
     }
     used = vsm_levels;
     return 1.0;
+}
+
+float vsm_lookup(vec3 p, vec3 n, float t, float noise, out uint used) {
+    return vsm_lookup_with(p, n, t, noise, (frame.flags & flag_soft_shadows) != 0u, used);
+}
+
+// a hard edged lookup, for where a soft edge would not show (the ground's bounce light).
+float vsm_hard_shadow(vec3 p, vec3 n, float t) {
+    uint used;
+    return vsm_lookup_with(p, n, t, 0.0, false, used);
 }
 
 float vsm_shadow(vec3 p, vec3 n, float t, float noise) {

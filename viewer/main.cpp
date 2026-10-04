@@ -201,7 +201,8 @@ constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wirefra
                    flag_moving = 512,  // some instances move: see animate() in common.glsl
                    flag_vsm = 1024,    // virtual shadow maps (vsm.glsl), not rays
                    flag_ao = 2048,     // ambient occlusion (ao.comp)
-                   flag_soft_shadows = 4096;  // contact-hardening penumbras
+                   flag_soft_shadows = 4096,  // contact-hardening penumbras
+                   flag_bounce = 8192;        // light bounced off the ground (ambient_light() in shade.comp)
 // ray traced shadows use the finest cut within each budget; far surfaces use coarser ones
 // (trace_surface() in surface.glsl).
 constexpr size_t shadow_budgets[] = {1u << 18, 1u << 15, 1u << 12};
@@ -640,7 +641,7 @@ public:
             vkUpdateDescriptorSets(ctx_.device, 2, w, 0, nullptr);
         }
         // ambient occlusion, half resolution.
-        ao_ = ctx_.make_image((width + 1) / 2, (height + 1) / 2, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT,
+        ao_ = ctx_.make_image((width + 1) / 2, (height + 1) / 2, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT,
                               VK_IMAGE_ASPECT_COLOR_BIT);
         // its depth chain (ao_depth.comp): half resolution and three halvings.
         VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1077,7 +1078,7 @@ private:
     vk::buffer shadow_mask_;
     VkPipeline taa_ = VK_NULL_HANDLE, expand_ = VK_NULL_HANDLE, cell_cull_ = VK_NULL_HANDLE;
     std::array<vk::image, frames_in_flight> history_;  // slot k writes history_[k], reads the other
-    vk::image ao_;                                     // ao.comp's output, half resolution
+    vk::image ao_;                                     // ao.comp's output, half resolution: indirect light, occlusion
     static constexpr uint32_t ao_depth_levels = 4;
     vk::image ao_depth_;                               // ao_depth.comp's chain
     std::array<VkImageView, ao_depth_levels> ao_depth_views_{};
@@ -1725,7 +1726,7 @@ struct view_state {
     bool frozen = false;
     float threshold = 1;
     uint32_t mode = 0;
-    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster | flag_shadows | flag_taa | flag_ao | flag_soft_shadows;
+    uint32_t flags = flag_cone_culling | flag_frustum_culling | flag_occlusion | flag_software_raster | flag_shadows | flag_taa | flag_ao | flag_soft_shadows | flag_bounce;
     float sw_max_pixels = 32;
     float speed = 1.5f;
     bool looking = false;
@@ -1775,6 +1776,7 @@ void on_key(GLFWwindow* w, int key, int, int action, int) {
     if (key == GLFW_KEY_H) v->flags ^= flag_shadows;
     if (key == GLFW_KEY_X) v->flags ^= flag_taa;
     if (key == GLFW_KEY_G) v->flags ^= flag_ao;
+    if (key == GLFW_KEY_B) v->flags ^= flag_bounce;
     if (key == GLFW_KEY_J) v->flags ^= flag_soft_shadows;
     if (key == GLFW_KEY_0) v->mode = 9;
     if (key == GLFW_KEY_T) v->flags ^= flag_wireframe;
@@ -1872,6 +1874,7 @@ options parse(int argc, char** argv) {
         }
         else if (a == "--no-taa") o.disable |= flag_taa;
         else if (a == "--no-ao") o.disable |= flag_ao;
+        else if (a == "--no-bounce") o.disable |= flag_bounce;
         else if (a == "--hard-shadows") o.disable |= flag_soft_shadows;
         else if (a == "--full-res-shadows") o.full_res_shadows = true;
         else if (a == "--materials") {

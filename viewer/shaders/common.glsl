@@ -108,6 +108,7 @@ const uint flag_full_res_shadows = 128u;  // every pixel traces its own ray
 const uint flag_taa = 256u;
 const uint flag_ao = 2048u;  // ambient occlusion (ao.comp)
 const uint flag_soft_shadows = 4096u;  // contact-hardening penumbras (vsm_lookup())
+const uint flag_bounce = 8192u;  // light bounced off the ground (ambient_light() in shade.comp)
 const uint flag_vsm = 1024u;  // virtual shadow maps (vsm.glsl), not rays
 const uint flag_moving = 512u;  // some instances move: rays also test shadow_moving
 

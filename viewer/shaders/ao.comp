@@ -3,11 +3,22 @@
 // resolution from the visibility buffer's depth. per pixel: two slices, rotated per frame so
 // taa averages them; along each, the highest horizon either side within ao_radius, integrated
 // against the depth-derived normal's cosine lobe. 1 is open, 0 shut.
+//
+// and the light arriving from everything but the sun (indirect light, half resolution being
+// plenty for it): the sky and the ground bounce of ambient_light(), times the occlusion, plus
+// what nearby surfaces bounce. that last is screen space: each horizon sample that newly hides
+// part of the hemisphere sends, over that part's cosine weight, the light it showed last frame
+// (the history, reprojected, its tone curve undone). bounces add up over frames.
+//
+// out: rgb the indirect light, a the occlusion.
 #extension GL_EXT_shader_atomic_int64 : require
 #include "common.glsl"
+#include "vsm.glsl"
+#include "lighting.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 35, r32f) uniform writeonly image2D ao_out;
+layout(set = 0, binding = 35, rgba16f) uniform writeonly image2D ao_out;
+layout(set = 0, binding = 21) uniform sampler2D history;  // last frame's image (taa.comp)
 
 const float ao_radius = 0.25;  // world units
 const uint ao_slices = 2u;
@@ -28,6 +39,16 @@ vec3 view_position(ivec2 q, int level) {
     return ray * texelFetch(ao_depth, q, level).x;
 }
 
+// the light a view-space point showed last frame: reprojected into the history, tone curve
+// undone. black off screen.
+vec3 last_light(mat4 to_world_space, vec3 view_p) {
+    const vec4 clip = frame.prev_view_proj * (to_world_space * vec4(view_p, 1.0));
+    if (clip.w <= 0.0) return vec3(0.0);
+    const vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec3(0.0);
+    return aces_inverse(textureLod(history, uv, 0.0).rgb);
+}
+
 // interleaved gradient noise (jimenez 2014).
 float noise(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
@@ -39,7 +60,7 @@ void main() {
     if (any(greaterThanEqual(half_px, size))) return;
     const vec3 p = view_position(half_px, 0);
     if (-p.z > 1e4) {
-        imageStore(ao_out, half_px, vec4(1.0));
+        imageStore(ao_out, half_px, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
     // normal from depth: the smaller difference either side, so edges don't smear.
@@ -51,9 +72,17 @@ void main() {
     const vec3 v = normalize(-p);
     if (dot(n, v) < 0.0) n = -n;
 
+    // world space, for the ground's bounce and reading last frame.
+    const mat4 to_world_space = inverse(frame.view);
+    const vec3 world_p = (to_world_space * vec4(p, 1.0)).xyz, world_n = normalize(mat3(to_world_space) * n);
+    // bounced off nearby surfaces: needs last frame's image to fit this one.
+    const bool bounce = (frame.flags & flag_bounce) != 0u && frame.taa_valid != 0u;
+    vec3 bounced = vec3(0.0);
+
     const float radius_px = min(ao_radius * frame.lod_scale / max(-p.z, frame.near_z), 96.0);
+    const float sky_noise = noise(vec2(half_px) + float(frame.frame_index % 64u) * 3.17);
     if (radius_px < 1.0) {
-        imageStore(ao_out, half_px, vec4(1.0));
+        imageStore(ao_out, half_px, vec4(ambient_light(world_p, world_n, 1.0, sky_noise), 1.0));
         return;
     }
     const float falloff_range = 0.615 * ao_radius;
@@ -75,6 +104,9 @@ void main() {
         const float angle_n = sign(dot(ortho, projected)) * acos(cos_n);
         float horizon0 = cos(angle_n + pi * 0.5), horizon1 = cos(angle_n - pi * 0.5);
         const float low0 = horizon0, low1 = horizon1;
+        // the visible cosine weight from the normal to a horizon at angle a (gtao's integral).
+        #define ARC(a) ((cos_n + 2.0 * (angle_n + clamp((a) - angle_n, -pi * 0.5, pi * 0.5)) * sin(angle_n) - \
+                         cos(2.0 * (angle_n + clamp((a) - angle_n, -pi * 0.5, pi * 0.5)) - angle_n)) * 0.25)
         for (uint step = 0u; step < ao_steps; ++step) {
             // quadratic spacing, dense near the pixel; in half-resolution texels, far taps on
             // coarser levels.
@@ -87,8 +119,17 @@ void main() {
             const float d0 = length(h0), d1 = length(h1);
             const float w0 = clamp(d0 * falloff_mul + falloff_add, 0.0, 1.0);
             const float w1 = clamp(d1 * falloff_mul + falloff_add, 0.0, 1.0);
-            horizon0 = max(horizon0, mix(low0, dot(h0 / max(d0, 1e-6), v), w0));
-            horizon1 = max(horizon1, mix(low1, dot(h1 / max(d1, 1e-6), v), w1));
+            const float c0 = mix(low0, dot(h0 / max(d0, 1e-6), v), w0), c1 = mix(low1, dot(h1 / max(d1, 1e-6), v), w1);
+            if (bounce && c0 > horizon0) {
+                const float hidden = abs(ARC(acos(clamp(horizon0, -1.0, 1.0))) - ARC(acos(clamp(c0, -1.0, 1.0))));
+                bounced += projected_length * hidden * last_light(to_world_space, p + h0);
+            }
+            if (bounce && c1 > horizon1) {
+                const float hidden = abs(ARC(-acos(clamp(horizon1, -1.0, 1.0))) - ARC(-acos(clamp(c1, -1.0, 1.0))));
+                bounced += projected_length * hidden * last_light(to_world_space, p + h1);
+            }
+            horizon0 = max(horizon0, c0);
+            horizon1 = max(horizon1, c1);
         }
         float a0 = -acos(clamp(horizon1, -1.0, 1.0)), a1 = acos(clamp(horizon0, -1.0, 1.0));
         a0 = angle_n + clamp(a0 - angle_n, -pi * 0.5, pi * 0.5);
@@ -97,5 +138,9 @@ void main() {
         const float arc1 = (cos_n + 2.0 * a1 * sin(angle_n) - cos(2.0 * a1 - angle_n)) * 0.25;
         visibility += projected_length * (arc0 + arc1);
     }
-    imageStore(ao_out, half_px, vec4(pow(clamp(visibility / float(ao_slices), 0.0, 1.0), ao_power)));
+    const float ao = pow(clamp(visibility / float(ao_slices), 0.0, 1.0), ao_power);
+    // the bounce at the scale ambient light is drawn at (the sky's 0.42 in ambient_light()): at
+    // full strength it fed back over frames until shadow sides lost their shape.
+    const vec3 indirect = ambient_light(world_p, world_n, ao, sky_noise) + bounced * (0.42 / float(ao_slices));
+    imageStore(ao_out, half_px, vec4(indirect, ao));
 }

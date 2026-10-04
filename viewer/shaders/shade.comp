@@ -10,13 +10,21 @@
 #include "common.glsl"
 #include "surface.glsl"
 #include "vsm.glsl"
+#include "lighting.glsl"
 
-layout(set = 0, binding = 35, r32f) uniform readonly image2D ao_in;  // ao.comp, half resolution
+layout(set = 0, binding = 35, rgba16f) uniform readonly image2D ao_in;  // ao.comp, half resolution
 
 // ambient occlusion at a full-resolution pixel: the half-resolution texel over it.
 float occlusion(uvec2 px) {
     if ((frame.flags & flag_ao) == 0u) return 1.0;
-    return imageLoad(ao_in, min(ivec2(px / 2u), imageSize(ao_in) - 1)).x;
+    return imageLoad(ao_in, min(ivec2(px / 2u), imageSize(ao_in) - 1)).a;
+}
+
+// light from all but the sun at a pixel: ao.comp's, or without it unoccluded here.
+vec3 indirect_light(uvec2 px, vec3 p, vec3 n) {
+    if ((frame.flags & flag_ao) != 0u) return imageLoad(ao_in, min(ivec2(px / 2u), imageSize(ao_in) - 1)).rgb;
+    const float noise = fract(52.9829189 * fract(dot(vec2(px) + float(frame.frame_index % 64u) * 7.123, vec2(0.06711056, 0.00583715))));
+    return ambient_light(p, n, 1.0, noise);
 }
 
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -159,11 +167,6 @@ Detail surface_detail(Material m, uint kind, vec3 q, float pixel, float ao, floa
     return d;
 }
 
-vec3 sky(vec3 dir) {
-    const float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    return mix(vec3(0.66, 0.68, 0.71), vec3(0.3, 0.42, 0.62), pow(t, 0.7)) * 0.9;
-}
-
 vec3 hash_color(uint x) {
     const uint h = hash(x);
     return vec3(float(h & 255u), float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0 * 0.8 + 0.1;
@@ -175,10 +178,6 @@ vec3 level_color(uint level) {
     const float h = 0.66 - 0.055 * float(min(level, 16u));
     const vec3 k = abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
     return mix(vec3(1.0), clamp(k - 1.0, 0.0, 1.0), 0.75) * 0.85;
-}
-
-vec3 aces(vec3 x) {
-    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
 vec2 to_pixel(vec3 world) {
@@ -217,8 +216,9 @@ float sunlight(uvec2 px, Surface s) {
 }
 
 // lambert plus ggx specular, schlick fresnel, smith shadowing.
-// wrap: light bleeding past the terminator; coat: a clear polish lobe over the rest.
-vec3 shade_material(Material m, vec3 n, vec3 v, float lit, float ao, float wrap, float coat) {
+// wrap: light bleeding past the terminator; coat: a clear polish lobe over the rest. ambient:
+// the light arriving from everywhere but the sun (ambient_light()).
+vec3 shade_material(Material m, vec3 n, vec3 v, float lit, float ao, float wrap, float coat, vec3 ambient) {
     const vec3 f0 = mix(vec3(0.04), m.albedo, m.metallic);
     const float nl = max(dot(n, sun_dir), 0.0), nv = max(dot(n, v), 1e-4);
     const float nl_wrap = max((dot(n, sun_dir) + wrap) / (1.0 + wrap), 0.0);
@@ -232,7 +232,6 @@ vec3 shade_material(Material m, vec3 n, vec3 v, float lit, float ao, float wrap,
     // times pi: the diffuse term drops its 1 / pi.
     const vec3 specular = 3.14159 * d * g * fresnel / max(4.0 * nl * nv, 1e-4);
     const vec3 diffuse = m.albedo * (1.0 - m.metallic) * (1.0 - fresnel);
-    const vec3 ambient = mix(vec3(0.24, 0.22, 0.2), sky(vec3(0, 1, 0)), n.y * 0.5 + 0.5) * 0.42 * ao;
     // sky in the reflection, fading with roughness.
     const vec3 env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
     const vec3 env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8 * ao;
@@ -261,8 +260,8 @@ void main() {
         // ground: y = 0 with a faint grid, fading into the sky.
         const vec2 cell = abs(fract(s.hit.xz * 0.5) - 0.5);
         const float line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
-        const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) *
-                            (sun_color * max(sun_dir.y, 0.0) * 0.6 * sunlight(px, s) + sky(vec3(0, 1, 0)) * 0.45 * occlusion(px));
+        const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) / ground_albedo *
+                            ground_radiance(sunlight(px, s), occlusion(px));
         color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
     }
     if (s.kind != surface_sky && frame.debug_mode == 9u) {
@@ -305,7 +304,7 @@ void main() {
         else if (frame.debug_mode == 7u) m.albedo = vid >= pass_start[2] ? vec3(0.95, 0.45, 0.1) : vec3(0.15, 0.45, 0.95);
 
         const float lit = dot(s.n, sun_dir) > 0.0 ? sunlight(px, s) : 0.0;
-        color = shade_material(m, n, -s.dir, lit, ao, wrap, coat);
+        color = shade_material(m, n, -s.dir, lit, ao, wrap, coat, indirect_light(px, s.hit, n));
         // from behind: no rim light, which would outline every sliver.
         if (!s.behind) color += pow(1.0 - max(dot(n, -s.dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic) * ao;
 
