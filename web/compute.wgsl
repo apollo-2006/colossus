@@ -54,12 +54,18 @@ struct PassInfo {
 // depth pyramid: level 0 half the screen, each texel the farthest (smallest,
 // reversed) depth it covers.
 @group(2) @binding(5) var hzb: texture_2d<f32>;
-@group(2) @binding(13) var ao_image: texture_2d<f32>;  // ao.wgsl, half resolution
+@group(2) @binding(13) var ao_image: texture_2d<f32>;  // ao.wgsl, half resolution: indirect light, occlusion
 
 // ambient occlusion over a full-resolution pixel.
 fn occlusion(px: vec2u) -> f32 {
   if ((frame.flags & FLAG_AO) == 0u) { return 1.0; }
-  return textureLoad(ao_image, min(px / 2u, textureDimensions(ao_image) - 1u), 0).x;
+  return textureLoad(ao_image, min(px / 2u, textureDimensions(ao_image) - 1u), 0).a;
+}
+
+// light from all but the sun: ao.wgsl's (sky, ground bounce, nearby bounce), or the plain one.
+fn indirect_light(px: vec2u, n: vec3f) -> vec3f {
+  if ((frame.flags & FLAG_AO) == 0u) { return plain_ambient(n, 1.0); }
+  return textureLoad(ao_image, min(px / 2u, textureDimensions(ao_image) - 1u), 0).rgb;
 }
 // building it: the level below, the level written.
 @group(2) @binding(6) var hzb_src: texture_2d<f32>;
@@ -669,14 +675,6 @@ fn sw_id_pass(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index
 // --- shading: the nearer of the hardware and software results, its triangle
 // refetched and hit with the pixel's ray.
 
-const SUN_DIR = normalize(vec3f(0.75, 0.5, 0.3));
-const SUN_COLOR = vec3f(1.0, 0.92, 0.82) * 1.7;
-
-fn sky(dir: vec3f) -> vec3f {
-  let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-  return mix(vec3f(0.66, 0.68, 0.71), vec3f(0.3, 0.42, 0.62), pow(t, 0.7)) * 0.9;
-}
-
 fn hash_color(x: u32) -> vec3f {
   let h = hash(x);
   return vec3f(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0 * 0.8 + 0.1;
@@ -838,7 +836,8 @@ fn surface_detail(m: Material, kind: u32, q: vec3f, pixel: f32, ao: f32, up: f32
 
 // lambert plus ggx specular, schlick fresnel, smith shadowing, sky in the
 // reflection.
-fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32, wrap: f32, coat: f32) -> vec3f {
+// ambient: the light from everything but the sun (indirect_light()).
+fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32, wrap: f32, coat: f32, ambient: vec3f) -> vec3f {
   let f0 = mix(vec3f(0.04), m.albedo, m.metallic);
   let nl = max(dot(n, SUN_DIR), 0.0);
   let nl_wrap = max((dot(n, SUN_DIR) + wrap) / (1.0 + wrap), 0.0);
@@ -855,7 +854,6 @@ fn shade_material(m: Material, n: vec3f, v: vec3f, lit: f32, ao: f32, wrap: f32,
   let fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
   let specular = 3.14159 * d * g * fresnel / max(4.0 * nl * nv, 1e-4);
   let diffuse = m.albedo * (1.0 - m.metallic) * (1.0 - fresnel);
-  let ambient = mix(vec3f(0.24, 0.22, 0.2), sky(vec3f(0.0, 1.0, 0.0)), n.y * 0.5 + 0.5) * 0.42 * ao;
   let env_f = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
   let env = sky(reflect(-v, n)) * env_f * (1.0 - m.roughness) * 0.8 * ao;
   // the coat: ggx at roughness 0.05, fresnel from 0.04.
@@ -979,14 +977,6 @@ fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
   return 1.0;
 }
 
-fn aces(x: vec3f) -> vec3f {
-  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
-}
-
-fn srgb(c: vec3f) -> vec3f {
-  return select(1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055, 12.92 * c, c <= vec3f(0.0031308));
-}
-
 @compute @workgroup_size(8, 8)
 fn shade(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= frame.width || gid.y >= frame.height) { return; }
@@ -1028,8 +1018,8 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       let hit = origin + dir * t;
       let cell = abs(fract(hit.xz * 0.5) - 0.5);
       let line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
-      let ground = mix(vec3f(0.42, 0.4, 0.37), vec3f(0.33, 0.31, 0.29), line) *
-                   (SUN_COLOR * SUN_DIR.y * 0.6 * sunlight(hit, vec3f(0.0, 1.0, 0.0), shadow_noise(gid.xy)) + sky(vec3f(0.0, 1.0, 0.0)) * 0.45 * occlusion(gid.xy));
+      let ground = mix(vec3f(0.42, 0.4, 0.37), vec3f(0.33, 0.31, 0.29), line) / GROUND_ALBEDO *
+                   ground_radiance(sunlight(hit, vec3f(0.0, 1.0, 0.0), shadow_noise(gid.xy)), occlusion(gid.xy));
       color = mix(ground, color, 1.0 - exp(-t * 0.012));
     }
   } else {
@@ -1100,7 +1090,7 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     }
     let hit = origin + dir * t;
     let lit = select(0.0, sunlight(hit, geometric_n, shadow_noise(gid.xy)), dot(geometric_n, SUN_DIR) > 0.0);
-    color = shade_material(m, n, -dir, lit, ao, wrap, coat);
+    color = shade_material(m, n, -dir, lit, ao, wrap, coat, indirect_light(gid.xy, n));
     if (!behind) { color += pow(1.0 - max(dot(n, -dir), 0.0), 4.0) * 0.25 * sky(n) * (1.0 - m.metallic) * ao; }
     color = mix(color, sky(dir), 1.0 - exp(-t * 0.012));
   }

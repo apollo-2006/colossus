@@ -22,7 +22,7 @@ const VSM_WORK_WORDS = 2359300 + 2 * 1048576;  // VW_VISIBLE + 2 * VSM_MAX_VISIB
 const FLAG_MOVING = 256;
 
 export const FLAG_CONE = 1, FLAG_FRUSTUM = 2, FLAG_SOFTWARE = 4, FLAG_SHADOWS = 16, FLAG_OCCLUSION = 32, FLAG_AO = 512,
-  FLAG_SOFT_SHADOWS = 1024;
+  FLAG_SOFT_SHADOWS = 1024, FLAG_BOUNCE = 2048;
 export const FLAG_TAA = 128;  // cpu only
 const FLAG_PREV_VALID = 64;
 
@@ -64,9 +64,10 @@ export class Renderer {
     r.format = navigator.gpu.getPreferredCanvasFormat();
     r.context?.configure({ device, format: r.format, alphaMode: 'opaque' });
     const common = await source('common.wgsl') + await source('vsm_common.wgsl');
-    r.computeModule = device.createShaderModule({ code: common + await source('compute.wgsl') });
+    const lighting = await source('lighting.wgsl');
+    r.computeModule = device.createShaderModule({ code: common + lighting + await source('compute.wgsl') });
     r.vsmModule = device.createShaderModule({ code: common + await source('vsm.wgsl') });
-    r.aoModule = device.createShaderModule({ code: common + await source('ao.wgsl') });
+    r.aoModule = device.createShaderModule({ code: common + lighting + await source('ao.wgsl') });
     r.rasterModule = device.createShaderModule({ code: common + await source('raster.wgsl') });
     for (const m of [r.computeModule, r.rasterModule, r.vsmModule, r.aoModule]) {
       const info = await m.getCompilationInfo();
@@ -179,7 +180,11 @@ export class Renderer {
         { binding: 1, visibility: C, buffer: { type: 'read-only-storage' } }, r32(2)],
     });
     this.aoDownLayout = d.createBindGroupLayout({ entries: [r32(2), unfilterable(3)] });
-    this.aoLayout = d.createBindGroupLayout({ entries: [unfilterable(4), r32(5)] });
+    this.aoLayout = d.createBindGroupLayout({
+      entries: [unfilterable(4), { binding: 5, visibility: C, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+        { binding: 6, visibility: C, buffer: { type: 'read-only-storage' } }, { binding: 7, visibility: C, buffer: { type: 'read-only-storage' } },
+        { binding: 8, visibility: C, texture: { sampleType: 'float' } }, { binding: 9, visibility: C, sampler: { type: 'filtering' } }],
+    });
     const aoPipeline = (entryPoint, layout) => d.createComputePipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, layout] }),
       compute: { module: this.aoModule, entryPoint, constants: { VSM_SIDE: this.vsmSide } },
@@ -414,7 +419,8 @@ export class Renderer {
     const level = (l) => this.hzb.createView({ baseMipLevel: l, mipLevelCount: 1 });
     // ambient occlusion: its half-resolution output and depth chain (four levels).
     const aw = Math.ceil(width / 2), ah = Math.ceil(height / 2);
-    this.aoImage = d.createTexture({ size: [aw, ah], format: 'r32float', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING });
+    // indirect light and occlusion.
+    this.aoImage = d.createTexture({ size: [aw, ah], format: 'rgba16float', usage: T.STORAGE_BINDING | T.TEXTURE_BINDING });
     this.aoDepth = d.createTexture({ size: [aw, ah], format: 'r32float', mipLevelCount: 4, usage: T.STORAGE_BINDING | T.TEXTURE_BINDING });
     const aoLevel = (l) => this.aoDepth.createView({ baseMipLevel: l, mipLevelCount: 1 });
     this.aoFirstGroup = d.createBindGroup({
@@ -425,9 +431,13 @@ export class Renderer {
     this.aoDownGroups = [1, 2, 3].map((l) => d.createBindGroup({
       layout: this.aoDownLayout, entries: [{ binding: 2, resource: aoLevel(l) }, { binding: 3, resource: aoLevel(l - 1) }],
     }));
-    this.aoGroup = d.createBindGroup({
-      layout: this.aoLayout, entries: [{ binding: 4, resource: this.aoDepth.createView() }, { binding: 5, resource: this.aoImage.createView() }],
-    });
+    // by frame parity, as taa's: last frame's image is the history taa reads this frame.
+    this.aoGroups = [0, 1].map((k) => d.createBindGroup({
+      layout: this.aoLayout,
+      entries: [{ binding: 4, resource: this.aoDepth.createView() }, { binding: 5, resource: this.aoImage.createView() },
+        { binding: 6, resource: { buffer: this.vsmEntries } }, { binding: 7, resource: { buffer: this.vsmAtlas } },
+        { binding: 8, resource: this.history[1 - k].createView() }, { binding: 9, resource: this.historySampler }],
+    }));
     this.hzbGroups = [];
     for (let l = 0; l < this.hzbLevels; l++)
       this.hzbGroups.push(d.createBindGroup({
@@ -662,7 +672,7 @@ export class Renderer {
         ap.dispatchWorkgroups(Math.ceil(Math.max(1, aw >> (k + 1)) / 8), Math.ceil(Math.max(1, ah >> (k + 1)) / 8));
       });
       ap.setPipeline(this.aoPass);
-      ap.setBindGroup(1, this.aoGroup);
+      ap.setBindGroup(1, this.aoGroups[this.frameIndex & 1]);
       ap.dispatchWorkgroups(Math.ceil(aw / 8), Math.ceil(ah / 8));
       ap.end();
     }
