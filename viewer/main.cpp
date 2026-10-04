@@ -218,6 +218,7 @@ struct options {
     bool headless = false, validate = false, vsync = true;
     int frames = 0;  // headless: frames drawn and timed
     std::string screenshot;
+    std::string record;  // headless: every frame after the warmup as DIR/frame_NNNNN.png
     float threshold = 1.0f;
     uint32_t mode = 0;
     bool camera_set = false;
@@ -1854,6 +1855,7 @@ options parse(int argc, char** argv) {
         else if (a == "--headless") o.headless = true;
         else if (a == "--frames") o.frames = std::stoi(next());
         else if (a == "--screenshot") o.screenshot = next();
+        else if (a == "--record") o.record = next();
         else if (a == "--threshold") o.threshold = std::stof(next());
         else if (a == "--mode") o.mode = std::min<uint32_t>(std::stoul(next()), mode_count - 1);
         else if (a == "--validate") o.validate = true;
@@ -1964,7 +1966,7 @@ int main(int argc, char** argv) {
                 const bool last = i == total - 1;
                 // time at 60 frames a second, so motion repeats run to run.
                 auto res = r.draw(frame_data(v, opt.width, opt.height, i / 60.0f), VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                  last && !opt.screenshot.empty());
+                                  (last && !opt.screenshot.empty()) || (!opt.record.empty() && i >= opt.warmup && i < total));
                 streamed += res.streaming.bytes_loaded;
                 evicted += res.streaming.evicted;
                 reads += res.streaming.reads;
@@ -1983,6 +1985,11 @@ int main(int argc, char** argv) {
                     settled_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_start).count();
                 }
                 if (res.valid && i >= opt.warmup + 2) results.push_back(res);
+                if (!opt.record.empty() && i >= opt.warmup && i < total) {
+                    char name[32];
+                    std::snprintf(name, sizeof name, "/frame_%05d.png", i - opt.warmup);
+                    png::write_rgb(opt.record + name, opt.width, opt.height, r.read_pixels());
+                }
                 if (last && !opt.screenshot.empty()) {
                     png::write_rgb(opt.screenshot, opt.width, opt.height, r.read_pixels());
                     std::printf("wrote %s\n", opt.screenshot.c_str());

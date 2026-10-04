@@ -267,9 +267,10 @@ or push constants:
   streamer, every cluster taking the same lod test on the cpu (no crowd, compute
   rasterizer or shadows), with the cluster and lod views and the error slider. below it,
   frames from the native viewer (`web/gallery/`, from `docs/` by `web/gallery.sh`), and
-  `web/flythrough.mp4` above them if there is one: a capture of
-  either renderer, made small with `ffmpeg -i capture.mkv -vf scale=1280:-2 -c:v libx264
-  -crf 26 -preset slow -an -movflags +faststart web/flythrough.mp4`. `?fallback` shows it
+  `web/flythrough.mp4` above them: 6.6 s through the crowd, recorded with
+  `--fly 0.06 --record dir` and made small with `ffmpeg -framerate 60 -i dir/frame_%05d.png
+  -vf scale=1280:-2 -c:v libx264 -crf 26 -preset slow -pix_fmt yuv420p -an -movflags
+  +faststart web/flythrough.mp4`. `?fallback` shows it
   anywhere.
 
 the models are trimmed to 4 million triangles at their finest (`--max-triangles`): about
@@ -309,7 +310,8 @@ models/fetch.sh            # downloads lucy and the dragon (380 mb) and builds b
 | t, p | wireframe; print the camera as a `--camera` argument |
 
 `--headless --frames n --screenshot out.png` renders without a window and prints the
-median frame's timings. `docs/shots.sh` renders the images on this page.
+median frame's timings; `--record dir` saves every frame after the warmup, for a video.
+`docs/shots.sh` renders the images on this page.
 
 ## tests
 
