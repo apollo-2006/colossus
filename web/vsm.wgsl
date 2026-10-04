@@ -133,14 +133,31 @@ fn render_new(slot: u32) {
   if ((frame.flags & FLAG_MOVING) != 0u) { render(slot, VSM_MOVING); }
 }
 
-fn invalidate(world_center: vec3f, radius: f32, lane: u32) {
+// the fastest any point of a moving instance goes (world units a second), as vsm_alloc.comp's.
+fn mover_speed(inst: Instance, m: Mesh) -> f32 {
+  var speed = 0.0;
+  if ((inst.anim & 512u) != 0u) {
+    let origin = vec3f(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
+    speed += 0.7 * (length(to_world(inst, m.bounds.xyz) - origin) + (m.bounds.w + deform_reach_of(inst)) * inst.scale) + 0.18;
+  }
+  if (deforming(inst)) { speed += (1.3 * DEFORM_A + 2.2 * DEFORM_B) * m.bounds.w * inst.scale; }
+  return speed;
+}
+
+// marks the moving layer of the pages a sphere covers; at a coarse level only every k frames,
+// k the frames the mover takes to move half a texel, over the sphere grown by that much.
+fn invalidate(world_center: vec3f, radius: f32, speed: f32, lane: u32) {
   let center = vsm_light_space(world_center).xy;
   let half = vec2i(i32(VSM_WINDOW / 2u));
+  let step = speed * max(frame.time - frame.prev_time, 1e-4);
   for (var level = 0u; level < VSM_LEVELS; level++) {
+    let every = u32(clamp(floor(0.5 * vsm_texel(level) / max(step, 1e-9)), 1.0, 8.0));
+    if (frame.frame_index % every != 0u) { continue; }
+    let reach = radius + step * f32(every);
     let size = vsm_texel(level) * f32(VSM_PAGE);
     let c = vsm_center(level);
-    let lo = max(vec2i(floor((center - radius) / size)), c - half);
-    let hi = min(vec2i(floor((center + radius) / size)), c + half - 1);
+    let lo = max(vec2i(floor((center - reach) / size)), c - half);
+    let hi = min(vec2i(floor((center + reach) / size)), c + half - 1);
     if (any(lo > hi)) { continue; }
     let width = u32(hi.x - lo.x + 1);
     let count = width * u32(hi.y - lo.y + 1);
@@ -164,8 +181,9 @@ fn vsm_invalidate(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_i
   let then = load_prev_instance(i);
   let m = meshes[now.mesh];
   let radius = (m.bounds.w + deform_reach_of(now)) * now.scale;
-  invalidate(to_world(then, m.bounds.xyz), radius, lane);
-  invalidate(to_world(now, m.bounds.xyz), radius, lane);
+  let speed = mover_speed(now, m);
+  invalidate(to_world(then, m.bounds.xyz), radius, speed, lane);
+  invalidate(to_world(now, m.bounds.xyz), radius, speed, lane);
 }
 
 @compute @workgroup_size(64)

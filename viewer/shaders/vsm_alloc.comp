@@ -41,14 +41,35 @@ void render_new(uint slot) {
     if ((frame.flags & flag_moving) != 0u) render(slot, vsm_moving);
 }
 
-void invalidate(vec3 world_center, float radius, uint lane) {
+// the fastest any point of a moving instance goes, world units a second: animate()'s turn (0.7
+// rad/s about its origin) and drift (0.2 round a circle at 0.9 rad/s), deform()'s sway and
+// ripple (at most 1.3 a + 2.2 b of the radius a second).
+float mover_speed(Instance inst, Mesh m) {
+    float speed = 0.0;
+    if ((inst.anim & 512u) != 0u) {
+        const vec3 origin = vec3(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
+        speed += 0.7 * (length(to_world(inst, m.bounds.xyz) - origin) + (m.bounds.w + deform_reach_of(inst)) * inst.scale) + 0.18;
+    }
+    if (deforming(inst)) speed += (1.3 * deform_a + 2.2 * deform_b) * m.bounds.w * inst.scale;
+    return speed;
+}
+
+// marks the moving layer of the pages a sphere covers for redrawing. a coarse level's texels are
+// wide against a frame's movement, so there it marks only every k frames, k the frames the mover
+// takes to move half a texel (at most 8), over the sphere grown by that much: what a page shows
+// is never more than half a texel behind.
+void invalidate(vec3 world_center, float radius, float speed, uint lane) {
     const vec2 center = vsm_light_space(world_center).xy;
     const ivec2 window = ivec2(vsm_window / 2u);
+    const float step = speed * max(frame.time - frame.prev_time, 1e-4);  // per frame
     for (uint level = 0u; level < vsm_levels; ++level) {
+        const uint every = uint(clamp(floor(0.5 * vsm_texel(level) / max(step, 1e-9)), 1.0, 8.0));
+        if (frame.frame_index % every != 0u) continue;
+        const float reach = radius + step * float(every);
         const float size = vsm_texel(level) * float(vsm_page);
         const ivec2 c = vsm_center(level);
-        const ivec2 lo = max(ivec2(floor((center - radius) / size)), c - window);
-        const ivec2 hi = min(ivec2(floor((center + radius) / size)), c + window - 1);
+        const ivec2 lo = max(ivec2(floor((center - reach) / size)), c - window);
+        const ivec2 hi = min(ivec2(floor((center + reach) / size)), c + window - 1);
         if (any(greaterThan(lo, hi))) continue;
         const uint width = uint(hi.x - lo.x + 1), count = width * uint(hi.y - lo.y + 1);
         for (uint k = lane; k < count; k += 64u) {
@@ -70,8 +91,9 @@ void main() {
         const Instance now = load_instance(i), then = load_prev_instance(i);
         const Mesh m = meshes[now.mesh];
         const float radius = (m.bounds.w + deform_reach_of(now)) * now.scale;
-        invalidate(to_world(then, m.bounds.xyz), radius, gl_LocalInvocationIndex);
-        invalidate(to_world(now, m.bounds.xyz), radius, gl_LocalInvocationIndex);
+        const float speed = mover_speed(now, m);
+        invalidate(to_world(then, m.bounds.xyz), radius, speed, gl_LocalInvocationIndex);
+        invalidate(to_world(now, m.bounds.xyz), radius, speed, gl_LocalInvocationIndex);
     } else if (push.level == 0u) {
         if (k >= vsm_slots) return;
         const VsmEntry e = vsm_entries[k];
