@@ -254,8 +254,8 @@ or push constants:
 * shadows are the viewer's virtual shadow maps, in a module of their own
   (`web/vsm.wgsl`) to keep the bind group small, their indirect arguments in their own
   buffer (a dispatch can't write the buffer it reads arguments from). soft shadows use
-  fewer taps than the viewer; ambient occlusion (`web/ao.wgsl`), materials, deformation
-  and antialiasing match it.
+  fewer taps than the viewer; ambient occlusion and bounce light (`web/ao.wgsl`),
+  materials, deformation and antialiasing match it.
 * cells and their instances are culled with a bind group of their own (the depth
   pyramid, cells, cell lists) in place of the image group's buffers, which keeps every
   stage within 16 storage buffers.
