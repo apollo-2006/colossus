@@ -22,27 +22,35 @@ float occlusion(uvec2 px) {
 
 // light from all but the sun at a pixel: ao.comp's, or without that pass the plain sky and grey
 // ground (the bounce is computed there, at half resolution: at full here it cost twice as much).
+// depth at a full-resolution pixel from the visibility buffer: 0 where nothing drew.
+float pixel_depth(ivec2 px) {
+    px = clamp(px, ivec2(0), ivec2(frame.width, frame.height) - 1);
+    return uintBitsToFloat(uint(vis[px.x + px.y * int(frame.width)] >> 32));
+}
+
 vec3 indirect_light(uvec2 px, vec3 n) {
-    if ((frame.flags & flag_ao) != 0u) return imageLoad(ao_in, min(ivec2(px / 2u), imageSize(ao_in) - 1)).rgb;
-    return plain_ambient(n, 1.0);
+    if ((frame.flags & flag_ao) == 0u) return plain_ambient(n, 1.0);
+    const ivec2 size = imageSize(ao_in), centre = min(ivec2(px / 2u), size - 1);
+    if ((frame.flags & flag_gi_rt) == 0u) return imageLoad(ao_in, centre).rgb;
+    // traced with four rays: a 3x3 of half-resolution texels, weighted by how near each one's
+    // depth is to this pixel's, so it smooths the noise without bleeding across edges.
+    const float z = pixel_depth(ivec2(px));
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            const ivec2 q = clamp(centre + ivec2(x, y), ivec2(0), size - 1);
+            const float zq = pixel_depth(q * 2);
+            const float w = (z == 0.0) == (zq == 0.0) ? exp(-abs(zq - z) / max(0.02 * z, 1e-6)) : 0.0;
+            sum += imageLoad(ao_in, q).rgb * w;
+            total += w;
+        }
+    return total > 0.0 ? sum / total : imageLoad(ao_in, centre).rgb;
 }
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D out_image;
 
-// per instance (Instance::material): albedo, roughness, metalness.
-struct Material {
-    vec3 albedo;
-    float roughness;
-    float metallic;
-};
-const Material materials[6] = Material[](
-    Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0),   // plaster: the plain look
-    Material(vec3(0.66, 0.64, 0.6), 0.3, 0.0),    // polished marble
-    Material(vec3(0.62, 0.5, 0.38), 0.85, 0.0),   // sandstone
-    Material(vec3(0.58, 0.38, 0.22), 0.35, 1.0),  // bronze
-    Material(vec3(1.0, 0.7, 0.27), 0.28, 1.0),    // gold
-    Material(vec3(0.2, 0.2, 0.22), 0.45, 0.0));   // dark granite
 
 // procedural surface detail: the scans have no uvs, so 3d value noise in the model's own space
 // (over its radius: the same on every statue, fixed to moving ones). octaves finer than a pixel
@@ -260,8 +268,11 @@ void main() {
         // ground: y = 0 with a faint grid, fading into the sky.
         const vec2 cell = abs(fract(s.hit.xz * 0.5) - 0.5);
         const float line = smoothstep(0.47, 0.5, max(cell.x, cell.y));
-        const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) / ground_albedo *
-                            ground_radiance(sunlight(px, s), occlusion(px));
+        vec3 ground_light = ground_radiance(sunlight(px, s), occlusion(px));
+        // with --gi rt the ao pass traced what reaches the ground, statues' bounce included.
+        if ((frame.flags & (flag_gi_rt | flag_ao)) == (flag_gi_rt | flag_ao))
+            ground_light = ground_radiance(sunlight(px, s), 0.0) + ground_albedo * indirect_light(px, vec3(0.0, 1.0, 0.0));
+        const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) / ground_albedo * ground_light;
         color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
     }
     if (s.kind != surface_sky && frame.debug_mode == 9u) {

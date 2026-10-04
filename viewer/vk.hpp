@@ -66,6 +66,7 @@ public:
 
     // ray queries, if present: for --shadows rt.
     bool ray_query = false;
+    bool position_fetch = false;  // ray queries can read a hit triangle's vertices (--gi rt)
     PFN_vkCreateAccelerationStructureKHR create_as = nullptr;
     PFN_vkDestroyAccelerationStructureKHR destroy_as = nullptr;
     PFN_vkGetAccelerationStructureBuildSizesKHR as_build_sizes = nullptr;
@@ -355,8 +356,13 @@ private:
         qci.pQueuePriorities = &priority;
 
         ray_query = has(gpu, ray_query_extensions, std::size(ray_query_extensions)) && !std::getenv("COLOSSUS_NO_RAY_QUERY");
+        const char* fetch_extension[] = {VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME};
+        position_fetch = ray_query && has(gpu, fetch_extension, 1);
+        VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR fetch{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR};
+        fetch.rayTracingPositionFetch = VK_TRUE;
         VkPhysicalDeviceRayQueryFeaturesKHR rq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
         rq.rayQuery = VK_TRUE;
+        if (position_fetch) rq.pNext = &fetch;
         VkPhysicalDeviceAccelerationStructureFeaturesKHR as{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
         as.accelerationStructure = VK_TRUE;
         as.pNext = &rq;
@@ -384,6 +390,7 @@ private:
 
         auto ext = required();
         if (ray_query) ext.insert(ext.end(), std::begin(ray_query_extensions), std::end(ray_query_extensions));
+        if (position_fetch) ext.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.pNext = &features;
         dci.queueCreateInfoCount = 1;

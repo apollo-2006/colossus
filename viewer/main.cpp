@@ -205,7 +205,8 @@ constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wirefra
                    flag_vsm = 1024,    // virtual shadow maps (vsm.glsl), not rays
                    flag_ao = 2048,     // ambient occlusion (ao.comp)
                    flag_soft_shadows = 4096,  // contact-hardening penumbras
-                   flag_bounce = 8192;        // light bounced off the ground (ambient_light() in shade.comp)
+                   flag_bounce = 8192,        // light bounced off the ground (ambient_light() in shade.comp)
+                   flag_gi_rt = 16384;        // bounce light traced in world space (traced_light() in ao.comp)
 // ray traced shadows use the finest cut within each budget; far surfaces use coarser ones
 // (trace_surface() in surface.glsl).
 constexpr size_t shadow_budgets[] = {1u << 18, 1u << 15, 1u << 12};
@@ -246,6 +247,7 @@ struct options {
     bool full_res_shadows = false;
     bool prefetch = true;
     bool merge_reads = true;   // pages close in the file share a read
+    bool gi_rt = false;        // --gi rt: bounce light traced in world space
 };
 
 struct camera {
@@ -774,6 +776,8 @@ public:
         fr.prev_time = history_valid_ ? prev_time_ : fr.time;
         if (sc_.moving) fr.flags |= flag_moving;
         fr.vsm_atlas_side = vsm_side_;
+        // traced bounce light needs ray queries that read hit vertices (position fetch).
+        if (!ctx_.position_fetch || !ao_rt_pipeline_) fr.flags &= ~flag_gi_rt;
         fr.page_count = static_cast<uint32_t>(sc_.pages.size());
 
         prev_time_ = fr.time;
@@ -888,7 +892,7 @@ public:
             vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_ALL, 0, sizeof back, &back);
             // the ray query variant only for ray traced shadows: it costs 0.05 ms even unused.
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              ao_rt_pipeline_ && !(fr.flags & flag_vsm) ? ao_rt_pipeline_ : ao_pipeline_);
+                              ao_rt_pipeline_ && (!(fr.flags & flag_vsm) || (fr.flags & flag_gi_rt)) ? ao_rt_pipeline_ : ao_pipeline_);
             vkCmdDispatch(cmd, ((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
             compute_barrier(cmd);
         }
@@ -1387,8 +1391,11 @@ private:
                       bool updatable = false) {
         VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
         info.type = type;
+        // bottom levels keep their vertices readable for --gi rt's hit normals (position fetch).
         info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
-                     (updatable ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0);
+                     (updatable ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0) |
+                     (ctx_.position_fetch && type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
+                          ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR : 0);
         info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         info.geometryCount = 1;
         info.pGeometries = &geom;
@@ -1784,6 +1791,7 @@ void on_key(GLFWwindow* w, int key, int, int action, int) {
     if (key == GLFW_KEY_X) v->flags ^= flag_taa;
     if (key == GLFW_KEY_G) v->flags ^= flag_ao;
     if (key == GLFW_KEY_B) v->flags ^= flag_bounce;
+    if (key == GLFW_KEY_I) v->flags ^= flag_gi_rt;
     if (key == GLFW_KEY_J) v->flags ^= flag_soft_shadows;
     if (key == GLFW_KEY_0) v->mode = 9;
     if (key == GLFW_KEY_T) v->flags ^= flag_wireframe;
@@ -1883,6 +1891,11 @@ options parse(int argc, char** argv) {
         else if (a == "--no-taa") o.disable |= flag_taa;
         else if (a == "--no-ao") o.disable |= flag_ao;
         else if (a == "--no-bounce") o.disable |= flag_bounce;
+        else if (a == "--gi") {
+            const std::string g = next();
+            if (g != "rt" && g != "screen") throw std::runtime_error("--gi takes rt or screen");
+            o.gi_rt = g == "rt";
+        }
         else if (a == "--hard-shadows") o.disable |= flag_soft_shadows;
         else if (a == "--full-res-shadows") o.full_res_shadows = true;
         else if (a == "--materials") {
@@ -1939,6 +1952,7 @@ int main(int argc, char** argv) {
         if (opt.full_res_shadows) v.flags |= flag_full_res_shadows;
         v.flags &= ~opt.disable;
         if (opt.vsm) v.flags |= flag_vsm;
+        if (opt.gi_rt) v.flags |= flag_gi_rt;
         v.sw_max_pixels = opt.sw_pixels;
         const float extent = std::max(1.0f, opt.grid * opt.spacing);
         v.cam.eye = {0, 0.35f + 0.25f * extent, 0.5f + 0.75f * extent};

@@ -12,6 +12,21 @@ vec3 aces_inverse(vec3 y) {
     return (-b - sqrt(max(b * b - 4.0 * a * c, 0.0))) / (2.0 * a);
 }
 
+// per instance (Instance::material): albedo, roughness, metalness. surface detail (shade.comp)
+// varies them; ray traced bounce light takes them plain.
+struct Material {
+    vec3 albedo;
+    float roughness;
+    float metallic;
+};
+const Material materials[6] = Material[](
+    Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0),   // plaster: the plain look
+    Material(vec3(0.66, 0.64, 0.6), 0.3, 0.0),    // polished marble
+    Material(vec3(0.62, 0.5, 0.38), 0.85, 0.0),   // sandstone
+    Material(vec3(0.58, 0.38, 0.22), 0.35, 1.0),  // bronze
+    Material(vec3(1.0, 0.7, 0.27), 0.28, 1.0),    // gold
+    Material(vec3(0.2, 0.2, 0.22), 0.45, 0.0));   // dark granite
+
 // the ground's colour and the light on it, as drawn: its radiance where it is in sun (lit 1) or
 // shadow (lit 0). the grid lines aside.
 const vec3 ground_albedo = vec3(0.41, 0.39, 0.36);
