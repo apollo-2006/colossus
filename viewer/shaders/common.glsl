@@ -48,6 +48,7 @@ struct Mesh {
     vec4 bounds;      // xyz centre, w radius
     vec4 lod_bounds;  // holds every lod sphere
     vec4 grid;        // position snapping: xyz grid point 0, w step
+    uvec4 tex;        // texture tiles: first page, levels (0: none), width, height (texture.glsl)
 };
 
 // a model placed by rotation, uniform scale, translation.
@@ -192,7 +193,7 @@ layout(set = 0, binding = 19, scalar) buffer RequestStamp { uint request_stamp[]
 uint cluster_level(Cluster c) { return c.level & 255u; }
 
 uvec4 cluster_widths(Cluster c) {  // bx, by, bz, ib
-    return (uvec4(c.level) >> uvec4(8, 12, 16, 20)) & 15u;
+    return (uvec4(c.level) >> uvec4(8, 12, 16, 20)) & uvec4(15u, 15u, 15u, 7u);
 }
 
 // `count` bits (at most 32) at a bit offset into the run starting at word `at`.
@@ -215,6 +216,20 @@ vec3 cluster_normal(uint base, Cluster c, uint k) {
     const uint xyz = b.x + b.y + b.z;
     return decode_octahedral(read_bits(base + c.vertex_offset, k * (xyz + 22u) + xyz, 22u));
 }
+
+// a textured cluster's (level bit 23) texture coordinates follow its vertex run and the word
+// after it: corner u0 | v0 << 16 on a 65535-step grid, widths bu | bv << 5, then per vertex
+// its offsets. widths past 16 are corrupt: capped, so reads stay near the run.
+vec2 cluster_uv(uint base, Cluster c, uint k) {
+    const uvec4 b = cluster_widths(c);
+    const uint run = base + c.vertex_offset + (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
+    const uint corner = pool[run], widths = pool[run + 1u];
+    const uint bu = min(widths & 31u, 16u), bv = min((widths >> 5u) & 31u, 16u);
+    const uint bit = 64u + k * (bu + bv);
+    return vec2(float((corner & 0xffffu) + read_bits(run, bit, bu)), float((corner >> 16u) + read_bits(run, bit + bu, bv))) / 65535.0;
+}
+
+bool cluster_textured(Cluster c) { return (c.level & 0x800000u) != 0u; }
 
 // triangle t as a | b << 8 | c << 16.
 uint cluster_triangle(uint base, Cluster c, uint t) {

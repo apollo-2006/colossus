@@ -18,4 +18,7 @@ constexpr uint32_t cluster_max_vertices = 128;
 //
 // replaced greedy growth: 108 triangles per cluster on the dragon, 8% pockets.
 // bisection fills them all: 20% fewer clusters, one root.
-std::vector<std::vector<uint32_t>> clusterize(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices);
+//
+// with `counted` (an id per index: texture wedges), the vertex limit counts those instead.
+std::vector<std::vector<uint32_t>> clusterize(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
+                                              const std::vector<uint32_t>* counted = nullptr);

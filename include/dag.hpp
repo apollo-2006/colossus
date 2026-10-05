@@ -24,6 +24,7 @@
 
 struct lod_cluster {
     std::vector<uint32_t> indices;  // three per triangle, into lod_mesh::positions
+    std::vector<uint32_t> corners;  // a wedge per index (lod_mesh::wedge_*)
     sphere bounds;                  // around the vertices: for culling
     vec3 cone_axis;                 // holds every face normal: see cone_cutoff
     // sine of the widest angle from cone_axis to a face normal: all triangles
@@ -47,8 +48,14 @@ struct lod_level_stats {
     float max_error = 0;
 };
 
+// texture coordinates ride on wedges: a vertex as one texture chart sees it. simplification
+// keeps them exact (a corner only ever takes a wedge of its own chart: see simplify()), so
+// seams stay closed. an untextured mesh has a wedge per vertex, in one chart.
 struct lod_mesh {
     std::vector<vec3> positions, normals;
+    std::vector<uint32_t> wedge_vertex, wedge_chart;
+    std::vector<vec2> wedge_uvs;  // empty if untextured
+    std::string texture;
     std::vector<lod_cluster> clusters;  // level 0, then each level
     std::vector<lod_level_stats> levels;
 };

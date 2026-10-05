@@ -10,7 +10,8 @@
 
 namespace {
 
-constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '8'};
+constexpr char magic[8] = {'C', 'G', 'E', 'O', 'v', '0', '0', '9'};
+constexpr uint32_t uv_max = 65535;
 constexpr uint32_t grid_bits = 14;
 constexpr uint32_t grid_max = (1u << grid_bits) - 2;  // a step of rounding to spare
 
@@ -80,7 +81,12 @@ uint32_t read_bits(const uint32_t* run, uint64_t bit, uint32_t count) {
     return uint32_t(v & ((uint64_t(1) << count) - 1));
 }
 
-uint32_t width(const gpu_cluster& c, int field) { return (c.level >> (8 + 4 * field)) & 15; }
+uint32_t width(const gpu_cluster& c, int field) { return (c.level >> (8 + 4 * field)) & (field == 3 ? 7 : 15); }
+
+// words from a cluster's vertex run to its texture coordinates.
+uint32_t uv_run(const gpu_cluster& c) {
+    return (c.vertex_count * (width(c, 0) + width(c, 1) + width(c, 2) + 22) + 31) / 32 + 1;
+}
 
 }  // namespace
 
@@ -102,6 +108,13 @@ vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k) {
     const uint32_t bx = width(c, 0), by = width(c, 1), bz = width(c, 2);
     const uint64_t at = uint64_t(k) * (bx + by + bz + 22) + bx + by + bz;
     return decode_octahedral(read_bits(page + c.vertex_offset, at, 22));
+}
+
+vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k) {
+    const uint32_t* run = page + c.vertex_offset + uv_run(c);
+    const uint32_t bu = run[1] & 31, bv = run[1] >> 5 & 31;
+    const uint64_t at = 64 + uint64_t(k) * (bu + bv);
+    return {float((run[0] & 0xffff) + read_bits(run, at, bu)) / uv_max, float((run[0] >> 16) + read_bits(run, at + bu, bv)) / uv_max};
 }
 
 packed_cluster pack_cluster(const gpu_cluster& c) {
@@ -217,7 +230,7 @@ paged_geometry page(const geometry& g) {
     for (const gpu_cluster& c : g.clusters) {
         vec3 clo(INFINITY, INFINITY, INFINITY), chi(-INFINITY, -INFINITY, -INFINITY);
         for (uint32_t k = 0; k < c.vertex_count; ++k) {
-            const size_t v = g.cluster_vertices[c.vertex_offset + k];
+            const size_t v = g.vertex_of(g.cluster_vertices[c.vertex_offset + k]);
             const vec3 q(g.positions[3 * v], g.positions[3 * v + 1], g.positions[3 * v + 2]);
             clo = min(clo, q);
             chi = max(chi, q);
@@ -254,13 +267,13 @@ paged_geometry page(const geometry& g) {
             for (int axis = 0; axis < 3; ++axis) {
                 dst.origin[axis] = UINT32_MAX;
                 for (uint32_t k = 0; k < src.vertex_count; ++k)
-                    dst.origin[axis] = std::min(dst.origin[axis], snap(g.cluster_vertices[src.vertex_offset + k], axis));
+                    dst.origin[axis] = std::min(dst.origin[axis], snap(g.vertex_of(g.cluster_vertices[src.vertex_offset + k]), axis));
             }
             // widths: each axis as wide as the cluster's extent, indices as the vertex count.
             uint32_t extent[3] = {0, 0, 0};
             for (uint32_t k = 0; k < src.vertex_count; ++k)
                 for (int axis = 0; axis < 3; ++axis)
-                    extent[axis] = std::max(extent[axis], snap(g.cluster_vertices[src.vertex_offset + k], axis) - dst.origin[axis]);
+                    extent[axis] = std::max(extent[axis], snap(g.vertex_of(g.cluster_vertices[src.vertex_offset + k]), axis) - dst.origin[axis]);
             uint32_t b[3];
             for (int axis = 0; axis < 3; ++axis) {
                 b[axis] = bits_for(extent[axis]);
@@ -268,12 +281,32 @@ paged_geometry page(const geometry& g) {
             }
             const uint32_t ib = std::max(bits_for(src.vertex_count - 1), 1u);
             if (src.level > 255) throw std::logic_error("too many levels to pack");
-            dst.level = src.level | b[0] << 8 | b[1] << 12 | b[2] << 16 | ib << 20;
+            if (ib > 7) throw std::logic_error("cluster too large to pack");
+            dst.level = src.level | b[0] << 8 | b[1] << 12 | b[2] << 16 | ib << 20 | uint32_t(g.textured()) << 23;
             bit_writer vw{words};
             for (uint32_t k = 0; k < src.vertex_count; ++k) {
-                const size_t v = g.cluster_vertices[src.vertex_offset + k];
+                const size_t v = g.vertex_of(g.cluster_vertices[src.vertex_offset + k]);
                 for (int axis = 0; axis < 3; ++axis) vw.put(snap(v, axis) - dst.origin[axis], b[axis]);
                 vw.put(encode_normal({g.normals[3 * v], g.normals[3 * v + 1], g.normals[3 * v + 2]}), 22);
+            }
+            if (g.textured()) {
+                words.push_back(0);  // the word after the vertex run
+                // corner and widths, then each vertex's offsets.
+                uint32_t q[2][cluster_max_vertices], lo[2] = {uv_max, uv_max}, hi[2] = {0, 0};
+                for (uint32_t k = 0; k < src.vertex_count; ++k) {
+                    const vec2 uv = g.wedge_uvs[g.cluster_vertices[src.vertex_offset + k]];
+                    q[0][k] = uint32_t(std::lround(std::clamp(uv.x, 0.0f, 1.0f) * uv_max));
+                    q[1][k] = uint32_t(std::lround(std::clamp(uv.y, 0.0f, 1.0f) * uv_max));
+                    for (int a = 0; a < 2; ++a) { lo[a] = std::min(lo[a], q[a][k]); hi[a] = std::max(hi[a], q[a][k]); }
+                }
+                const uint32_t bu = bits_for(hi[0] - lo[0]), bv = bits_for(hi[1] - lo[1]);
+                words.push_back(lo[0] | lo[1] << 16);
+                words.push_back(bu | bv << 5);
+                bit_writer uw{words};
+                for (uint32_t k = 0; k < src.vertex_count; ++k) {
+                    uw.put(q[0][k] - lo[0], bu);
+                    uw.put(q[1][k] - lo[1], bv);
+                }
             }
             dst.triangle_offset = static_cast<uint32_t>(words.size());
             bit_writer tw{words};
@@ -393,7 +426,9 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
         if (bx > grid_bits || by > grid_bits || bz > grid_bits || ib == 0 || ib > 7 || (c.vertex_count > 0 && (c.vertex_count - 1) >> ib))
             throw std::runtime_error(path + ": cluster bit widths out of range");
         // each run, plus the word after it, which a read straddling its end touches.
-        const uint64_t vertex_words = (uint64_t(c.vertex_count) * (bx + by + bz + 22) + 31) / 32 + 1;
+        uint64_t vertex_words = (uint64_t(c.vertex_count) * (bx + by + bz + 22) + 31) / 32 + 1;
+        // a textured cluster's corner and width words; the offsets are checked once read.
+        if (cluster_textured(c)) vertex_words += 2;
         const uint64_t triangle_words = (uint64_t(c.triangle_count) * 3 * ib + 31) / 32 + 1;
         if (c.vertex_offset + vertex_words > words || c.triangle_offset + triangle_words > words)
             throw std::runtime_error(path + ": cluster outside its page");
@@ -408,6 +443,13 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
                 const uint32_t w = decode_triangle(c, base, t);
                 if ((w & 255) >= c.vertex_count || (w >> 8 & 255) >= c.vertex_count || (w >> 16 & 255) >= c.vertex_count)
                     throw std::runtime_error(path + ": triangle index out of range");
+            }
+            if (cluster_textured(c)) {
+                const uint32_t widths = base[c.vertex_offset + uv_run(c) + 1];
+                const uint32_t bu = widths & 31, bv = widths >> 5 & 31;
+                const uint64_t end = c.vertex_offset + uv_run(c) + 2 + (uint64_t(c.vertex_count) * (bu + bv) + 31) / 32 + 1;
+                if (bu > 16 || bv > 16 || widths >> 10 || end > p.pages[c.group].size / 4)
+                    throw std::runtime_error(path + ": texture coordinates out of range");
             }
         }
     }

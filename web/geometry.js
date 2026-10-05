@@ -2,7 +2,7 @@
 // and dependencies, all of a .cgeo but page data, which streams from name.pages
 // (web/streamer.js). layout: include/paged_file.hpp.
 
-const MAGIC = 'CGEOv008';
+const MAGIC = 'CGEOv009';
 
 // streams a url, reporting (bytes so far, total or 0), gunzipping .gz names.
 export async function fetchBytes(url, onProgress) {

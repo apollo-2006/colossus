@@ -10,20 +10,45 @@
 #include <cstdint>
 #include <vector>
 
+// a wedge made by a relaxed seam collapse (see wedges::relax).
+struct new_wedge {
+    vec2 uv;
+    uint32_t vertex, chart;
+};
+constexpr uint32_t new_wedge_bit = 0x80000000u;
+
 struct simplify_result {
     std::vector<uint32_t> indices;  // into the input's positions
+    // a wedge per index, with wedges given; new_wedge_bit | k names new_wedges[k].
+    std::vector<uint32_t> corners;
+    std::vector<new_wedge> new_wedges;
     // estimated distance from the input: root of the worst collapse's
     // area-weighted mean squared distance.
     float error = 0;
 };
 
+// texture wedges of a mesh being simplified: a wedge per input index, and each wedge's chart
+// and vertex (lod_mesh).
+struct wedges {
+    const std::vector<uint32_t>& corners;
+    const std::vector<uint32_t>& chart;
+    const std::vector<uint32_t>& vertex;
+    const std::vector<vec2>& uv;
+    // seams may move: a corner whose chart has no wedge at the vertex it moves onto gets a new
+    // one there, keeping its old coordinates. positions stay shared, so no cracks; the texture
+    // shifts across the seam by at most the collapse's distance, which the error measures.
+    bool relax = false;
+};
+
 // collapses edges, cheapest first, down to target_triangles or until none is
-// allowed. locked[v] never moves (others may move onto it), which holds group
+// allowed. with wedges, a corner moving onto a vertex takes that vertex's wedge in
+// the corner's chart, and a collapse is refused where the vertex has none: seam
+// vertices only slide along their seams, and texture coordinates stay exact. locked[v] never moves (others may move onto it), which holds group
 // outlines fixed. refuses flips and link-condition violations. border vertices
 // only slide along the border, where planes through each border edge price
 // moving the outline.
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                         const std::vector<uint8_t>& locked, size_t target_triangles);
+                         const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w = nullptr);
 
 // vertex clustering (rossignac and borrel): each vertex snaps to one vertex of
 // its grid cell, the grid coarsened until at most target_triangles remain;
@@ -31,5 +56,7 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
 // collapses cannot; used only for the last group, which nothing borders. stays
 // crack-free: duplicates are kept (edge use counts keep their parity) and a
 // cell with a border vertex keeps one. error is 0: measure it.
+// with wedges, a corner takes its cell's vertex's wedge in its chart (any wedge of that vertex
+// where it has none: at the coarsest level a seam may smear).
 simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                                 size_t target_triangles);
+                                 size_t target_triangles, const wedges* w = nullptr);

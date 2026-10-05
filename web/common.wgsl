@@ -227,7 +227,7 @@ fn to_world_dir(inst: Instance, v: vec3f) -> vec3f {
 fn cluster_level(c: Cluster) -> u32 { return c.level & 255u; }
 
 fn cluster_widths(c: Cluster) -> vec4u {  // bx, by, bz, ib
-  return (vec4u(c.level) >> vec4u(8u, 12u, 16u, 20u)) & vec4u(15u);
+  return (vec4u(c.level) >> vec4u(8u, 12u, 16u, 20u)) & vec4u(15u, 15u, 15u, 7u);
 }
 
 // `count` bits (at most 31) at a bit offset into the run starting at word `at`.

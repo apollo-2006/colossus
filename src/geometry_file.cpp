@@ -26,6 +26,11 @@ geometry pack(const lod_mesh& lod) {
     g.positions.reserve(3 * lod.positions.size());
     for (const vec3& p : lod.positions) g.positions.insert(g.positions.end(), {p.x, p.y, p.z});
     for (const vec3& n : lod.normals) g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
+    if (!lod.wedge_uvs.empty()) {
+        g.wedge_vertex = lod.wedge_vertex;
+        g.wedge_uvs = lod.wedge_uvs;
+        g.texture = lod.texture;
+    }
     g.bounds = bounding_sphere(lod.positions.size(), [&](size_t i) { return lod.positions[i]; });
     // every lod sphere, which can stick out past the model.
     g.lod_bounds = g.bounds;
@@ -67,8 +72,10 @@ geometry pack(const lod_mesh& lod) {
         for (size_t t = 0; t < c.indices.size(); t += 3) {
             uint32_t packed = 0;
             for (int k = 0; k < 3; ++k) {
-                auto [it, added] = local.emplace(c.indices[t + k], static_cast<uint32_t>(local.size()));
-                if (added) g.cluster_vertices.push_back(c.indices[t + k]);
+                // untextured, the wedge is the vertex.
+                const uint32_t w = g.textured() ? c.corners[t + k] : c.indices[t + k];
+                auto [it, added] = local.emplace(w, static_cast<uint32_t>(local.size()));
+                if (added) g.cluster_vertices.push_back(w);
                 packed |= it->second << (8 * k);
             }
             g.cluster_triangles.push_back(packed);
@@ -105,7 +112,9 @@ geometry trim(const geometry& g, size_t max_triangles) {
     geometry out;
     out.bounds = g.bounds;
     out.lod_bounds = g.lod_bounds;
+    out.texture = g.texture;
     std::vector<uint32_t> remap(g.positions.size() / 3, UINT32_MAX);
+    std::vector<uint32_t> wedge_remap(g.textured() ? g.wedge_uvs.size() : 0, UINT32_MAX);
     for (const gpu_cluster& c : g.clusters) {
         if (c.parent_error <= floor_error) continue;  // finer than the new leaves everywhere
         gpu_cluster k = c;
@@ -117,14 +126,25 @@ geometry trim(const geometry& g, size_t max_triangles) {
         k.vertex_offset = static_cast<uint32_t>(out.cluster_vertices.size());
         k.triangle_offset = static_cast<uint32_t>(out.cluster_triangles.size());
         for (uint32_t i = 0; i < c.vertex_count; ++i) {
-            uint32_t& v = remap[g.cluster_vertices[c.vertex_offset + i]];
+            const uint32_t w = g.cluster_vertices[c.vertex_offset + i];
+            uint32_t& v = remap[g.vertex_of(w)];
             if (v == UINT32_MAX) {
                 v = static_cast<uint32_t>(out.positions.size() / 3);
-                const size_t src = 3 * size_t(g.cluster_vertices[c.vertex_offset + i]);
+                const size_t src = 3 * size_t(g.vertex_of(w));
                 out.positions.insert(out.positions.end(), &g.positions[src], &g.positions[src + 3]);
                 out.normals.insert(out.normals.end(), &g.normals[src], &g.normals[src + 3]);
             }
-            out.cluster_vertices.push_back(v);
+            if (!g.textured()) {
+                out.cluster_vertices.push_back(v);
+                continue;
+            }
+            uint32_t& nw = wedge_remap[w];
+            if (nw == UINT32_MAX) {
+                nw = static_cast<uint32_t>(out.wedge_uvs.size());
+                out.wedge_uvs.push_back(g.wedge_uvs[w]);
+                out.wedge_vertex.push_back(v);
+            }
+            out.cluster_vertices.push_back(nw);
         }
         out.cluster_triangles.insert(out.cluster_triangles.end(), g.cluster_triangles.begin() + c.triangle_offset,
                                      g.cluster_triangles.begin() + c.triangle_offset + c.triangle_count);

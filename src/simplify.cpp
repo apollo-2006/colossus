@@ -50,11 +50,12 @@ struct collapse {
 }  // namespace
 
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                         const std::vector<uint8_t>& locked, size_t target_triangles) {
+                         const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w) {
     simplify_result out;
     const size_t n = indices.size() / 3;
     if (n <= target_triangles) {
         out.indices = indices;
+        if (w) out.corners = w->corners;
         return out;
     }
 
@@ -72,6 +73,28 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
         pos[v] = positions[verts[v]];
         fixed[v] = locked[verts[v]];
     }
+
+    // per corner its wedge; per vertex its wedges by chart (a vertex keeps its own as others
+    // collapse onto it).
+    std::vector<uint32_t> corner(w ? w->corners : std::vector<uint32_t>());
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> chart_wedges(w ? nv : 0);  // (chart, wedge)
+    if (w)
+        for (size_t i = 0; i < indices.size(); ++i) {
+            auto& list = chart_wedges[tri[i]];
+            const uint32_t chart = w->chart[corner[i]];
+            bool have = false;
+            for (const auto& [c, x] : list) have |= c == chart;
+            if (!have) list.push_back({chart, corner[i]});
+        }
+    auto chart_of = [&](uint32_t id) {
+        return id & new_wedge_bit ? out.new_wedges[id & ~new_wedge_bit].chart : w->chart[id];
+    };
+    auto uv_of = [&](uint32_t id) { return id & new_wedge_bit ? out.new_wedges[id & ~new_wedge_bit].uv : w->uv[id]; };
+    auto wedge_in = [&](uint32_t v, uint32_t chart) -> uint32_t {
+        for (const auto& [c, x] : chart_wedges[v])
+            if (c == chart) return x;
+        return UINT32_MAX;
+    };
 
     std::vector<std::vector<uint32_t>> vertex_tris(nv);
     for (size_t t = 0; t < n; ++t)
@@ -213,6 +236,16 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
             if (la <= 1e-6f * lb || dot(after, before) <= 0.25f * la * lb) { ok = false; break; }
         }
         if (!ok) continue;
+        // every triangle staying at `from` needs `to` in its texture chart.
+        if (w)
+            for (uint32_t t : vertex_tris[from]) {
+                if (!tri_alive[t]) continue;
+                const uint32_t* v = &tri[3 * t];
+                if (v[0] == to || v[1] == to || v[2] == to) continue;
+                const int k = v[0] == from ? 0 : v[1] == from ? 1 : 2;
+                if (!w->relax && wedge_in(to, chart_of(corner[3 * t + k])) == UINT32_MAX) { ok = false; break; }
+            }
+        if (!ok) continue;
 
         worst = std::max(worst, c.cost);
         for (uint32_t t : vertex_tris[from]) {
@@ -223,7 +256,19 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
                 --live;
             } else {
                 for (int k = 0; k < 3; ++k)
-                    if (v[k] == from) v[k] = to;
+                    if (v[k] == from) {
+                        v[k] = to;
+                        if (w) {
+                            const uint32_t old = corner[3 * t + k], chart = chart_of(old);
+                            uint32_t x = wedge_in(to, chart);
+                            if (x == UINT32_MAX) {  // relaxed: a new wedge of this chart at `to`
+                                x = new_wedge_bit | uint32_t(out.new_wedges.size());
+                                out.new_wedges.push_back({uv_of(old), verts[to], chart});
+                                chart_wedges[to].push_back({chart, x});
+                            }
+                            corner[3 * t + k] = x;
+                        }
+                    }
                 vertex_tris[to].push_back(t);
             }
         }
@@ -247,13 +292,32 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
     out.indices.reserve(3 * live);
     for (size_t t = 0; t < n; ++t)
         if (tri_alive[t])
-            for (int k = 0; k < 3; ++k) out.indices.push_back(verts[tri[3 * t + k]]);
+            for (int k = 0; k < 3; ++k) {
+                out.indices.push_back(verts[tri[3 * t + k]]);
+                if (w) out.corners.push_back(corner[3 * t + k]);
+            }
     out.error = static_cast<float>(std::sqrt(worst));
     return out;
 }
 
 simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                                 size_t target_triangles) {
+                                 size_t target_triangles, const wedges* w) {
+    // each vertex's wedges by chart.
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> chart_wedges;
+    if (w)
+        for (size_t i = 0; i < indices.size(); ++i) {
+            auto& list = chart_wedges[indices[i]];
+            const uint32_t chart = w->chart[w->corners[i]];
+            bool have = false;
+            for (const auto& [c, x] : list) have |= c == chart;
+            if (!have) list.push_back({chart, w->corners[i]});
+        }
+    auto wedge_for = [&](uint32_t v, uint32_t from_wedge) {
+        const auto& list = chart_wedges[v];
+        for (const auto& [c, x] : list)
+            if (c == w->chart[from_wedge]) return x;
+        return list[0].second;
+    };
     // open edges (used once) give border vertices.
     std::vector<std::pair<uint32_t, uint32_t>> edges;
     for (size_t t = 0; t < indices.size(); t += 3)
@@ -304,14 +368,18 @@ simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::
             auto it = pick.find(k);
             if (it == pick.end() || d < it->second.second || (d == it->second.second && v < it->second.first)) pick[k] = {v, d};
         }
-        std::vector<uint32_t> out;
+        std::vector<uint32_t> out, corners;
         for (size_t t = 0; t < indices.size(); t += 3) {
             const uint32_t a = pick[cell_of(indices[t])].first, b = pick[cell_of(indices[t + 1])].first,
                            c = pick[cell_of(indices[t + 2])].first;
             if (a == b || b == c || a == c) continue;
             out.insert(out.end(), {a, b, c});
+            if (w)
+                corners.insert(corners.end(), {wedge_for(a, w->corners[t]), wedge_for(b, w->corners[t + 1]),
+                                               wedge_for(c, w->corners[t + 2])});
         }
         r.indices = std::move(out);
+        r.corners = std::move(corners);
         if (r.indices.size() / 3 <= target_triangles || cells == 1) break;
     }
     return r;

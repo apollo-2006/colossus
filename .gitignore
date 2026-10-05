@@ -3,6 +3,8 @@
 /colossus
 /models/*.ply
 /models/*.cgeo
+/models/*.ctex
+/models/washington/
 /models/dragon_recon/
 *.png
 !/docs/*.png

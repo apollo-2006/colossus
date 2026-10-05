@@ -9,6 +9,7 @@
 // (sunlight()).
 #include "common.glsl"
 #include "surface.glsl"
+#include "texture.glsl"
 #include "vsm.glsl"
 #include "lighting.glsl"
 
@@ -291,7 +292,20 @@ void main() {
         const float ao = occlusion(px);
         vec3 n = s.n;
         float wrap = 0.0, coat = 0.0;
-        if (frame.debug_mode == 0u) {
+        const uvec4 tex = meshes[inst.mesh].tex;
+        if (frame.debug_mode == 0u && tex.y != 0u && cluster_textured(c)) {
+            // a scan's own colour: no procedural detail. texture coordinates where this pixel's
+            // ray and its neighbours' meet the triangle's plane: their differences pick the level.
+            const vec2 uv0 = cluster_uv(s.base, c, s.corners.x), uv1 = cluster_uv(s.base, c, s.corners.y),
+                       uv2 = cluster_uv(s.base, c, s.corners.z);
+            const vec2 b = plane_bary(s.p0, s.p1, s.p2, s.dir);
+            const vec2 bx = plane_bary(s.p0, s.p1, s.p2, pixel_ray_at(vec2(px) + vec2(1.5, 0.5)));
+            const vec2 by = plane_bary(s.p0, s.p1, s.p2, pixel_ray_at(vec2(px) + vec2(0.5, 1.5)));
+            const vec2 uv = uv0 + (uv1 - uv0) * s.bary.x + (uv2 - uv0) * s.bary.y;
+            const vec2 duv_dx = (uv1 - uv0) * (bx.x - b.x) + (uv2 - uv0) * (bx.y - b.y);
+            const vec2 duv_dy = (uv1 - uv0) * (by.x - b.x) + (uv2 - uv0) * (by.y - b.y);
+            m = Material(sample_texture(tex, uv, duv_dx, duv_dy), 0.75, 0.0);
+        } else if (frame.debug_mode == 0u) {
             const vec4 bounds = meshes[inst.mesh].bounds;
             const float radius = bounds.w;
             // detail is fixed to the rest surface: a swaying statue's grain bends with it.

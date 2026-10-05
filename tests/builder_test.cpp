@@ -9,6 +9,7 @@
 #include "mesh.hpp"
 #include "paged_file.hpp"
 #include "simplify.hpp"
+#include "texture_file.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -90,6 +91,31 @@ mesh grid(int n) {
     return m;
 }
 
+// textured: a chart per cell of a grid of side `cells` (by triangle centroid; side 2 gives the
+// octants). a vertex's coordinates in chart c are ((c + 0.45 x + 0.5) / charts, 0.45 z + 0.5):
+// the chart reads back from u, so a smeared seam shows as a triangle of mixed charts.
+uint32_t texture_charts = 8;
+vec2 chart_uv(vec3 p, uint32_t chart) { return {(chart + 0.45f * p.x + 0.5f) / texture_charts, 0.45f * p.z + 0.5f}; }
+uint32_t chart_from_u(float u) { return uint32_t(u * texture_charts); }
+mesh grid_textured(mesh m, uint32_t cells) {
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> wedge_of;
+    for (size_t t = 0; t < m.triangle_count(); ++t) {
+        const vec3 c = (m.positions[m.indices[3 * t]] + m.positions[m.indices[3 * t + 1]] + m.positions[m.indices[3 * t + 2]]) * (1.0f / 3);
+        auto cell = [&](float x) { return std::min(uint32_t(std::max(0.0f, (x + 1.1f) / 2.2f * cells)), cells - 1); };
+        const uint32_t chart = cell(c.x) + cells * (cell(c.y) + cells * cell(c.z));
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t v = m.indices[3 * t + k];
+            auto [it, added] = wedge_of.emplace(std::make_pair(v, chart), uint32_t(m.wedge_uvs.size()));
+            if (added) {
+                m.wedge_uvs.push_back(chart_uv(m.positions[v], chart));
+                m.wedge_vertex.push_back(v);
+            }
+            m.corners.push_back(it->second);
+        }
+    }
+    return m;
+}
+
 std::string temp_path(const char* name) {
     return std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/colossus_" + name;
 }
@@ -135,6 +161,24 @@ void test_ply_and_obj() {
     std::ofstream(path) << "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nf 1/1 2/1 3/1 -1/1\n";
     const mesh m = load_mesh(path);
     CHECK(m.indices == std::vector<uint32_t>({0, 1, 2, 0, 2, 3}));
+    CHECK(m.textured() && m.wedge_uvs.size() == 4);  // one vt at four positions splits
+
+    // texture coordinates: vertex 1 on a seam (two vts), vertex 3's shared; v flipped; the
+    // texture from the material library, beside the obj.
+    std::ofstream(temp_path("square.mtl")) << "newmtl m\nmap_Kd tex.jpg \n";
+    std::ofstream(path) << "mtllib colossus_square.mtl\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n"
+                           "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvt 0.5 0.25\nf 1/1 2/2 3/3\nf 1/5/1 3/3/1 4/4/1\n";
+    mesh t = load_mesh(path);
+    weld(t);
+    CHECK(t.textured() && t.wedge_uvs.size() == 5 && t.corners.size() == 6);
+    if (t.textured() && t.corners.size() == 6) {
+        const vec2 a = t.wedge_uvs[t.corners[0]], b = t.wedge_uvs[t.corners[3]], c = t.wedge_uvs[t.corners[2]];
+        CHECK(a.x == 0 && a.y == 1);
+        CHECK(b.x == 0.5f && b.y == 0.75f);
+        CHECK(t.corners[2] == t.corners[4] && c.x == 1 && c.y == 0);
+        CHECK(t.wedge_vertex[t.corners[0]] == t.indices[0] && t.wedge_vertex[t.corners[3]] == t.indices[3]);
+    }
+    CHECK(t.texture == temp_path("") .substr(0, temp_path("").find_last_of('/') + 1) + "tex.jpg");
 }
 
 void test_weld() {
@@ -203,13 +247,43 @@ void test_simplify() {
     for (uint32_t corner : {0u, 40u, 40u * 41, 41u * 41 - 1}) CHECK(used.count(corner) == 1);
 }
 
-void test_hierarchy(const char* name, const mesh& input) {
+// exact: texture coordinates checked exact (no seam had to move).
+void test_hierarchy(const char* name, const mesh& input, bool exact = true) {
     std::printf("hierarchy: %s, %zu triangles\n", name, input.triangle_count());
     mesh m = input;
+    // texture coordinates come from the unplaced positions: keep them.
+    const std::vector<vec3> unplaced = m.positions;
     normalize_placement(m, false);
     const lod_mesh lod = build_lod(m, false);
     const geometry g = pack(lod);
     CHECK(g.leaf_triangles() == m.triangle_count());
+    CHECK(g.textured() == m.textured());
+    if (g.textured()) {
+        // every wedge has its vertex's coordinates in its chart (unless seams moved), and every
+        // triangle one chart. only the last group's vertex clustering may smear one.
+        size_t off = 0, mixed = 0, mixed_root = 0;
+        for (const gpu_cluster& c : g.clusters) {
+            for (uint32_t k = 0; k < c.vertex_count; ++k) {
+                const uint32_t w = g.cluster_vertices[c.vertex_offset + k];
+                const vec2 uv = g.wedge_uvs[w];
+                const vec2 want = chart_uv(unplaced[g.vertex_of(w)], chart_from_u(uv.x));
+                off += std::abs(uv.x - want.x) > 1e-6f || std::abs(uv.y - want.y) > 1e-6f;
+            }
+            for (uint32_t t = 0; t < c.triangle_count; ++t) {
+                const uint32_t p = g.cluster_triangles[c.triangle_offset + t];
+                const uint32_t* v = &g.cluster_vertices[c.vertex_offset];
+                const uint32_t a = chart_from_u(g.wedge_uvs[v[p & 255]].x), b = chart_from_u(g.wedge_uvs[v[p >> 8 & 255]].x),
+                               d = chart_from_u(g.wedge_uvs[v[p >> 16 & 255]].x);
+                const bool bad = a != b || b != d;
+                mixed += bad;
+                mixed_root += bad && c.parent_error >= 1e30f;
+            }
+        }
+        std::printf("  %zu wedges; %zu off their vertex's coordinates; %zu triangles across charts (%zu in roots)\n",
+                    g.wedge_uvs.size(), off, mixed, mixed_root);
+        CHECK(!exact || off == 0);
+        CHECK(mixed == mixed_root);
+    }
     size_t roots = 0;
     for (const gpu_cluster& c : g.clusters) {
         roots += c.parent_error >= 1e30f;
@@ -238,14 +312,18 @@ void test_hierarchy(const char* name, const mesh& input) {
     // positions within half a grid step, normals within a fraction of a degree,
     // shared vertices identical from every cluster: quantizing opens no cracks.
     size_t wrong = 0, mismatched = 0;
-    float worst_normal = 1, worst_position = 0;
+    float worst_normal = 1, worst_position = 0, worst_uv = 0;
     std::map<uint32_t, vec3> seen;
     for (size_t i = 0; i < g.clusters.size(); ++i) {
         const gpu_cluster& c = g.clusters[i];
         const gpu_cluster& pc = back.clusters[i];
         const uint32_t* base = &back.data[back.pages[pc.group].offset / 4];
         for (uint32_t k = 0; k < c.vertex_count; ++k) {
-            const uint32_t v = g.cluster_vertices[c.vertex_offset + k];
+            const uint32_t w = g.cluster_vertices[c.vertex_offset + k], v = g.vertex_of(w);
+            if (g.textured()) {
+                const vec2 uv = decode_uv(pc, base, k), want = g.wedge_uvs[w];
+                worst_uv = std::max({worst_uv, std::abs(uv.x - want.x), std::abs(uv.y - want.y)});
+            }
             const vec3 p = decode_position(back, pc, base, k);
             const vec3 original(g.positions[3 * v], g.positions[3 * v + 1], g.positions[3 * v + 2]);
             worst_position = std::max(worst_position, length(p - original));
@@ -262,6 +340,8 @@ void test_hierarchy(const char* name, const mesh& input) {
     CHECK(mismatched == 0);
     CHECK(worst_position <= 0.88f * back.grid_step);  // half a step per axis
     CHECK(worst_normal > 0.9999f);
+    CHECK(worst_uv <= 0.5f / 65535 + 1e-7f);
+    if (g.textured()) std::printf("  texture coordinates within %.2f steps of 1/65535\n", worst_uv * 65535);
     size_t bad_deps = 0;
     for (const gpu_cluster& c : back.clusters)
         if (c.creator != no_page) {
@@ -271,6 +351,60 @@ void test_hierarchy(const char* name, const mesh& input) {
         }
     CHECK(bad_deps == 0);
     CHECK(back.pages[0].dep_count == 0);
+}
+
+// bc1 blocks within a few levels on smooth colour, and a texture file's tiles: each texel of
+// a tile, border included, is its level's texel (clamped at the edges), through bc1.
+void test_texture() {
+    std::printf("textures\n");
+    uint8_t rgb[48], back[48], block[8];
+    int worst_smooth = 0;
+    for (int b = 0; b < 200; ++b) {
+        for (int i = 0; i < 16; ++i) {
+            const float t = (i % 4 + i / 4) / 6.0f;
+            rgb[3 * i] = uint8_t(30 + b + 20 * t);
+            rgb[3 * i + 1] = uint8_t(200 - b / 2 - 30 * t);
+            rgb[3 * i + 2] = uint8_t(90 + 10 * t);
+        }
+        encode_bc1(rgb, block);
+        decode_bc1(block, back);
+        for (int i = 0; i < 48; ++i) worst_smooth = std::max(worst_smooth, std::abs(rgb[i] - back[i]));
+    }
+    std::printf("  bc1 on gradients: within %d of 255\n", worst_smooth);
+    CHECK(worst_smooth <= 10);
+
+    image im;
+    im.width = 300;
+    im.height = 130;
+    for (uint32_t y = 0; y < im.height; ++y)
+        for (uint32_t x = 0; x < im.width; ++x)
+            im.rgb.insert(im.rgb.end(), {uint8_t(x * 255 / 299), uint8_t(y * 255 / 129), uint8_t(128 + 100 * std::sin(x * 0.05f))});
+    const std::string path = temp_path("test.ctex");
+    save_texture(im, path);
+    const texture_info t = load_texture_info(path);
+    CHECK(t.levels.size() == 3);  // 300 x 130, 150 x 65, 75 x 33
+    CHECK(t.levels.size() == 3 && t.levels[0].tiles_x == 3 && t.levels[0].tiles_y == 2 && t.levels[2].tiles_x == 1);
+    CHECK(t.tile_count() == 6 + 2 + 1);
+    CHECK(t.parent(4) == 6);  // (1, 1) of level 0 -> (0, 0) of level 1
+    CHECK(t.parent(5) == 7);  // (2, 1) -> (1, 0)
+    CHECK(t.parent(8) == UINT32_MAX);
+    // level 0 tile (2, 1): its texels against the image.
+    std::ifstream f(path, std::ios::binary);
+    std::vector<uint8_t> tile(tile_bytes);
+    f.seekg(static_cast<std::streamoff>(t.data_offset + 5 * tile_bytes));
+    f.read(reinterpret_cast<char*>(tile.data()), tile_bytes);
+    int worst = 0;
+    for (uint32_t by = 0; by < tile_texels / 4; ++by)
+        for (uint32_t bx = 0; bx < tile_texels / 4; ++bx) {
+            decode_bc1(&tile[(by * 32 + bx) * 8], back);
+            for (int i = 0; i < 16; ++i) {
+                const int x = std::clamp(int(2 * tile_payload) - int(tile_border) + int(4 * bx) + i % 4, 0, 299);
+                const int y = std::clamp(int(tile_payload) - int(tile_border) + int(4 * by) + i / 4, 0, 129);
+                for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(back[3 * i + c] - im.rgb[(size_t(y) * 300 + x) * 3 + c]));
+            }
+        }
+    std::printf("  a tile against its image: within %d of 255\n", worst);
+    CHECK(worst <= 12);
 }
 
 }  // namespace
@@ -354,6 +488,7 @@ void test_deviation_bound() {
 }
 
 int main() {
+    test_texture();
     test_deviation_bound();
     test_packed_cones();
     test_ply_and_obj();
@@ -364,6 +499,9 @@ int main() {
     test_hierarchy("closed sphere", bumpy_sphere(7));
     test_hierarchy("sphere with holes", holed_sphere(7));
     test_hierarchy("flat grid", grid(250));
+    test_hierarchy("textured sphere with holes", grid_textured(holed_sphere(7), 2));
+    texture_charts = 216;
+    test_hierarchy("sphere with holes, 216 small charts", grid_textured(holed_sphere(7), 6), false);
     if (failures) {
         std::printf("%d checks failed\n", failures);
         return 1;

@@ -38,13 +38,20 @@ struct geometry {
     std::vector<float> positions;  // xyz per vertex
     std::vector<float> normals;    // xyz per vertex
     std::vector<gpu_cluster> clusters;  // by parent error
-    std::vector<uint32_t> cluster_vertices;
+    // a cluster's vertices are wedges: a vertex and its texture coordinates in one chart.
+    // untextured, both are empty and a wedge is its vertex.
+    std::vector<uint32_t> wedge_vertex;
+    std::vector<vec2> wedge_uvs;
+    std::string texture;
+    std::vector<uint32_t> cluster_vertices;  // wedges
     std::vector<uint32_t> cluster_triangles;  // a | b << 8 | c << 16
     std::vector<lod_level_stats> levels;
     sphere bounds;      // around the model
     sphere lod_bounds;  // around bounds and every lod and parent sphere
 
     size_t leaf_triangles() const;
+    bool textured() const { return !wedge_uvs.empty(); }
+    uint32_t vertex_of(uint32_t wedge) const { return wedge_vertex.empty() ? wedge : wedge_vertex[wedge]; }
 };
 
 geometry pack(const lod_mesh& lod);

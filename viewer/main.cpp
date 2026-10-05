@@ -14,6 +14,7 @@
 //     colossus --model models/lucy.cgeo --grid 10
 //     colossus --model a.cgeo --model b.cgeo --grid 40 --headless --frames 60 --screenshot out.png
 #include "paged_file.hpp"
+#include "texture_file.hpp"
 #include "streamer.hpp"
 #include "png.hpp"
 #include "vk.hpp"
@@ -129,6 +130,8 @@ struct gpu_mesh {
     float bounds[4];
     float lod_bounds[4];
     float grid[4];  // grid point 0 and step: see paged_file.hpp
+    // texture tiles: first page, level count (0: untextured), width, height (texture_file.hpp)
+    uint32_t texture[4];
 };
 struct gpu_instance {
     float rows[3][4];
@@ -415,6 +418,33 @@ void make_scene(const options& opt, scene& s) {
         }
 
         gpu_mesh m{};
+        // a texture beside the model streams with it: its tiles are pages too, each depending
+        // on the coarser tile over it, so a resident tile's coarser copies are resident.
+        const std::string ctex = path.substr(0, path.find_last_of('.')) + ".ctex";
+        if (access(ctex.c_str(), R_OK) == 0) {
+            const texture_info t = load_texture_info(ctex);
+            const int tfd = open(ctex.c_str(), O_RDONLY);
+            if (tfd < 0) throw std::runtime_error("cannot open " + ctex);
+            if (opt.cold) posix_fadvise(tfd, 0, 0, POSIX_FADV_DONTNEED);
+            s.files.push_back(tfd);
+            const uint32_t first = static_cast<uint32_t>(s.pages.size());
+            for (uint32_t k = 0; k < t.tile_count(); ++k) {
+                const uint32_t parent = t.parent(k);
+                const uint32_t dep_first = static_cast<uint32_t>(s.deps.size());
+                if (parent != UINT32_MAX) s.deps.push_back(first + parent);
+                stream_page sp{tfd, t.data_offset + uint64_t(k) * tile_bytes, tile_bytes, dep_first,
+                               parent != UINT32_MAX ? 1u : 0u, parent == UINT32_MAX};
+                sp.child_first = static_cast<uint32_t>(s.children.size());
+                s.pages.push_back(sp);
+            }
+            m.texture[0] = first;
+            m.texture[1] = static_cast<uint32_t>(t.levels.size());
+            m.texture[2] = t.width;
+            m.texture[3] = t.height;
+            s.total_page_bytes += uint64_t(t.tile_count()) * tile_bytes;
+            std::printf("  texture %u x %u: %zu levels, %u tiles, %.0f MB\n", t.width, t.height, t.levels.size(), t.tile_count(),
+                        t.tile_count() * double(tile_bytes) / 1048576.0);
+        }
         m.shadow_error = shadow_error;
         m.first_cluster = static_cast<uint32_t>(s.clusters.size());
         m.cluster_count = static_cast<uint32_t>(g.clusters.size());

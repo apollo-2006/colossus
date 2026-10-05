@@ -5,11 +5,19 @@
 #include <string>
 #include <vector>
 
+// a textured mesh keeps texture coordinates per wedge: a vertex as one texture chart sees it
+// (a vertex on a uv seam has a wedge per chart). each triangle corner names its wedge. an
+// untextured mesh has none.
 struct mesh {
     std::vector<vec3> positions;
     std::vector<uint32_t> indices;  // three per triangle
+    std::vector<uint32_t> corners;  // a wedge per index, or empty
+    std::vector<vec2> wedge_uvs;    // texture coordinates, v down
+    std::vector<uint32_t> wedge_vertex;
+    std::string texture;            // the texture's file, if any (an obj's map_Kd)
 
     size_t triangle_count() const { return indices.size() / 3; }
+    bool textured() const { return !corners.empty(); }
 };
 
 // reads ply (binary, either byte order, or ascii) or obj, by extension.

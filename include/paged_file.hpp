@@ -13,7 +13,11 @@
 // bits first; a triangle three indices of ib bits, ib enough for the vertex
 // count. the widths ride in the cluster's level word (cluster_level()):
 //
-//   level (8) | bx (4) << 8 | by (4) << 12 | bz (4) << 16 | ib (4) << 20
+//   level (8) | bx (4) << 8 | by (4) << 12 | bz (4) << 16 | ib (3) << 20 | textured (1) << 23
+//
+// a textured cluster's texture coordinates follow its vertex run (and the word after it): a
+// word u0 | v0 << 16, the cluster's corner on a 65535-step grid over [0, 1], a word bu | bv << 5,
+// then per vertex its offsets from the corner in bu and bv bits.
 //
 // shared vertices snap to the same grid point in each cluster: no cracks.
 //
@@ -104,5 +108,8 @@ inline uint32_t cluster_level(const gpu_cluster& c) { return c.level & 0xff; }
 // vertex k of a cluster, from its page's words.
 vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* page, uint32_t k);
 vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k);
+// texture coordinates of vertex k of a textured cluster.
+vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k);
+inline bool cluster_textured(const gpu_cluster& c) { return (c.level >> 23) & 1; }
 // triangle t of a cluster (a | b << 8 | c << 16) from its page.
 uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t);

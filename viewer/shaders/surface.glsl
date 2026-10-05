@@ -16,7 +16,27 @@ struct Surface {
     uint id;      // in the visibility buffer
     uvec2 vc;     // (instance, cluster)
     vec3 p0, p1, p2;
+    uint base;       // the cluster's page
+    uvec3 corners;   // the triangle's vertices in the cluster
+    vec2 bary;       // weights of corners 1 and 2
 };
+
+// weights of a triangle's corners 1 and 2 where the ray from the camera along dir meets its
+// plane (moller-trumbore), unclamped.
+vec2 plane_bary(vec3 p0, vec3 p1, vec3 p2, vec3 dir) {
+    const vec3 e1 = p1 - p0, e2 = p2 - p0;
+    const vec3 pv = cross(dir, e2);
+    const float det = dot(e1, pv);
+    const vec3 tv = frame.origin.xyz - p0;
+    const float inv = abs(det) > 1e-20 ? 1.0 / det : 0.0;
+    return vec2(dot(tv, pv), dot(dir, cross(tv, e1))) * inv;
+}
+
+vec3 pixel_ray_at(vec2 p) {
+    const vec2 ndc = p / vec2(frame.width, frame.height) * 2.0 - 1.0;
+    const vec4 near_point = frame.inv_view_proj * vec4(ndc, 1.0, 1.0);
+    return normalize(near_point.xyz / near_point.w - frame.origin.xyz);
+}
 
 vec3 pixel_ray(uvec2 px) {
     const vec2 ndc = (vec2(px) + 0.5) / vec2(frame.width, frame.height) * 2.0 - 1.0;
@@ -66,6 +86,9 @@ Surface surface_at(uvec2 px) {
     // far outside.
     const float bu = clamp(dot(tv, pv) * inv, 0.0, 1.0);
     const float bv = clamp(dot(s.dir, qv) * inv, 0.0, 1.0 - bu);
+    s.base = base;
+    s.corners = uvec3(i0, i1, i2);
+    s.bary = vec2(bu, bv);
     // distance from depth, which is exact.
     const vec4 center = frame.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
     const vec3 forward = normalize(center.xyz / center.w - origin);

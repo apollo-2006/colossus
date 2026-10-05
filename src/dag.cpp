@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <numeric>
 
 namespace {
@@ -180,6 +181,62 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
+// the mesh's wedges, split so each lies in one texture chart, and a wedge per corner. charts
+// join triangles across an edge whose two ends have the same wedges on both sides. an
+// untextured mesh gets a wedge per vertex, one chart.
+std::vector<uint32_t> make_wedges(const mesh& m, lod_mesh& out) {
+    const size_t n = m.triangle_count();
+    if (!m.textured()) {
+        out.wedge_vertex.resize(m.positions.size());
+        std::iota(out.wedge_vertex.begin(), out.wedge_vertex.end(), 0u);
+        out.wedge_chart.assign(m.positions.size(), 0);
+        return m.indices;
+    }
+    // union find over triangles.
+    std::vector<uint32_t> parent(n);
+    std::iota(parent.begin(), parent.end(), 0u);
+    auto find = [&](uint32_t x) {
+        while (parent[x] != x) x = parent[x] = parent[parent[x]];
+        return x;
+    };
+    struct side { uint64_t edge; uint32_t tri, wa, wb; };
+    std::vector<side> sides;
+    sides.reserve(3 * n);
+    for (uint32_t t = 0; t < n; ++t)
+        for (int c = 0; c < 3; ++c) {
+            uint32_t a = m.indices[3 * t + c], b = m.indices[3 * t + (c + 1) % 3];
+            uint32_t wa = m.corners[3 * t + c], wb = m.corners[3 * t + (c + 1) % 3];
+            if (a > b) { std::swap(a, b); std::swap(wa, wb); }
+            sides.push_back({uint64_t(a) << 32 | b, t, wa, wb});
+        }
+    std::sort(sides.begin(), sides.end(), [](const side& x, const side& y) { return x.edge < y.edge; });
+    for (size_t i = 0; i < sides.size();) {
+        size_t j = i;
+        while (j < sides.size() && sides[j].edge == sides[i].edge) ++j;
+        for (size_t k = i + 1; k < j; ++k)
+            if (sides[k].wa == sides[i].wa && sides[k].wb == sides[i].wb) parent[find(sides[k].tri)] = find(sides[i].tri);
+        i = j;
+    }
+    // a wedge per (wedge, chart): a wedge two charts share splits.
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> split;
+    std::vector<uint32_t> corners(m.corners.size());
+    for (uint32_t t = 0; t < n; ++t) {
+        const uint32_t chart = find(t);
+        for (int c = 0; c < 3; ++c) {
+            const uint32_t w = m.corners[3 * t + c];
+            auto [it, added] = split.emplace(std::make_pair(w, chart), uint32_t(out.wedge_uvs.size()));
+            if (added) {
+                out.wedge_uvs.push_back(m.wedge_uvs[w]);
+                out.wedge_vertex.push_back(m.wedge_vertex[w]);
+                out.wedge_chart.push_back(chart);
+            }
+            corners[3 * t + c] = it->second;
+        }
+    }
+    out.texture = m.texture;
+    return corners;
+}
+
 }  // namespace
 
 void cluster_bounds(const std::vector<vec3>& positions, lod_cluster& c) {
@@ -210,17 +267,23 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
     lod_mesh out;
     out.positions = m.positions;
     out.normals = vertex_normals(m);
+    std::vector<uint32_t> corners = make_wedges(m, out);
 
-    auto make_clusters = [&](const std::vector<uint32_t>& indices, std::vector<lod_cluster>& dst) {
-        for (const auto& tris : clusterize(out.positions, indices)) {
+    auto make_clusters = [&](const std::vector<uint32_t>& indices, const std::vector<uint32_t>& corner_list,
+                             std::vector<lod_cluster>& dst) {
+        for (const auto& tris : clusterize(out.positions, indices, out.wedge_uvs.empty() ? nullptr : &corner_list)) {
             lod_cluster c;
             c.indices.reserve(3 * tris.size());
-            for (uint32_t t : tris) c.indices.insert(c.indices.end(), &indices[3 * t], &indices[3 * t + 3]);
+            c.corners.reserve(3 * tris.size());
+            for (uint32_t t : tris) {
+                c.indices.insert(c.indices.end(), &indices[3 * t], &indices[3 * t + 3]);
+                c.corners.insert(c.corners.end(), &corner_list[3 * t], &corner_list[3 * t + 3]);
+            }
             dst.push_back(std::move(c));
         }
     };
 
-    make_clusters(m.indices, out.clusters);
+    make_clusters(m.indices, corners, out.clusters);
     parallel_for(out.clusters.size(), [&](size_t i) {
         cluster_bounds(out.positions, out.clusters[i]);
         out.clusters[i].lod_bounds = out.clusters[i].bounds;
@@ -260,14 +323,16 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 }
 
         std::vector<std::vector<lod_cluster>> made(groups.size());
+        std::vector<std::vector<new_wedge>> made_wedges(groups.size());
         std::vector<uint8_t> stuck(groups.size(), 0);
         parallel_for(groups.size(), [&](size_t g) {
-            std::vector<uint32_t> merged;
+            std::vector<uint32_t> merged, merged_corners;
             float child_error = 0;
             sphere bounds = out.clusters[groups[g][0]].lod_bounds;
             for (uint32_t c : groups[g]) {
                 const lod_cluster& cl = out.clusters[c];
                 merged.insert(merged.end(), cl.indices.begin(), cl.indices.end());
+                merged_corners.insert(merged_corners.end(), cl.corners.begin(), cl.corners.end());
                 child_error = std::max(child_error, cl.lod_error);
                 bounds = merge(bounds, cl.lod_bounds);
             }
@@ -291,9 +356,15 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 stuck[g] = 1;
                 return;
             }
-            simplify_result s = simplify(out.positions, merged, locked, tris / 2);
+            wedges w{merged_corners, out.wedge_chart, out.wedge_vertex, out.wedge_uvs};
+            simplify_result s = simplify(out.positions, merged, locked, tris / 2, &w);
+            // seams of many small texture charts can pin a group: let them move.
+            if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && !out.wedge_uvs.empty()) {
+                w.relax = true;
+                s = simplify(out.positions, merged, locked, tris / 2, &w);
+            }
             if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && last)
-                s = cluster_vertices(out.positions, merged, std::max<size_t>(tris / 2, 1));
+                s = cluster_vertices(out.positions, merged, std::max<size_t>(tris / 2, 1), &w);
             if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) {
                 stuck[g] = 1;
                 return;
@@ -304,7 +375,7 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
             // coincide, flat parts, a bound cannot reach 0).
             float sampled = sampled_deviation(out.positions, merged, s.indices);
             if (sampled > outlier_ratio * s.error) {
-                simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4);
+                simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4, &w);
                 if (!gentle.indices.empty() && gentle.indices.size() / 3 <= stuck_ratio * tris) {
                     const float gentle_sampled = sampled_deviation(out.positions, merged, gentle.indices);
                     if (gentle_sampled < sampled) {
@@ -315,7 +386,8 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
             }
             const float measured = mesh_deviation(out.positions, merged, s.indices, 0.1f, bounds.radius * 1e-6f);
             const float error = child_error + std::max(s.error, measured);
-            make_clusters(s.indices, made[g]);
+            make_clusters(s.indices, s.corners, made[g]);
+            made_wedges[g] = std::move(s.new_wedges);
             for (lod_cluster& c : made[g]) {
                 cluster_bounds(out.positions, c);
                 c.lod_bounds = bounds;
@@ -340,7 +412,16 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 out.clusters[c].parent_error = made[g][0].lod_error;
                 out.clusters[c].group = group_id;
             }
+            // wedges the group's relaxed seams made, numbered after the rest.
+            const uint32_t wedge_base = static_cast<uint32_t>(out.wedge_uvs.size());
+            for (const new_wedge& nw : made_wedges[g]) {
+                out.wedge_uvs.push_back(nw.uv);
+                out.wedge_vertex.push_back(nw.vertex);
+                out.wedge_chart.push_back(nw.chart);
+            }
             for (lod_cluster& c : made[g]) {
+                for (uint32_t& k : c.corners)
+                    if (k & new_wedge_bit) k = wedge_base + (k & ~new_wedge_bit);
                 c.creator = group_id;
                 next.push_back(static_cast<uint32_t>(out.clusters.size()));
                 out.clusters.push_back(std::move(c));

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -27,11 +28,12 @@ bool ends_with(const std::string& s, const std::string& suffix) {
     return true;
 }
 
-void add_polygon(mesh& m, const uint32_t* v, size_t n) {
+void add_polygon(mesh& m, const uint32_t* v, size_t n, const uint32_t* w = nullptr) {
     for (size_t k = 2; k < n; ++k) {
         m.indices.push_back(v[0]);
         m.indices.push_back(v[k - 1]);
         m.indices.push_back(v[k]);
+        if (w) m.corners.insert(m.corners.end(), {w[0], w[k - 1], w[k]});
     }
 }
 
@@ -195,9 +197,15 @@ mesh load_ply(const std::string& data) {
     return m;
 }
 
-mesh load_obj(const std::string& data) {
+// obj: v, vt and f (v, v/vt, v/vt/vn or v//vn; negative counts back). with vt the mesh is
+// textured, a wedge per vt (split where one serves two positions); weld() merges equal ones.
+// mtllib's map_Kd names the texture, relative to the obj.
+mesh load_obj(const std::string& data, const std::string& path) {
     mesh m;
-    std::vector<uint32_t> poly;
+    std::vector<vec2>& uvs = m.wedge_uvs;
+    std::vector<uint32_t> poly, poly_wedges;
+    std::string mtllib;
+    bool any_uv = false, any_without = false;
     size_t pos = 0;
     while (pos < data.size()) {
         size_t eol = data.find('\n', pos);
@@ -213,9 +221,20 @@ mesh load_obj(const std::string& data) {
             p.y = std::strtof(next, &next);
             p.z = std::strtof(next, &next);
             m.positions.push_back(p);
+        } else if (end - s > 3 && s[0] == 'v' && s[1] == 't' && s[2] == ' ') {
+            char* next;
+            vec2 t;
+            t.x = std::strtof(s + 3, &next);
+            t.y = 1 - std::strtof(next, &next);  // obj's v runs up, textures' rows down
+            uvs.push_back(t);
+        } else if (end - s > 7 && std::strncmp(s, "mtllib ", 7) == 0) {
+            mtllib.assign(s + 7, end);
+            while (!mtllib.empty() && (mtllib.back() == '\r' || mtllib.back() == ' ')) mtllib.pop_back();
         } else if (end - s > 2 && s[0] == 'f' && s[1] == ' ') {
             poly.clear();
+            poly_wedges.clear();
             const char* q = s + 2;
+            bool with_uv = true;
             while (q < end) {
                 char* next;
                 const long v = std::strtol(q, &next, 10);
@@ -226,10 +245,58 @@ mesh load_obj(const std::string& data) {
                     throw std::runtime_error("OBJ: face index out of range");
                 poly.push_back(static_cast<uint32_t>(index));
                 q = next;
-                while (q < end && *q != ' ' && *q != '\t') ++q;  // skip /vt/vn
+                long t = 0;
+                if (q < end && *q == '/' && q + 1 < end && q[1] != '/') {
+                    t = std::strtol(q + 1, &next, 10);
+                    q = next;
+                }
+                if (t == 0) with_uv = false;
+                else {
+                    const long ti = t < 0 ? static_cast<long>(uvs.size()) + t : t - 1;
+                    if (ti < 0 || ti >= static_cast<long>(uvs.size())) throw std::runtime_error("OBJ: texture index out of range");
+                    poly_wedges.push_back(uint32_t(ti));
+                }
+                while (q < end && *q != ' ' && *q != '\t') ++q;  // skip /vn
                 while (q < end && (*q == ' ' || *q == '\t' || *q == '\r')) ++q;
             }
-            add_polygon(m, poly.data(), poly.size());
+            any_uv |= with_uv;
+            any_without |= !with_uv;
+            add_polygon(m, poly.data(), poly.size(), with_uv ? poly_wedges.data() : nullptr);
+        }
+    }
+    if (any_uv && any_without) throw std::runtime_error("OBJ: some faces have texture coordinates and some not");
+    if (!any_uv) {
+        m.wedge_uvs.clear();
+        return m;
+    }
+    // a wedge per vt, at the position its corners use; a vt at two positions splits.
+    m.wedge_vertex.assign(uvs.size(), UINT32_MAX);
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> split;
+    for (size_t i = 0; i < m.corners.size(); ++i) {
+        uint32_t& w = m.corners[i];
+        const uint32_t v = m.indices[i];
+        if (m.wedge_vertex[w] == UINT32_MAX) m.wedge_vertex[w] = v;
+        else if (m.wedge_vertex[w] != v) {
+            auto [it, added] = split.emplace(std::make_pair(w, v), uint32_t(uvs.size()));
+            if (added) {
+                uvs.push_back(uvs[w]);
+                m.wedge_vertex.push_back(v);
+            }
+            w = it->second;
+        }
+    }
+    // the texture, from the material library.
+    if (!mtllib.empty()) {
+        const std::string dir = path.substr(0, path.find_last_of('/') + 1);
+        std::ifstream f(dir + mtllib);
+        std::string line;
+        while (std::getline(f, line)) {
+            size_t a = line.find_first_not_of(" \t");
+            if (a == std::string::npos || line.compare(a, 7, "map_Kd ") != 0) continue;
+            std::string name = line.substr(a + 7);
+            while (!name.empty() && (name.back() == '\r' || name.back() == ' ')) name.pop_back();
+            m.texture = dir + name.substr(name.find_last_of(' ') == std::string::npos ? 0 : name.find_last_of(' ') + 1);
+            break;
         }
     }
     return m;
@@ -240,7 +307,7 @@ mesh load_obj(const std::string& data) {
 mesh load_mesh(const std::string& path) {
     const std::string data = read_file(path);
     if (ends_with(path, ".ply")) return load_ply(data);
-    if (ends_with(path, ".obj")) return load_obj(data);
+    if (ends_with(path, ".obj")) return load_obj(data, path);
     throw std::runtime_error("unknown mesh format: " + path + " (want .ply or .obj)");
 }
 
@@ -273,7 +340,7 @@ void weld(mesh& m) {
     };
     std::unordered_map<std::array<uint32_t, 3>, char, tri_hash> seen;
     seen.reserve(m.triangle_count());
-    std::vector<uint32_t> indices;
+    std::vector<uint32_t> indices, corners;
     indices.reserve(m.indices.size());
     for (size_t t = 0; t < m.triangle_count(); ++t) {
         uint32_t a = remap[m.indices[3 * t]], b = remap[m.indices[3 * t + 1]], c = remap[m.indices[3 * t + 2]];
@@ -283,6 +350,7 @@ void weld(mesh& m) {
         while (k[0] != std::min({a, b, c})) std::rotate(k.begin(), k.begin() + 1, k.end());
         if (!seen.emplace(k, 0).second) continue;
         indices.insert(indices.end(), {a, b, c});
+        if (m.textured()) corners.insert(corners.end(), &m.corners[3 * t], &m.corners[3 * t + 3]);
     }
 
     // drop unused vertices.
@@ -296,6 +364,36 @@ void weld(mesh& m) {
         i = used[i];
     }
     m.indices = std::move(indices);
+
+    // wedges: one per welded vertex and texture coordinate, only those still used. each
+    // vertex's corners in a row (counting sort), equal coordinates merged within it.
+    if (!m.textured()) return;
+    std::vector<uint32_t> start(m.positions.size() + 1, 0), order(corners.size());
+    for (uint32_t v : m.indices) ++start[v + 1];
+    for (size_t v = 0; v < m.positions.size(); ++v) start[v + 1] += start[v];
+    {
+        std::vector<uint32_t> fill(start.begin(), start.end() - 1);
+        for (size_t i = 0; i < corners.size(); ++i) order[fill[m.indices[i]]++] = uint32_t(i);
+    }
+    std::vector<vec2> uvs;
+    std::vector<uint32_t> wedge_vertex;
+    for (size_t v = 0; v < m.positions.size(); ++v) {
+        const size_t first_wedge = uvs.size();
+        for (uint32_t k = start[v]; k < start[v + 1]; ++k) {
+            const uint32_t i = order[k];
+            const vec2 uv = m.wedge_uvs[corners[i]];
+            size_t w = first_wedge;
+            while (w < uvs.size() && (uvs[w].x != uv.x || uvs[w].y != uv.y)) ++w;
+            if (w == uvs.size()) {
+                uvs.push_back(uv);
+                wedge_vertex.push_back(uint32_t(v));
+            }
+            corners[i] = uint32_t(w);
+        }
+    }
+    m.corners = std::move(corners);
+    m.wedge_uvs = std::move(uvs);
+    m.wedge_vertex = std::move(wedge_vertex);
 }
 
 void normalize_placement(mesh& m, bool up_z) {
@@ -310,7 +408,10 @@ void normalize_placement(mesh& m, bool up_z) {
         volume += dot(a, cross(b, c));
     }
     if (volume < 0)
-        for (size_t t = 0; t < m.triangle_count(); ++t) std::swap(m.indices[3 * t + 1], m.indices[3 * t + 2]);
+        for (size_t t = 0; t < m.triangle_count(); ++t) {
+            std::swap(m.indices[3 * t + 1], m.indices[3 * t + 2]);
+            if (m.textured()) std::swap(m.corners[3 * t + 1], m.corners[3 * t + 2]);
+        }
     vec3 lo = m.positions[0], hi = lo;
     for (const vec3& p : m.positions) { lo = min(lo, p); hi = max(hi, p); }
     const vec3 size = hi - lo;

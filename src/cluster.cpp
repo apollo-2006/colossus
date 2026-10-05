@@ -12,7 +12,7 @@ constexpr size_t leaf_triangles = 8192;
 // recursive bisection of the triangle graph (triangles joined across edges). halves
 // are compact, and every cluster but one per piece is full.
 std::vector<std::vector<uint32_t>> bisect_piece(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                                                const std::vector<uint32_t>& tris) {
+                                                const std::vector<uint32_t>& tris, const std::vector<uint32_t>* counted) {
     const size_t n = tris.size();
     std::vector<std::vector<uint32_t>> out;
     if (n == 0) return out;
@@ -55,7 +55,22 @@ std::vector<std::vector<uint32_t>> bisect_piece(const std::vector<vec3>& positio
         centroid[i] = (positions[verts[corner[3 * i]]] + positions[verts[corner[3 * i + 1]]] + positions[verts[corner[3 * i + 2]]]) *
                       (1.0f / 3);
 
-    std::vector<uint32_t> member(n, UINT32_MAX), seen(n, UINT32_MAX), vertex_stamp(nv, UINT32_MAX);
+    // what the vertex limit counts: vertices, or the ids given (wedges), numbered locally.
+    std::vector<uint32_t> count_id(corner);
+    size_t count_ids = nv;
+    if (counted) {
+        std::vector<uint32_t> ids;
+        ids.reserve(3 * n);
+        for (uint32_t t : tris)
+            for (int c = 0; c < 3; ++c) ids.push_back((*counted)[3 * t + c]);
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        for (size_t i = 0; i < n; ++i)
+            for (int c = 0; c < 3; ++c)
+                count_id[3 * i + c] = static_cast<uint32_t>(std::lower_bound(ids.begin(), ids.end(), (*counted)[3 * tris[i] + c]) - ids.begin());
+        count_ids = ids.size();
+    }
+    std::vector<uint32_t> member(n, UINT32_MAX), seen(n, UINT32_MAX), vertex_stamp(count_ids, UINT32_MAX);
     uint32_t stamp = 0;
     // breadth-first order of `set` from `seed`; unreachable pieces taken nearest the
     // seed first.
@@ -99,8 +114,8 @@ std::vector<std::vector<uint32_t>> bisect_piece(const std::vector<vec3>& positio
         uint32_t count = 0;
         for (uint32_t t : set)
             for (int c = 0; c < 3; ++c)
-                if (vertex_stamp[corner[3 * t + c]] != stamp) {
-                    vertex_stamp[corner[3 * t + c]] = stamp;
+                if (vertex_stamp[count_id[3 * t + c]] != stamp) {
+                    vertex_stamp[count_id[3 * t + c]] = stamp;
                     ++count;
                 }
         return count;
@@ -225,7 +240,8 @@ std::vector<std::vector<uint32_t>> bisect_piece(const std::vector<vec3>& positio
 
 }  // namespace
 
-std::vector<std::vector<uint32_t>> clusterize(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices) {
+std::vector<std::vector<uint32_t>> clusterize(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
+                                              const std::vector<uint32_t>* counted) {
     const size_t n = indices.size() / 3;
     std::vector<vec3> centroid(n);
     for (size_t t = 0; t < n; ++t)
@@ -258,7 +274,7 @@ std::vector<std::vector<uint32_t>> clusterize(const std::vector<vec3>& positions
     }
 
     std::vector<std::vector<std::vector<uint32_t>>> results(pieces.size());
-    parallel_for(pieces.size(), [&](size_t i) { results[i] = bisect_piece(positions, indices, pieces[i]); });
+    parallel_for(pieces.size(), [&](size_t i) { results[i] = bisect_piece(positions, indices, pieces[i], counted); });
     std::vector<std::vector<uint32_t>> out;
     for (auto& r : results)
         for (auto& c : r) out.push_back(std::move(c));

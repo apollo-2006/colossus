@@ -179,7 +179,7 @@ function decodePage(gl, model, c, page, data) {
   const g = model.grid;
   let v = 0, k = 0;
   for (const i of list) {
-    const lw = c.level[i], bx = (lw >>> 8) & 15, by = (lw >>> 12) & 15, bz = (lw >>> 16) & 15, ib = (lw >>> 20) & 15;
+    const lw = c.level[i], bx = (lw >>> 8) & 15, by = (lw >>> 12) & 15, bz = (lw >>> 16) & 15, ib = (lw >>> 20) & 7;
     const vc = c.counts[i] & 0xffff, tc = c.counts[i] >>> 16;
     const vat = c.offsets[i] & 0xffff, tat = c.offsets[i] >>> 16, stride = bx + by + bz + 22;
     const ox = c.origin[3 * i], oy = c.origin[3 * i + 1], oz = c.origin[3 * i + 2];

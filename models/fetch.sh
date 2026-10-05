@@ -5,11 +5,15 @@
 #     models/fetch.sh               # both
 #     models/fetch.sh dragon        # the xyz rgb asian dragon, 7.2M triangles
 #     models/fetch.sh lucy          # lucy, 28M triangles
+#     models/fetch.sh washington    # textured: horatio greenough's george washington
+#                                   # (1840), 17M triangles, a 720 mb download
 #
-# from the stanford 3d scanning repository,
+# the dragon and lucy are from the stanford 3d scanning repository,
 # http://graphics.stanford.edu/data/3Dscanrep/, which asks credit to the
 # stanford computer graphics laboratory (and, for the dragon, xyz rgb inc.) and
-# allows no commercial use without permission.
+# allows no commercial use without permission. washington is the smithsonian
+# american art museum's scan, released cc0 through smithsonian open access
+# (https://3d.si.edu). its texture is converted to ppm with ffmpeg.
 set -euo pipefail
 cd "$(dirname "$0")"
 names=("$@")
@@ -35,6 +39,15 @@ for name in "${names[@]}"; do
         tar xzf lucy.tar.gz lucy.ply && rm lucy.tar.gz
       fi
       $download_only || $build lucy.ply lucy.cgeo --up-z ;;
-    *) echo "unknown model $name (dragon, lucy)"; exit 2 ;;
+    washington)
+      stem="washington/george-washington-greenough-statue-(1840)-master"
+      if [[ ! -f $stem-geometry.obj ]]; then
+        mkdir -p washington
+        curl -fL -o washington/scan.zip "https://3d-api.si.edu/content/document/3d_package:789cf90a-4387-4ac1-9e96-c7d6a7b9d26f/resources/george-washington-greenough-statue-(1840)-full_resolution-obj.zip"
+        (cd washington && unzip -o -q scan.zip && rm scan.zip)
+      fi
+      [[ -f $stem-texture.ppm ]] || ffmpeg -v error -y -i "$stem-texture.jpg" "$stem-texture.ppm"
+      $download_only || $build "$stem-geometry.obj" washington.cgeo ;;
+    *) echo "unknown model $name (dragon, lucy, washington)"; exit 2 ;;
   esac
 done

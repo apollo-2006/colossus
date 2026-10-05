@@ -41,7 +41,7 @@ auto cluster_triangles(const geometry& g, Pick&& pick) {
             for (uint32_t t = 0; t < c.triangle_count; ++t) {
                 const uint32_t p = g.cluster_triangles[c.triangle_offset + t];
                 const uint32_t* v = &g.cluster_vertices[c.vertex_offset];
-                emit(v[p & 255], v[p >> 8 & 255], v[p >> 16 & 255]);
+                emit(g.vertex_of(v[p & 255]), g.vertex_of(v[p >> 8 & 255]), g.vertex_of(v[p >> 16 & 255]));
             }
         }
     };
