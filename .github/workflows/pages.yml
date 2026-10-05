@@ -1,7 +1,7 @@
 name: demo
 
-# builds the web models from the stanford scans and publishes web/ to github
-# pages, so the live demo runs the repository's code.
+# builds the web models from the stanford scans and the smithsonian's washington,
+# and publishes web/ to github pages, so the live demo runs the repository's code.
 on:
   push:
     branches: [main]
@@ -41,9 +41,13 @@ jobs:
             models/lucy.ply
             models/xyzrgb_dragon.ply
           key: stanford-scans-v1
+      # washington's texture is a jpeg, converted with ffmpeg.
+      - name: Install ffmpeg
+        if: steps.models.outputs.cache-hit != 'true'
+        run: command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
       - name: Download the scans
         if: steps.models.outputs.cache-hit != 'true'
-        run: models/fetch.sh --download-only dragon lucy
+        run: models/fetch.sh --download-only dragon lucy washington
       - name: Build the web models
         if: steps.models.outputs.cache-hit != 'true'
         run: web/build.sh

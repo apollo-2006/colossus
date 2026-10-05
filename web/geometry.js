@@ -21,10 +21,33 @@ export async function fetchBytes(url, onProgress) {
   return new Response(stream).arrayBuffer();
 }
 
+// a model and, if it has one, its texture: name.texture.json describing name.tiles (web/split.py).
 export async function fetchModel(stem, onProgress) {
   const model = parseMeta(await fetchBytes(`${stem}.meta.gz`, onProgress));
   model.pagesUrl = `${stem}.pages`;
+  const t = await fetch(`${stem}.texture.json`).catch(() => null);
+  if (t && t.ok) {
+    model.texture = await t.json();
+    model.texture.tilesUrl = `${stem}.tiles`;
+  }
   return model;
+}
+
+// a texture's tiles as pages (include/texture_file.hpp): level by level, each depending on the
+// tile one level coarser over it, the coarsest pinned.
+export function texturePages(texture) {
+  const out = [];
+  const levels = texture.levels;
+  for (let l = 0; l < levels.length; l++) {
+    const { tilesX, tilesY, first } = levels[l];
+    for (let y = 0; y < tilesY; y++)
+      for (let x = 0; x < tilesX; x++) {
+        const up = levels[l + 1];
+        const parent = up ? up.first + Math.min(y >> 1, up.tilesY - 1) * up.tilesX + Math.min(x >> 1, up.tilesX - 1) : -1;
+        out.push({ offset: (first + y * tilesX + x) * texture.tileBytes, size: texture.tileBytes, parent });
+      }
+  }
+  return out;
 }
 
 export function parseMeta(buffer) {

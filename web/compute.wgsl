@@ -201,6 +201,115 @@ fn request_finer(c: Cluster, priority: f32) {
   if (k < frame.max_requests) { requests.list[k] = vec2u(c.creator, bitcast<u32>(priority)); }
 }
 
+// a model's texture, streamed as tiles into the page pool (include/texture_file.hpp, and
+// viewer/shaders/texture.glsl, which this follows): bc1 decoded here, bilinear within a tile
+// (its border holds the neighbours), trilinear across levels. a missing tile is asked for and
+// its nearest resident coarser copy drawn: tiles are resident only while their coarser copies
+// are, and the coarsest is pinned.
+const TILE_TEXELS = 128u;
+const TILE_BORDER = 4u;
+const TILE_PAYLOAD = 120u;
+
+fn srgb_to_linear3(c: vec3f) -> vec3f {
+  return select(c / 12.92, pow((c + 0.055) / 1.055, vec3f(2.4)), c > vec3f(0.04045));
+}
+
+fn unpack565(v: u32) -> vec3f {
+  return vec3f(f32(v >> 11u), f32((v >> 5u) & 63u), f32(v & 31u)) / vec3f(31.0, 63.0, 31.0);
+}
+
+// texel t (0 to 127 each way) of the tile at word `at`, linear.
+fn tile_texel(at: u32, t: vec2u) -> vec3f {
+  let block = at + 2u * ((t.y >> 2u) * (TILE_TEXELS / 4u) + (t.x >> 2u));
+  let ends = pool[block];
+  let bits = pool[block + 1u];
+  let c0 = ends & 0xffffu;
+  let c1 = ends >> 16u;
+  let index = (bits >> (2u * ((t.y & 3u) * 4u + (t.x & 3u)))) & 3u;
+  let a = unpack565(c0);
+  let b = unpack565(c1);
+  var c = a;
+  if (index == 1u) { c = b; }
+  else if (index == 2u) { c = select((a + b) * 0.5, (2.0 * a + b) / 3.0, c0 > c1); }
+  else if (index == 3u) { c = select(vec3f(0.0), (a + 2.0 * b) / 3.0, c0 > c1); }
+  return srgb_to_linear3(c);
+}
+
+struct TextureLevel {
+  size: vec2u,
+  tiles: vec2u,
+  first: u32,
+}
+
+fn texture_level(tex: vec4u, level: u32) -> TextureLevel {
+  var l: TextureLevel;
+  l.size = tex.zw;
+  l.first = tex.x;
+  for (var k = 0u; k < level; k++) {
+    l.tiles = (l.size + TILE_PAYLOAD - 1u) / TILE_PAYLOAD;
+    l.first += l.tiles.x * l.tiles.y;
+    l.size = (l.size + 1u) / 2u;
+  }
+  l.tiles = (l.size + TILE_PAYLOAD - 1u) / TILE_PAYLOAD;
+  return l;
+}
+
+// bilinear at uv from the finest resident level from `level` up; a missing `level` tile is
+// asked for, more urgently the coarser the copy drawn instead.
+fn sample_resident(tex: vec4u, uv: vec2f, level: u32) -> vec3f {
+  var wanted = NO_PAGE;
+  for (var k = level; k < tex.y; k++) {
+    let l = texture_level(tex, k);
+    let at = clamp(uv, vec2f(0.0), vec2f(1.0)) * vec2f(l.size) - 0.5;
+    let base = floor(at);
+    let f = at - base;
+    let b = vec2i(base);
+    let tile = min(vec2u(max(b, vec2i(0))) / TILE_PAYLOAD, l.tiles - 1u);
+    let page = l.first + tile.y * l.tiles.x + tile.x;
+    let word = page_table[page];
+    if (word == NO_PAGE) {
+      if (k == level) { wanted = page; }
+      continue;
+    }
+    if (wanted != NO_PAGE) {
+      let stamp = arrayLength(&page_stamps) / 2u + wanted;
+      if (atomicExchange(&page_stamps[stamp], frame.frame_index) != frame.frame_index) {
+        let n = atomicAdd(&requests.count, 1u);
+        if (n < frame.max_requests) { requests.list[n] = vec2u(wanted, bitcast<u32>(frame.lod_threshold * exp2(f32(k - level)))); }
+      }
+    }
+    atomicStore(&page_stamps[page], frame.frame_index);
+    let t = vec2u(clamp(b - vec2i(tile * TILE_PAYLOAD) + i32(TILE_BORDER), vec2i(0), vec2i(i32(TILE_TEXELS) - 2)));
+    return mix(mix(tile_texel(word, t), tile_texel(word, t + vec2u(1u, 0u)), f.x),
+               mix(tile_texel(word, t + vec2u(0u, 1u)), tile_texel(word, t + vec2u(1u, 1u)), f.x), f.y);
+  }
+  return vec3f(1.0, 0.0, 1.0);  // unreachable: the coarsest tile is pinned
+}
+
+// trilinear: the level whose texels match the pixel's footprint, and the next.
+fn sample_texture(tex: vec4u, uv: vec2f, duv_dx: vec2f, duv_dy: vec2f) -> vec3f {
+  let size = vec2f(tex.zw);
+  let footprint = max(length(duv_dx * size), length(duv_dy * size));
+  let lod = clamp(log2(max(footprint, 1e-8)), 0.0, f32(tex.y - 1u));
+  let level = u32(lod);
+  let f = lod - f32(level);
+  let a = sample_resident(tex, uv, level);
+  if (f < 1.0 / 64.0 || level + 1u >= tex.y) { return a; }
+  return mix(a, sample_resident(tex, uv, level + 1u), f);
+}
+
+// weights of a triangle's corners 1 and 2 where the ray from the camera along dir meets its
+// plane, unclamped.
+fn plane_bary(p0: vec3f, p1: vec3f, p2: vec3f, origin: vec3f, dir: vec3f) -> vec2f {
+  let e1 = p1 - p0;
+  let e2 = p2 - p0;
+  let pv = cross(dir, e2);
+  let det = dot(e1, pv);
+  let inv = select(0.0, 1.0 / det, abs(det) > 1e-20);
+  let tv = origin - p0;
+  return vec2f(dot(tv, pv), dot(dir, cross(tv, e1))) * inv;
+}
+
 // indirect arguments: [0, 8) cluster culling per pass, [8, 16) hardware draws,
 // [16, 24) software dispatches, [24, 28) pass 2 instance culling, [28, 36)
 // expand per pass, [36, 40) pass 1 instance culling, [40, 44) pass 2 cell
@@ -977,6 +1086,13 @@ fn sunlight(p: vec3f, n: vec3f, noise: f32) -> f32 {
   return 1.0;
 }
 
+// the ray from the camera through a point of the image (pixel units).
+fn pixel_dir(p: vec2f) -> vec3f {
+  let ndc = vec2f(p.x / f32(frame.width) * 2.0 - 1.0, 1.0 - p.y / f32(frame.height) * 2.0);
+  let near_point = frame.inv_view_proj * vec4f(ndc, 1.0, 1.0);
+  return normalize(near_point.xyz / near_point.w - frame.origin.xyz);
+}
+
 @compute @workgroup_size(8, 8)
 fn shade(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= frame.width || gid.y >= frame.height) { return; }
@@ -1065,7 +1181,22 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let geometric_n = n;
     var wrap = 0.0;
     var coat = 0.0;
-    if (frame.debug_mode == 0u) {
+    let tex = meshes[inst.mesh].tex;
+    if (frame.debug_mode == 0u && tex.y != 0u && cluster_textured(c)) {
+      // a scan's own colour: no procedural detail. texture coordinates where this pixel's ray
+      // and its neighbours' meet the triangle's plane: their differences pick the level.
+      let uv0 = cluster_uv(c, i0);
+      let uv1 = cluster_uv(c, i1);
+      let uv2 = cluster_uv(c, i2);
+      let pf = vec2f(gid.xy) + 0.5;
+      let b0 = plane_bary(p0, p1, p2, origin, dir);
+      let bx = plane_bary(p0, p1, p2, origin, pixel_dir(pf + vec2f(1.0, 0.0)));
+      let by = plane_bary(p0, p1, p2, origin, pixel_dir(pf + vec2f(0.0, 1.0)));
+      let uv = uv0 + (uv1 - uv0) * bu + (uv2 - uv0) * bv;
+      let duv_dx = (uv1 - uv0) * (bx.x - b0.x) + (uv2 - uv0) * (bx.y - b0.y);
+      let duv_dy = (uv1 - uv0) * (by.x - b0.x) + (uv2 - uv0) * (by.y - b0.y);
+      m = Material(sample_texture(tex, uv, duv_dx, duv_dy), 0.75, 0.0);
+    } else if (frame.debug_mode == 0u) {
       let radius = bounds.w;
       // detail is fixed to the rest surface: a swaying statue's grain bends with it.
       let drawn = from_world(inst, origin + dir * t);

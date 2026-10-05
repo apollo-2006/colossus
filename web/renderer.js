@@ -5,6 +5,7 @@
 // then shadow pages (vsm.wgsl) -> shade -> taa -> blit.
 import { frustumPlanes, invert, lookTo, mul, perspectiveReverseZ } from './math.js';
 import { Streamer } from './streamer.js';
+import { texturePages } from './geometry.js';
 
 const MAX_WORK = 1 << 20;
 const MAX_VISIBLE = 1 << 20;
@@ -248,10 +249,12 @@ export class Renderer {
   // need them.
   loadModels(models, poolBytes) {
     const d = this.device;
-    const total = models.reduce((a, m) => ({ c: a.c + m.clusterCount, p: a.p + m.pages.length }), { c: 0, p: 0 });
+    // pages: each model's, then its texture's tiles (texturePages()).
+    const tiles = models.map((m) => (m.texture ? texturePages(m.texture) : []));
+    const total = models.reduce((a, m, k) => ({ c: a.c + m.clusterCount, p: a.p + m.pages.length + tiles[k].length }), { c: 0, p: 0 });
     const clusters = new ArrayBuffer(total.c * 48);
     const shared = new Float32Array(total.p * 5);
-    const meshes = new ArrayBuffer(models.length * 64);
+    const meshes = new ArrayBuffer(models.length * 80);
     const pages = [];
     let clusterBase = 0;
     models.forEach((m, k) => {
@@ -267,12 +270,20 @@ export class Renderer {
         url: m.pagesUrl, offset: p.offset, size: p.size, pinned: i === 0,
         deps: p.deps.map((x) => x + pageBase), children: p.children.map((x) => x + pageBase), error: p.error,
       }));
-      const mu = new Uint32Array(meshes, k * 64, 4), mf = new Float32Array(meshes, k * 64 + 16, 12);
+      const mu = new Uint32Array(meshes, k * 80, 4), mf = new Float32Array(meshes, k * 80 + 16, 12);
       mu[0] = clusterBase;
       mu[1] = m.clusterCount;
       mf.set(m.bounds, 0);
       mf.set(m.lodBounds, 4);
       mf.set(m.grid, 8);
+      if (m.texture) {
+        // first tile page, levels, width, height (Mesh::tex in common.wgsl).
+        const tileBase = pages.length;
+        new Uint32Array(meshes, k * 80 + 64, 4).set([tileBase, m.texture.levels.length, m.texture.width, m.texture.height]);
+        for (const t of tiles[k])
+          pages.push({ url: m.texture.tilesUrl, offset: t.offset, size: t.size, pinned: t.parent < 0,
+                       deps: t.parent < 0 ? [] : [tileBase + t.parent], children: [], error: 0 });
+      }
       clusterBase += m.clusterCount;
     });
     this.models = models;

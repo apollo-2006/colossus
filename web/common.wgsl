@@ -93,6 +93,7 @@ struct Mesh {
   bounds: vec4f,
   lod_bounds: vec4f,
   grid: vec4f,  // position snapping: xyz grid point 0, w step
+  tex: vec4u,   // texture tiles: first page, levels (0: none), width, height (compute.wgsl)
 }
 
 struct Instance {
@@ -309,6 +310,22 @@ fn cluster_normal(c: Cluster, k: u32) -> vec3f {
   let xyz = b.x + b.y + b.z;
   return decode_octahedral(read_bits(page_table[c.group] + c.vertex_offset, k * (xyz + 22u) + xyz, 22u));
 }
+
+// a textured cluster's (level bit 23) texture coordinates follow its vertex run and the word
+// after it: corner u0 | v0 << 16 on a 65535-step grid, widths bu | bv << 5, then per vertex its
+// offsets (include/paged_file.hpp). widths past 16 are corrupt: capped.
+fn cluster_uv(c: Cluster, k: u32) -> vec2f {
+  let b = cluster_widths(c);
+  let run = page_table[c.group] + c.vertex_offset + (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
+  let corner = pool[run];
+  let widths = pool[run + 1u];
+  let bu = min(widths & 31u, 16u);
+  let bv = min((widths >> 5u) & 31u, 16u);
+  let bit = 64u + k * (bu + bv);
+  return vec2f(f32((corner & 0xffffu) + read_bits(run, bit, bu)), f32((corner >> 16u) + read_bits(run, bit + bu, bv))) / 65535.0;
+}
+
+fn cluster_textured(c: Cluster) -> bool { return (c.level & 0x800000u) != 0u; }
 
 // triangle t as a | b << 8 | c << 16.
 fn cluster_triangle(c: Cluster, t: u32) -> u32 {

@@ -3,8 +3,10 @@ import { fetchModel } from './geometry.js';
 import { FLAG_CONE, FLAG_FRUSTUM, FLAG_OCCLUSION, FLAG_AO, FLAG_BOUNCE, FLAG_SHADOWS, FLAG_SOFT_SHADOWS, FLAG_SOFTWARE, FLAG_TAA, Renderer } from './renderer.js';
 
 const $ = (id) => document.getElementById(id);
-const MODELS = ['models/lucy', 'models/dragon'];
-const POOL_BYTES = 192 << 20;  // streamed pages; the rest stay on the server
+const MODELS = ['models/lucy', 'models/dragon', 'models/washington'];  // washington textured
+// streamed pages; the rest stay on the server. a slot fits the largest page (washington's are
+// up to 30 kb, with texture coordinates), so this holds about 16,000 pages.
+const POOL_BYTES = 512 << 20;
 
 const human = (v) => (v >= 1e12 ? `${(v / 1e12).toFixed(2)}T` : v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : `${v}`);
 
