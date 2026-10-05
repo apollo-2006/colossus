@@ -336,6 +336,12 @@ or push constants:
   hand. a pool slot fits the largest page, and washington's run to 30 kb with their
   texture coordinates (the others' to 12), so the pool is 512 mb: at 192 it held fewer
   pages than a frame wanted and fetched 569 mb without settling.
+* skinning runs as in the viewer (`web/skeleton.js` reads the `.cskn` and poses the joints,
+  matching the c++ to the last digit). every stage is at its 16 storage buffers, so the
+  joints ride in the page table buffer after the shared bounds. a scene menu picks the
+  statues or 900 foxes; while nothing placed is skinned the renderer uses pipelines with
+  skinning compiled out (an override constant), since its untaken branches cost the
+  statues 0.1 ms in registers.
 * shadows are the viewer's virtual shadow maps, in a module of their own
   (`web/vsm.wgsl`) to keep the bind group small, their indirect arguments in their own
   buffer (a dispatch can't write the buffer it reads arguments from). soft shadows use
@@ -348,10 +354,12 @@ or push constants:
   slider goes to a million. `?still` starts with motion paused and the camera held, so
   every load shows the same frame.
 * without webgpu, or on a gpu with fewer than 16 storage buffers per stage (most phones),
-  the page falls back to `web/lite.js`: one statue in webgl2, streamed by the same
+  the page falls back to `web/lite.js`: one model in webgl2, streamed by the same
   streamer, every cluster taking the same lod test on the cpu (no crowd, compute
   rasterizer or shadows; 4x msaa and fxaa), with the cluster and lod views and the error
-  slider. below it,
+  slider. washington brings one texture level, at most 2048 a side, decoded on the cpu;
+  the fox walks, skinned in the vertex shader with the same spheres in the lod test.
+  below it,
   frames from the native viewer (`web/gallery/`, from `docs/` by `web/gallery.sh`), and
   `web/flythrough.mp4` above them: 6.6 s through the crowd, recorded with
   `--fly 0.06 --record dir` and made small with `ffmpeg -framerate 60 -i dir/frame_%05d.png
@@ -362,8 +370,9 @@ or push constants:
 the models are trimmed to 4 million triangles at their finest (`--max-triangles`): 2.5 to
 2.9 mb of gzipped metadata each, up front, and 54 to 88 mb of pages, streamed, with 14 mb
 of washington's tiles. in chrome on the rx 9070 xt at 1600x813, 900 instances of the
-three take 1.67 ms of gpu time once streaming settles (61 mb fetched), 2.64 ms with the
-middle moving and swaying, and a million 2.31 ms. it needs 16
+three take 1.73 ms of gpu time once streaming settles (61 mb fetched), 2.64 ms with the
+middle moving and swaying, and a million 2.31 ms. 900 foxes take 1.76 ms paused and 3.04
+running, 1.42 of it shadows. it needs 16
 storage buffers per shader stage, which desktop gpus allow. `web/build.sh` builds the models;
 `node tests/web_screenshot.mjs` renders the page headless.
 
@@ -472,7 +481,7 @@ messages have every step's numbers.
   and a page that finds the pool full falls back a level.
 * a texture is colour only, one per model: no normal or roughness maps. where seams had
   to move, the texture can slip across them by up to the cluster's error. the webgl2
-  fallback draws no textures, and the browser no skinning yet.
+  fallback samples one level of a texture, decoded up front.
 * bounce light is a single bounce. by default it comes off the ground and what's on
   screen; `--gi rt` reaches everything but needs ray queries, traces the coarse shadow
   copies and costs 0.5 to 0.6 ms more. the browser has the screen space kind only.
