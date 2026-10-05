@@ -231,7 +231,7 @@ void save_texture(const image& base, const std::string& path) {
         const uint32_t v[3] = {l.tiles_x, l.tiles_y, l.first_tile};
         f.write(reinterpret_cast<const char*>(v), sizeof v);
     }
-    while (f.tellp() % 16) f.put(0);
+    while (f && f.tellp() % 16) f.put(0);  // a failed stream's tellp is -1
 
     // each level's tiles, borders clamped to the level's edges; rows in parallel.
     std::vector<uint8_t> out;
@@ -286,7 +286,7 @@ texture_info load_texture_info(const std::string& path) {
         h = (h + 1) / 2;
     }
     if (t.levels.back().tiles_x != 1 || t.levels.back().tiles_y != 1) throw std::runtime_error(path + ": levels end early");
-    while (f.tellg() % 16) f.get();
+    while (f && f.tellg() % 16) f.get();  // past the end, tellg is -1
     t.data_offset = static_cast<uint64_t>(f.tellg());
     f.seekg(0, std::ios::end);
     if (!f || uint64_t(f.tellg()) < t.data_offset + uint64_t(t.tile_count()) * tile_bytes) throw std::runtime_error(path + ": ends early");

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -311,6 +312,22 @@ void test_hierarchy(const char* name, const mesh& input, bool exact = true) {
     save_paged(paged, path);
     const paged_geometry back = load_paged(path, true);
     CHECK(back.clusters.size() == g.clusters.size() && back.pages.size() == paged.pages.size());
+    // cut short anywhere around the padding before the page data, it fails to load (once it
+    // spun forever: past the end, tellg is -1, and -1 % 16 is never 0).
+    {
+        const std::string cut = temp_path("cut.cgeo");
+        size_t refused = 0, tried = 0;
+        for (uint64_t at = back.data_offset - 24; at < back.data_offset + 4; ++at, ++tried) {
+            std::filesystem::copy_file(path, cut, std::filesystem::copy_options::overwrite_existing);
+            std::filesystem::resize_file(cut, at);
+            try {
+                load_paged(cut, true);
+            } catch (const std::runtime_error&) {
+                ++refused;
+            }
+        }
+        CHECK(refused == tried);
+    }
     // positions within half a grid step, normals within a fraction of a degree,
     // shared vertices identical from every cluster: quantizing opens no cracks.
     size_t wrong = 0, mismatched = 0;
