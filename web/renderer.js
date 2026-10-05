@@ -6,6 +6,11 @@
 import { frustumPlanes, invert, lookTo, mul, perspectiveReverseZ } from './math.js';
 import { Streamer } from './streamer.js';
 import { texturePages } from './geometry.js';
+import { poseJoints, spectralNorm } from './skeleton.js';
+
+// skinned models: each animation at this many phases, posed once a frame on the cpu, so a crowd
+// shares a few dozen poses (as the viewer's pose slots).
+const POSE_PHASES = 16;
 
 const MAX_WORK = 1 << 20;
 const MAX_VISIBLE = 1 << 20;
@@ -126,21 +131,9 @@ export class Renderer {
     const layout4 = d.createPipelineLayout({
       bindGroupLayouts: [this.sceneLayout, this.workLayout, this.imageLayout, this.argsLayout],
     });
-    const constants = { VSM_SIDE: this.vsmSide };
-    const compute = (entryPoint, layout) => d.createComputePipeline({ layout, compute: { module: this.computeModule, entryPoint, constants } });
-    const cullLayout = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.cullLayout] });
-    this.cellCull = compute('cell_cull', cullLayout);
-    this.argsCells = compute('args_cells', layout4);
-    this.instanceCull = compute('instance_cull', cullLayout);
-    this.argsBig = compute('args_big', layout4);
-    this.expand = compute('expand', layout3);
-    this.argsCull = compute('args_cull', layout4);
-    this.clusterCull = compute('cluster_cull', layout3);
-    this.argsDraw = compute('args_draw', layout4);
-    this.swDepth = compute('sw_depth_pass', layout3);
-    this.swId = compute('sw_id_pass', layout3);
-    this.shade = compute('shade', layout3);
-    const hzbLayout = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.hzbLayout] });
+    this.pipelineLayouts = { layout3, layout4,
+      cull: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.cullLayout] }),
+      hzb: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.hzbLayout] }) };
     this.taaLayout = d.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: C, texture: { sampleType: 'depth' } },
@@ -152,18 +145,9 @@ export class Renderer {
         { binding: 12, visibility: C, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
       ],
     });
-    this.taa = compute('taa', d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.taaLayout] }));
+    this.pipelineLayouts.taa = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.workLayout, this.taaLayout] });
+    this.pipelineLayouts.raster = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.rasterLayout] });
     this.historySampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-    this.hzbFirst = compute('hzb_first', hzbLayout);
-    this.hzbDown = compute('hzb_down', hzbLayout);
-
-    this.raster = d.createRenderPipeline({
-      layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.rasterLayout] }),
-      vertex: { module: this.rasterModule, entryPoint: 'vs' },
-      fragment: { module: this.rasterModule, entryPoint: 'fs', targets: [{ format: 'r32uint' }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
-    });
     // virtual shadow map passes bind the scene, the shadow pages and the streaming buffers
     // they ask through; argument writers also bind the arguments.
     const rwStorage = (binding) => ({ binding, visibility: C, buffer: { type: 'storage' } });
@@ -193,14 +177,13 @@ export class Renderer {
     this.aoDepthFirst = aoPipeline('ao_depth_first', this.aoFirstLayout);
     this.aoDepthDown = aoPipeline('ao_depth_down', this.aoDownLayout);
     this.aoPass = aoPipeline('ao', this.aoLayout);
-    const vsmPipeline = (entryPoint, args = false) => d.createComputePipeline({
-      layout: d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.vsmLayout, ...(args ? [this.vsmArgsLayout] : [])] }),
-      compute: { module: this.vsmModule, entryPoint, constants: { VSM_SIDE: this.vsmSide } },
-    });
-    this.vsm = {};
-    for (const e of ['mark', 'invalidate', 'alloc_slots', 'alloc_phys', 'alloc_assign', 'clear', 'instance', 'expand', 'cluster', 'raster'])
-      this.vsm[e] = vsmPipeline(`vsm_${e}`);
-    for (const e of ['args_alloc', 'args_expand', 'args_cull', 'args_raster']) this.vsm[e] = vsmPipeline(`vsm_${e}`, true);
+    this.pipelineLayouts.vsm = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.vsmLayout] });
+    this.pipelineLayouts.vsmArgs = d.createPipelineLayout({ bindGroupLayouts: [this.sceneLayout, this.vsmLayout, this.vsmArgsLayout] });
+    // the pipelines that read geometry come in two sets, with skinning compiled in or out
+    // (SKINNING in common.wgsl): its untaken branches still cost registers, 0.1 ms over the
+    // statues. the set without is used whenever nothing placed is skinned.
+    this.pipelineSets = { false: this.makePipelines(false) };
+    this.usePipelines(false);
     this.blit = d.createRenderPipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [d.createBindGroupLayout({ entries: [] }), this.blitLayout] }),
       vertex: { module: this.rasterModule, entryPoint: 'blit_vs' },
@@ -254,8 +237,36 @@ export class Renderer {
     const total = models.reduce((a, m, k) => ({ c: a.c + m.clusterCount, p: a.p + m.pages.length + tiles[k].length }), { c: 0, p: 0 });
     const clusters = new ArrayBuffer(total.c * 48);
     const shared = new Float32Array(total.p * 5);
-    const meshes = new ArrayBuffer(models.length * 80);
+    const meshes = new ArrayBuffer(models.length * 96);
     const pages = [];
+    // pose slots: per skinned model, every animation at POSE_PHASES phases.
+    this.poseSlots = [];
+    this.poseJointCount = 0;
+    this.skinInfo = models.map((m, k) => {
+      if (!m.skeleton) return null;
+      const sk = m.skeleton, anims = Math.max(sk.animations.length, 1), phases = sk.animations.length ? POSE_PHASES : 1;
+      const info = { firstSlot: this.poseSlots.length, firstJoint: this.poseJointCount, animations: sk.animations.map((a) => a.name), phases };
+      for (let a = 0; a < anims; a++)
+        for (let p = 0; p < phases; p++) {
+          this.poseSlots.push({ model: k, animation: sk.animations.length ? a : -1, phase: p / phases, firstJoint: this.poseJointCount });
+          this.poseJointCount += sk.joints.length;
+        }
+      // the farthest any pose moves the model's sphere, sampled finely, a tenth more: cells
+      // are culled by it.
+      const rows = new Float32Array(12 * sk.joints.length), c = m.bounds;
+      let reach = 0;
+      for (let a = sk.animations.length ? 0 : -1; a < Math.max(sk.animations.length, 0); a++)
+        for (let s = 0; s < 64; s++) {
+          poseJoints(sk, a, a < 0 ? 0 : sk.animations[a].duration * s / 64, rows);
+          for (let j = 0; j < sk.joints.length; j++) {
+            const r = 12 * j;
+            const moved = [0, 1, 2].map((q) => rows[r + 4 * q] * c[0] + rows[r + 4 * q + 1] * c[1] + rows[r + 4 * q + 2] * c[2] + rows[r + 4 * q + 3]);
+            reach = Math.max(reach, Math.hypot(moved[0] - c[0], moved[1] - c[1], moved[2] - c[2]) + spectralNorm(rows, r, true) * c[3]);
+          }
+        }
+      info.reach = reach * 1.1;
+      return info;
+    });
     let clusterBase = 0;
     models.forEach((m, k) => {
       const pageBase = pages.length;
@@ -270,16 +281,22 @@ export class Renderer {
         url: m.pagesUrl, offset: p.offset, size: p.size, pinned: i === 0,
         deps: p.deps.map((x) => x + pageBase), children: p.children.map((x) => x + pageBase), error: p.error,
       }));
-      const mu = new Uint32Array(meshes, k * 80, 4), mf = new Float32Array(meshes, k * 80 + 16, 12);
+      const mu = new Uint32Array(meshes, k * 96, 4), mf = new Float32Array(meshes, k * 96 + 16, 12);
       mu[0] = clusterBase;
       mu[1] = m.clusterCount;
+      mu[2] = this.poseJointCount;
+      const sk = this.skinInfo[k];
+      if (sk) {
+        new Uint32Array(meshes, k * 96 + 80, 4).set([m.skeleton.joints.length, sk.firstSlot, sk.firstJoint, m.skeleton.anchor]);
+        sk.pageBase = pageBase;
+      }
       mf.set(m.bounds, 0);
       mf.set(m.lodBounds, 4);
       mf.set(m.grid, 8);
       if (m.texture) {
         // first tile page, levels, width, height (Mesh::tex in common.wgsl).
         const tileBase = pages.length;
-        new Uint32Array(meshes, k * 80 + 64, 4).set([tileBase, m.texture.levels.length, m.texture.width, m.texture.height]);
+        new Uint32Array(meshes, k * 96 + 64, 4).set([tileBase, m.texture.levels.length, m.texture.width, m.texture.height]);
         for (const t of tiles[k])
           pages.push({ url: m.texture.tilesUrl, offset: t.offset, size: t.size, pinned: t.parent < 0,
                        deps: t.parent < 0 ? [] : [tileBase + t.parent], children: [], error: 0 });
@@ -296,9 +313,18 @@ export class Renderer {
     };
     this.clusterBuffer = upload(clusters);
     this.meshBuffer = upload(meshes);
-    // the page table (rewritten each frame), then each page's shared bounds (common.wgsl).
-    this.pageTable = d.createBuffer({ size: pages.length * 4 + shared.byteLength, usage: S | CD });
-    d.queue.writeBuffer(this.pageTable, pages.length * 4, shared);
+    // the page table (rewritten each frame), each page's shared bounds, each page's skin
+    // joints, then this frame's and last frame's joints and the pose slots' bounds (also
+    // rewritten each frame): common.wgsl.
+    const P = pages.length;
+    this.poseWords = 32 * this.poseJointCount + 4 * this.poseSlots.length;
+    this.pageTable = d.createBuffer({ size: 4 * (8 * P + this.poseWords) + 16, usage: S | CD });
+    d.queue.writeBuffer(this.pageTable, P * 4, shared);
+    const joints = new Uint32Array(2 * P);
+    models.forEach((m, k) => { if (m.skeleton) joints.set(m.skeleton.pageJoints, 2 * this.skinInfo[k].pageBase); });
+    d.queue.writeBuffer(this.pageTable, 6 * P * 4, joints);
+    this.poseData = new Float32Array(this.poseWords);
+    this.lastPose = null;
     this.pageCount = pages.length;
     this.pool = d.createBuffer({ size: this.streamer.slotCount * this.streamer.slotBytes, usage: S | CD });
     // per page: frame last drawn from, then frame last asked for.
@@ -310,10 +336,83 @@ export class Renderer {
     this.width = this.height = 0;
   }
 
+  // poses every skinned slot at time t into the page table buffer (common.wgsl), with last
+  // frame's joints for motion, and per slot how far its joints carry the model's bounds and lod
+  // bounds from the anchor joint, and the fastest a point goes (as the viewer's pose_slots()).
+  poseFrame(t, prevT) {
+    if (!this.poseSlots.length) return;
+    const J = this.poseJointCount, data = this.poseData, now = data.subarray(0, 16 * J);
+    const dt = t - prevT, haveLast = this.lastPose !== null;
+    const apply = (q, at, p) => [0, 1, 2].map((r) => q[at + 4 * r] * p[0] + q[at + 4 * r + 1] * p[1] + q[at + 4 * r + 2] * p[2] + q[at + 4 * r + 3]);
+    this.poseSlots.forEach((ps, k) => {
+      const m = this.models[ps.model], sk = m.skeleton;
+      const duration = ps.animation < 0 ? 0 : sk.animations[ps.animation].duration;
+      const rows = poseJoints(sk, ps.animation, t + ps.phase * duration, new Float32Array(12 * sk.joints.length));
+      const a = 12 * sk.anchor, c = m.bounds, lc = m.lodBounds;
+      let grow = 0, lodGrow = 0, speed = 0;
+      for (let j = 0; j < sk.joints.length; j++) {
+        const r = 12 * j, out = 16 * (ps.firstJoint + j);
+        now.set(rows.subarray(r, r + 12), out);
+        now[out + 12] = spectralNorm(rows, r, true);
+        const apart = spectralNorm(rows, r, false, rows, a);
+        now[out + 13] = apart;
+        now[out + 14] = now[out + 15] = 0;
+        const mc = apply(rows, r, c), ac = apply(rows, a, c), ml = apply(rows, r, lc), al = apply(rows, a, lc);
+        grow = Math.max(grow, Math.hypot(mc[0] - ac[0], mc[1] - ac[1], mc[2] - ac[2]) + apart * c[3]);
+        lodGrow = Math.max(lodGrow, Math.hypot(ml[0] - al[0], ml[1] - al[1], ml[2] - al[2]) + apart * lc[3]);
+        if (haveLast && dt > 0) {
+          const before = apply(this.lastPose, out, c);
+          speed = Math.max(speed, (Math.hypot(mc[0] - before[0], mc[1] - before[1], mc[2] - before[2]) +
+                                   spectralNorm(rows, r, false, this.lastPose, out) * c[3]) / dt);
+        }
+      }
+      data.set([grow, lodGrow, speed, 0], 32 * J + 4 * k);
+    });
+    data.set(haveLast ? this.lastPose : now, 16 * J);
+    this.lastPose = now.slice();
+    this.device.queue.writeBuffer(this.pageTable, 8 * this.pageCount * 4, data);
+  }
+
+  // every pipeline that decodes geometry, with skinning in or out.
+  makePipelines(skin) {
+    const d = this.device, L = this.pipelineLayouts;
+    const constants = { VSM_SIDE: this.vsmSide, SKINNING: skin };
+    const compute = (entryPoint, layout) => d.createComputePipeline({ layout, compute: { module: this.computeModule, entryPoint, constants } });
+    const vsm = (entryPoint, layout) => d.createComputePipeline({ layout, compute: { module: this.vsmModule, entryPoint, constants } });
+    const p = {
+      cellCull: compute('cell_cull', L.cull), argsCells: compute('args_cells', L.layout4), instanceCull: compute('instance_cull', L.cull),
+      argsBig: compute('args_big', L.layout4), expand: compute('expand', L.layout3), argsCull: compute('args_cull', L.layout4),
+      clusterCull: compute('cluster_cull', L.layout3), argsDraw: compute('args_draw', L.layout4), swDepth: compute('sw_depth_pass', L.layout3),
+      swId: compute('sw_id_pass', L.layout3), shade: compute('shade', L.layout3), taa: compute('taa', L.taa),
+      hzbFirst: compute('hzb_first', L.hzb), hzbDown: compute('hzb_down', L.hzb),
+      raster: d.createRenderPipeline({
+        layout: L.raster,
+        vertex: { module: this.rasterModule, entryPoint: 'vs', constants: { SKINNING: skin } },
+        fragment: { module: this.rasterModule, entryPoint: 'fs', targets: [{ format: 'r32uint' }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+      }),
+      vsm: {},
+    };
+    for (const e of ['mark', 'invalidate', 'alloc_slots', 'alloc_phys', 'alloc_assign', 'clear', 'instance', 'expand', 'cluster', 'raster'])
+      p.vsm[e] = vsm(`vsm_${e}`, L.vsm);
+    for (const e of ['args_alloc', 'args_expand', 'args_cull', 'args_raster']) p.vsm[e] = vsm(`vsm_${e}`, L.vsmArgs);
+    return p;
+  }
+
+  usePipelines(skin) {
+    if (!this.pipelineSets[skin]) this.pipelineSets[skin] = this.makePipelines(skin);
+    Object.assign(this, this.pipelineSets[skin]);
+  }
+
   // placements: {model, matrix (3x4 rows), scale, material, anim, cell}. instances of a cell
   // (at most 64) are consecutive; without cells, every 64 make one.
   setPlacements(placements) {
     const d = this.device;
+    this.usePipelines(placements.some((p) => p.anim & 2048));
+    // every cached shadow page drew the old crowd: forget them all (still layers keep shadows
+    // of instances no longer there otherwise, and nothing marks them dirty).
+    if (this.vsmEntries) d.queue.writeBuffer(this.vsmEntries, 0, new Uint32Array(VSM_PHYS + 2 * this.vsmSide * this.vsmSide).fill(0xffffffff));
     // each cell's sphere holds its instances' spheres, a moving one's whole path (turns about
     // its origin, drifts 0.2: animate() in common.wgsl).
     const cells = [];
@@ -326,7 +425,7 @@ export class Renderer {
         const origin = [m[3], m[7], m[11]];
         let c = [0, 1, 2].map((r) => m[4 * r] * b[0] + m[4 * r + 1] * b[1] + m[4 * r + 2] * b[2] + origin[r]);
         // deforming: points move up to the reach (DEFORM_REACH in common.wgsl).
-        let radius = b[3] * (p.anim & 1024 ? 1.1 : 1) * p.scale;
+        let radius = (b[3] * (p.anim & 1024 ? 1.1 : 1) + (p.anim & 2048 ? this.skinInfo[p.model].reach : 0)) * p.scale;
         if (p.anim & 512) {
           radius += Math.hypot(c[0] - origin[0], c[1] - origin[1], c[2] - origin[2]) + 0.2;
           c = origin;
@@ -554,6 +653,7 @@ export class Renderer {
     this.wanted = [];
     for (const u of uploads) d.queue.writeBuffer(this.pool, u.slot * this.streamer.slotBytes, u.data);
     d.queue.writeBuffer(this.pageTable, 0, this.streamer.table);
+    this.poseFrame(time, prevTime);
 
     const enc = d.createCommandEncoder();
     const ts = (begin, end) => (this.timestamps ? { timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: begin, endOfPassWriteIndex: end } } : {});

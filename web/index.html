@@ -25,6 +25,8 @@
     <dt>image</dt><dd id="size">...</dd>
     <dt>streamed in</dt><dd id="pages">...</dd>
   </dl>
+  <label>scene
+    <select id="scene"><option value="statues">statues</option><option value="foxes">foxes, skinned</option></select></label>
   <label>crowd <span id="grid-label"></span>
     <input id="grid" type="range" min="0" max="19" value="9"></label>
   <label>error allowed <span id="threshold-label">1 px</span>
@@ -71,7 +73,7 @@
   <section id="lite" hidden>
     <canvas id="lite-view"></canvas>
     <div class="lite-bar">
-      <label>model <select id="lite-model"><option value="models/lucy">Lucy</option><option value="models/dragon">dragon</option><option value="models/washington">George Washington</option></select></label>
+      <label>model <select id="lite-model"><option value="models/lucy">Lucy</option><option value="models/dragon">dragon</option><option value="models/washington">George Washington</option><option value="models/fox">fox, walking</option></select></label>
       <label>view <select id="lite-mode"><option value="0">shaded</option><option value="1">clusters</option><option value="2">LOD level</option></select></label>
       <label class="lite-threshold">error allowed <span id="lite-threshold-label">1 px</span>
         <input id="lite-threshold" type="range" min="-2" max="5" step="1" value="0"></label>

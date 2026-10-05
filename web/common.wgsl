@@ -88,12 +88,13 @@ struct PackedCluster {
 struct Mesh {
   first_cluster: u32,
   cluster_count: u32,
-  pad0: u32,
+  pose_joints: u32,  // every skinned slot's joints, in all models: where last frame's start
   pad1: u32,
   bounds: vec4f,
   lod_bounds: vec4f,
   grid: vec4f,  // position snapping: xyz grid point 0, w step
   tex: vec4u,   // texture tiles: first page, levels (0: none), width, height (compute.wgsl)
+  skin: vec4u,  // skinned: joints (0: none), first pose slot, its first joint, anchor joint
 }
 
 struct Instance {
@@ -101,7 +102,8 @@ struct Instance {
   mesh: u32,
   scale: f32,
   material: u32,  // into compute.wgsl's materials
-  anim: u32,      // 0: still. else moving (animate()): phase in low 8 bits, bit 8 reverses
+  anim: u32,      // 0: still. else moving (animate()): phase in low 8 bits, bit 8 reverses;
+                  // bit 10 sways (deform()); bit 11 skinned, its pose slot from bit 16
 }
 
 const FLAG_CONE = 1u;
@@ -296,6 +298,174 @@ fn deform_normal(inst: Instance, bounds: vec4f, p: vec3f, n: vec3f, t: f32) -> v
 
 fn deform_reach_of(inst: Instance) -> f32 { return select(0.0, DEFORM_REACH * meshes[inst.mesh].bounds.w, deforming(inst)); }
 fn deform_stretch_of(inst: Instance) -> f32 { return select(1.0, DEFORM_STRETCH, deforming(inst)); }
+
+// skinning (include/skeleton.hpp, viewer/shaders/common.glsl, which this follows). each skinned
+// instance follows a pose slot, posed on the cpu each frame. the page table buffer carries,
+// after the table (page_count words) and the pages' shared bounds (5 each), each page's
+// joints (2 words, a bit each), then this frame's joints (16 words each: three rows and |A -
+// I|, |A - A_anchor|), last frame's, and per slot how far its joints carry the model's
+// bounds and lod bounds from the anchor, and the fastest point.
+struct Joint {
+  r0: vec4f,
+  r1: vec4f,
+  r2: vec4f,
+  norms: vec4f,  // x: |A - I|, y: |A - A_anchor| (spectral)
+}
+
+// false compiles skinning out (the renderer's second set of pipelines, used while nothing
+// placed is skinned): its untaken branches still cost registers.
+override SKINNING: bool = true;
+fn skinned(inst: Instance) -> bool { return SKINNING && (inst.anim & 2048u) != 0u; }
+fn pose_slot(inst: Instance) -> u32 { return inst.anim >> 16u; }
+fn joint_base(inst: Instance) -> u32 {
+  let sk = meshes[inst.mesh].skin;
+  return sk.z + (pose_slot(inst) - sk.y) * sk.x;
+}
+fn pose_vec4(at: u32) -> vec4f {
+  return bitcast<vec4f>(vec4u(page_table[at], page_table[at + 1u], page_table[at + 2u], page_table[at + 3u]));
+}
+fn load_joint(inst: Instance, j: u32, prev: bool) -> Joint {
+  let at = 8u * frame.page_count + select(0u, 16u * meshes[inst.mesh].pose_joints, prev) + 16u * j;
+  return Joint(pose_vec4(at), pose_vec4(at + 4u), pose_vec4(at + 8u), pose_vec4(at + 12u));
+}
+fn pose_info(inst: Instance) -> vec4f {
+  return pose_vec4(8u * frame.page_count + 32u * meshes[inst.mesh].pose_joints + 4u * pose_slot(inst));
+}
+fn page_joints(page: u32) -> vec2u {
+  let at = 6u * frame.page_count + 2u * page;
+  return vec2u(page_table[at], page_table[at + 1u]);
+}
+fn joint_point(j: Joint, p: vec3f) -> vec3f {
+  let q = vec4f(p, 1.0);
+  return vec3f(dot(j.r0, q), dot(j.r1, q), dot(j.r2, q));
+}
+fn joint_dir(j: Joint, d: vec3f) -> vec3f { return vec3f(dot(j.r0.xyz, d), dot(j.r1.xyz, d), dot(j.r2.xyz, d)); }
+
+// a sphere around a skinned sphere's points, nested level to level for the lod test: centred on
+// the anchor joint's image of the centre, grown by how far each of the page's joints carries
+// points from where the anchor does (lod_sphere() in common.glsl explains).
+fn lod_sphere(inst: Instance, page: u32, center: vec3f, radius: f32) -> vec4f {
+  if (!skinned(inst)) { return vec4f(center, radius + deform_reach_of(inst)); }
+  let at = joint_base(inst);
+  let a = load_joint(inst, at + meshes[inst.mesh].skin.w, false);
+  let c = joint_point(a, center);
+  let bits = page_joints(page);
+  var grow = 0.0;
+  for (var h = 0u; h < 2u; h++) {
+    var b = select(bits.y, bits.x, h == 0u);
+    while (b != 0u) {
+      let j = firstTrailingBit(b) + 32u * h;
+      b &= b - 1u;
+      let jt = load_joint(inst, at + j, false);
+      grow = max(grow, length(joint_point(jt, center) - c) + jt.norms.y * radius);
+    }
+  }
+  return vec4f(c, (1.0 + a.norms.x) * radius + grow);
+}
+
+// the other nested sphere: the rest sphere grown by how far the page's joints move its points.
+fn rest_sphere(inst: Instance, page: u32, center: vec3f, radius: f32) -> vec4f {
+  let at = joint_base(inst);
+  let bits = page_joints(page);
+  var reach = 0.0;
+  for (var h = 0u; h < 2u; h++) {
+    var b = select(bits.y, bits.x, h == 0u);
+    while (b != 0u) {
+      let j = firstTrailingBit(b) + 32u * h;
+      b &= b - 1u;
+      let jt = load_joint(inst, at + j, false);
+      reach = max(reach, length(joint_point(jt, center) - center) + jt.norms.x * radius);
+    }
+  }
+  return vec4f(center, radius + reach);
+}
+
+// a sphere around where a cluster is drawn, for culling only: on its lowest joint's image.
+fn drawn_sphere(inst: Instance, page: u32, center: vec3f, radius: f32) -> vec4f {
+  if (!skinned(inst)) { return vec4f(center, radius + deform_reach_of(inst)); }
+  let at = joint_base(inst);
+  let bits = page_joints(page);
+  if (all(bits == vec2u(0u))) { return vec4f(center, radius); }
+  let first = select(32u + firstTrailingBit(bits.y), firstTrailingBit(bits.x), bits.x != 0u);
+  let a = load_joint(inst, at + first, false);
+  let c = joint_point(a, center);
+  var grow = 0.0;
+  for (var h = 0u; h < 2u; h++) {
+    var b = select(bits.y, bits.x, h == 0u);
+    while (b != 0u) {
+      let j = firstTrailingBit(b) + 32u * h;
+      b &= b - 1u;
+      let jt = load_joint(inst, at + j, false);
+      let d0 = jt.r0.xyz - a.r0.xyz;
+      let d1 = jt.r1.xyz - a.r1.xyz;
+      let d2 = jt.r2.xyz - a.r2.xyz;
+      grow = max(grow, length(joint_point(jt, center) - c) + sqrt(dot(d0, d0) + dot(d1, d1) + dot(d2, d2)) * radius);
+    }
+  }
+  return vec4f(c, (1.0 + a.norms.x) * radius + grow);
+}
+
+// a model's whole sphere (bounds) or its sphere around every lod sphere (lod_bounds).
+fn instance_sphere(inst: Instance, sphere: vec4f, lod: bool) -> vec4f {
+  if (!skinned(inst)) { return vec4f(sphere.xyz, sphere.w + deform_reach_of(inst)); }
+  let a = load_joint(inst, joint_base(inst) + meshes[inst.mesh].skin.w, false);
+  let info = pose_info(inst);
+  return vec4f(joint_point(a, sphere.xyz), (1.0 + a.norms.x) * sphere.w + select(info.x, info.y, lod));
+}
+
+// errors as drawn: a swaying instance's stretched; a skinned one's already hold its
+// animations (measured posed when built).
+fn grown_error(inst: Instance, error: f32) -> f32 { return select(error * deform_stretch_of(inst), error, skinned(inst)); }
+fn error_floor(inst: Instance, limit: f32) -> f32 { return select(limit / deform_stretch_of(inst), limit, skinned(inst)); }
+
+// words from a cluster's vertex run to its skin: past its texture coordinates if any.
+fn skin_run(c: Cluster) -> u32 {
+  let b = cluster_widths(c);
+  let at = (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
+  if ((c.level & 0x800000u) == 0u) { return at; }
+  let widths = pool[page_table[c.group] + c.vertex_offset + at + 1u];
+  let bu = min(widths & 31u, 16u);
+  let bv = min((widths >> 5u) & 31u, 16u);
+  return at + 2u + (c.vertex_count * (bu + bv) + 31u) / 32u;
+}
+
+// vertex k skinned, now or as last frame; a direction turned by its joints.
+fn skin_point(inst: Instance, c: Cluster, k: u32, p: vec3f, prev: bool) -> vec3f {
+  let run = page_table[c.group] + c.vertex_offset + skin_run(c) + 2u * k;
+  let js = pool[run];
+  let ws = pool[run + 1u];
+  let at = joint_base(inst);
+  let last = meshes[inst.mesh].skin.x - 1u;
+  var out_p = vec3f(0.0);
+  for (var i = 0u; i < 4u; i++) {
+    let w = f32((ws >> (8u * i)) & 255u) / 255.0;
+    if (w == 0.0) { continue; }
+    out_p += w * joint_point(load_joint(inst, at + min((js >> (8u * i)) & 255u, last), prev), p);
+  }
+  return out_p;
+}
+
+fn skin_dir(inst: Instance, c: Cluster, k: u32, d: vec3f) -> vec3f {
+  let run = page_table[c.group] + c.vertex_offset + skin_run(c) + 2u * k;
+  let js = pool[run];
+  let ws = pool[run + 1u];
+  let at = joint_base(inst);
+  let last = meshes[inst.mesh].skin.x - 1u;
+  var out_d = vec3f(0.0);
+  for (var i = 0u; i < 4u; i++) {
+    let w = f32((ws >> (8u * i)) & 255u) / 255.0;
+    if (w != 0.0) { out_d += w * joint_dir(load_joint(inst, at + min((js >> (8u * i)) & 255u, last), false), d); }
+  }
+  return out_d;
+}
+
+// vertex k of a cluster as drawn now (model space): skinned, or swaying, or as stored.
+fn drawn_vertex(inst: Instance, c: Cluster, k: u32) -> vec3f {
+  let m = meshes[inst.mesh];
+  let p = cluster_position(c, m.grid, k);
+  if (skinned(inst)) { return skin_point(inst, c, k, p, false); }
+  return deform(inst, m.bounds, p, frame.time);
+}
 
 fn cluster_position(c: Cluster, grid: vec4f, k: u32) -> vec3f {
   let b = cluster_widths(c);

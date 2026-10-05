@@ -183,11 +183,24 @@ struct Lod {
 fn lod_test(inst: Instance, c: Cluster) -> Lod {
   let s = inst.scale;
   var r: Lod;
-  // a deforming instance: points up to its reach away, errors stretched (deform()).
-  let reach = deform_reach_of(inst);
-  let stretch = deform_stretch_of(inst);
-  r.self_error = projected_error(to_world(inst, c.lod_center), (c.lod_radius + reach) * s, c.lod_error * s * stretch);
-  let coarse_enough = projected_error(to_world(inst, c.parent_center), (c.parent_radius + reach) * s, c.parent_error * s * stretch) > frame.lod_threshold;
+  // a deforming or skinned instance: spheres where the points are, errors grown (lod_sphere(),
+  // grown_error() in common.wgsl). the lod sphere grows by the creator page's joints (a leaf's,
+  // its own page's), the parent sphere by its own page's: one computation from either side.
+  let lod_page = select(c.group, c.creator, c.creator != NO_PAGE);
+  let lod = lod_sphere(inst, lod_page, c.lod_center, c.lod_radius);
+  let parent = lod_sphere(inst, c.group, c.parent_center, c.parent_radius);
+  let lod_e = grown_error(inst, c.lod_error) * s;
+  let parent_e = grown_error(inst, c.parent_error) * s;
+  r.self_error = projected_error(to_world(inst, lod.xyz), lod.w * s, lod_e);
+  var parent_error = projected_error(to_world(inst, parent.xyz), parent.w * s, parent_e);
+  // skinned: either nested sphere bounds it, and the smaller of two nested bounds nests too.
+  if (skinned(inst)) {
+    let lod_r = rest_sphere(inst, lod_page, c.lod_center, c.lod_radius);
+    let parent_r = rest_sphere(inst, c.group, c.parent_center, c.parent_radius);
+    r.self_error = min(r.self_error, projected_error(to_world(inst, lod_r.xyz), lod_r.w * s, lod_e));
+    parent_error = min(parent_error, projected_error(to_world(inst, parent_r.xyz), parent_r.w * s, parent_e));
+  }
+  let coarse_enough = parent_error > frame.lod_threshold;
   let finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
   r.wants_finer = r.self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
   r.draw = page_table[c.group] != NO_PAGE && coarse_enough && (r.self_error <= frame.lod_threshold || !finer_resident);
@@ -412,13 +425,17 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
   if (valid) {
     let inst = load_instance(i);
     let m = meshes[inst.mesh];
-    let center = to_world(inst, m.bounds.xyz);
-    let radius = (m.bounds.w + deform_reach_of(inst)) * inst.scale;
+    let sphere = instance_sphere(inst, m.bounds, false);
+    let center = to_world(inst, sphere.xyz);
+    let radius = sphere.w * inst.scale;
     var keep = hidden_before || (frame.flags & FLAG_FRUSTUM) == 0u || sphere_in_frustum(center, radius);
-    // pass 1: was it hidden last frame, where it was last frame.
+    // pass 1: was it hidden last frame, where it was last frame (skinned: where it is now,
+    // grown by how far a point moved since).
     var then = center;
-    if (pass_index == 0u && inst.anim != 0u) { then = to_world(load_prev_instance(i), m.bounds.xyz); }
-    if (keep && occluded(then, radius)) {
+    var then_r = radius;
+    if (pass_index == 0u && inst.anim != 0u && !skinned(inst)) { then = to_world(load_prev_instance(i), m.bounds.xyz); }
+    if (pass_index == 0u && skinned(inst)) { then_r += pose_info(inst).z * (frame.time - frame.prev_time) * inst.scale; }
+    if (keep && occluded(then, then_r)) {
       if (pass_index == 0u) { late[frame.max_visible + atomicAdd(&counters.late_instances, 1u)] = vec2u(i, 0u); }
       else { atomicAdd(&counters.instances_occluded, 1u); }
       keep = false;
@@ -426,10 +443,11 @@ fn instance_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_in
     if (keep) {
       atomicAdd(&counters.instances_visible, 1u);
       // projected_error()'s worst over the sphere holding every lod sphere.
-      let lc = to_world(inst, m.lod_bounds.xyz) - frame.cull_origin.xyz;
-      let r = (m.lod_bounds.w + deform_reach_of(inst)) * inst.scale;
+      let ls = instance_sphere(inst, m.lod_bounds, true);
+      let lc = to_world(inst, ls.xyz) - frame.cull_origin.xyz;
+      let r = ls.w * inst.scale;
       let z = max(dot(lc, frame.cull_planes[4].xyz) - r, frame.near_z);
-      let limit = frame.lod_threshold * z / (inst.scale * deform_stretch_of(inst) * frame.lod_scale * projected_sec(lc, r));
+      let limit = error_floor(inst, frame.lod_threshold * z / (inst.scale * frame.lod_scale * projected_sec(lc, r)));
       var lo = 0u;
       var hi = m.cluster_count;
       while (lo < hi) {
@@ -579,17 +597,21 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       let s = inst.scale;
       let lod = lod_test(inst, c);
       draw = lod.draw;
-      let center = to_world(inst, c.center);
-      let r = (c.radius + deform_reach_of(inst)) * s;
+      let drawn = drawn_sphere(inst, c.group, c.center, c.radius);
+      let center = to_world(inst, drawn.xyz);
+      let r = drawn.w * s;
       if (draw && (frame.flags & FLAG_FRUSTUM) != 0u) { draw = sphere_in_frustum(center, r); }
-      if (draw && (frame.flags & FLAG_CONE) != 0u && c.cone_cutoff < 1.0 && !deforming(inst)) {
+      // (a deforming or skinned instance's normals turn: no cone.)
+      if (draw && (frame.flags & FLAG_CONE) != 0u && c.cone_cutoff < 1.0 && !deforming(inst) && !skinned(inst)) {
         let axis = normalize(to_world_dir(inst, c.cone_axis));
         let view = center - frame.cull_origin.xyz;
         if (dot(view, axis) >= c.cone_cutoff * length(view) + r) { draw = false; }
       }
       var then = center;
-      if (pass_index == 0u && inst.anim != 0u) { then = to_world(load_prev_instance(w.x), c.center); }
-      if (draw && occluded(then, r)) {
+      var then_r = r;
+      if (pass_index == 0u && inst.anim != 0u && !skinned(inst)) { then = to_world(load_prev_instance(w.x), c.center); }
+      if (pass_index == 0u && skinned(inst)) { then_r += pose_info(inst).z * (frame.time - frame.prev_time) * s; }
+      if (draw && occluded(then, then_r)) {
         draw = false;
         hidden = true;
       }
@@ -614,8 +636,9 @@ fn cluster_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_ind
       cluster_id = ic.y;
       let inst = load_instance(instance_id);
       let c = load_cluster(cluster_id);
-      let center = to_world(inst, c.center);
-      let r = (c.radius + deform_reach_of(inst)) * inst.scale;
+      let drawn = drawn_sphere(inst, c.group, c.center, c.radius);
+      let center = to_world(inst, drawn.xyz);
+      let r = drawn.w * inst.scale;
       draw = !occluded(center, r);
       if (draw) {
         atomicAdd(&wg_triangles, c.triangle_count);
@@ -704,7 +727,7 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   let c = load_cluster(v.y);
   if (lane < c.vertex_count) {
     let m = meshes[inst.mesh];
-    let clip = frame.view_proj * vec4f(to_world(inst, deform(inst, m.bounds, cluster_position(c, m.grid, lane), frame.time)), 1.0);
+    let clip = frame.view_proj * vec4f(to_world(inst, drawn_vertex(inst, c, lane)), 1.0);
     let ndc = clip.xy / clip.w;
     // pixels run down; clip space up.
     let px = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(f32(frame.width), f32(frame.height));
@@ -1147,9 +1170,9 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let i2 = (packed >> 16u) & 255u;
     let grid = meshes[inst.mesh].grid;
     let bounds = meshes[inst.mesh].bounds;
-    let p0 = to_world(inst, deform(inst, bounds, cluster_position(c, grid, i0), frame.time));
-    let p1 = to_world(inst, deform(inst, bounds, cluster_position(c, grid, i1), frame.time));
-    let p2 = to_world(inst, deform(inst, bounds, cluster_position(c, grid, i2), frame.time));
+    let p0 = to_world(inst, drawn_vertex(inst, c, i0));
+    let p1 = to_world(inst, drawn_vertex(inst, c, i1));
+    let p2 = to_world(inst, drawn_vertex(inst, c, i2));
     // ray against the triangle's plane, for exact barycentrics.
     let e1 = p1 - p0;
     let e2 = p2 - p0;
@@ -1166,9 +1189,14 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
     let center = frame.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
     let forward = normalize(center.xyz / center.w - origin);
     let t = frame.near_z / z / dot(dir, forward);
-    let n0 = cluster_normal(c, i0);
-    let n1 = cluster_normal(c, i1);
-    let n2 = cluster_normal(c, i2);
+    var n0 = cluster_normal(c, i0);
+    var n1 = cluster_normal(c, i1);
+    var n2 = cluster_normal(c, i2);
+    if (skinned(inst)) {  // each vertex's normal turned by its joints
+      n0 = skin_dir(inst, c, i0, n0);
+      n1 = skin_dir(inst, c, i1, n1);
+      n2 = skin_dir(inst, c, i2, n2);
+    }
     let model_n = deform_normal(inst, bounds, from_world(inst, origin + dir * t), n0 * (1.0 - bu - bv) + n1 * bu + n2 * bv, frame.time);
     var n = normalize(to_world_dir(inst, model_n));
     // from behind (inside a fold, through a scan hole): light the visible side,
@@ -1200,12 +1228,19 @@ fn shade(@builtin(global_invocation_id) gid: vec3u) {
       let radius = bounds.w;
       // detail is fixed to the rest surface: a swaying statue's grain bends with it.
       let drawn = from_world(inst, origin + dir * t);
-      let q = undeform(inst, bounds, drawn, frame.time) / radius;
+      // skinned: no inverse, the pixel's weights on the triangle's rest corners.
+      var rest = undeform(inst, bounds, drawn, frame.time);
+      if (skinned(inst)) {
+        rest = cluster_position(c, grid, i0) * (1.0 - bu - bv) + cluster_position(c, grid, i1) * bu + cluster_position(c, grid, i2) * bv;
+      }
+      let q = rest / radius;
       let d = surface_detail(m, min(inst.material, 5u), q, t / (frame.lod_scale * inst.scale * radius), ao, n.y);
       m = d.m;
       wrap = d.wrap;
       coat = d.coat;
-      let g = to_world_dir(inst, deform_gradient(inst, bounds, drawn, d.grad, frame.time)) / inst.scale;
+      var model_g = deform_gradient(inst, bounds, drawn, d.grad, frame.time);
+      if (skinned(inst)) { model_g = skin_dir(inst, c, i0, d.grad); }
+      let g = to_world_dir(inst, model_g) / inst.scale;
       n = normalize(n - (g - dot(g, n) * n));
     }
     if (frame.debug_mode != 0u) { m = Material(vec3f(0.56, 0.52, 0.47), 0.6, 0.0); }
@@ -1303,14 +1338,37 @@ fn taa(@builtin(global_invocation_id) gid: vec3u) {
       let forward = normalize(center.xyz / center.w - origin);
       var p = origin + dir * (frame.near_z / z / dot(dir, forward));
       // a moving surface was elsewhere last frame: through its instance.
-      var instance = 0u;
+      var vc = vec2u(0u);
+      var id = 0u;
       if (hd > 0.0 && hd >= bitcast<f32>(sd_bits)) {
-        instance = hw_visible[textureLoad(hw_id, px, 0).x >> 7u].x;
+        id = textureLoad(hw_id, px, 0).x;
+        vc = hw_visible[id >> 7u];
       } else {
-        instance = sw_visible[atomicLoad(&sw_buf[frame.width * frame.height + gid.x + gid.y * frame.width]) >> 7u].x;
+        id = atomicLoad(&sw_buf[frame.width * frame.height + gid.x + gid.y * frame.width]);
+        vc = sw_visible[id >> 7u];
       }
+      let instance = vc.x;
       let inst = load_instance(instance);
-      if (inst.anim != 0u) {
+      if (skinned(inst)) {
+        // no inverse: the pixel's weights on its triangle as drawn now, applied to the
+        // triangle's corners posed as last frame.
+        let c = load_cluster(vc.y);
+        let tri = cluster_triangle(c, id & 127u);
+        let i0 = tri & 255u;
+        let i1 = (tri >> 8u) & 255u;
+        let i2 = (tri >> 16u) & 255u;
+        let grid = meshes[inst.mesh].grid;
+        let r0 = cluster_position(c, grid, i0);
+        let r1 = cluster_position(c, grid, i1);
+        let r2 = cluster_position(c, grid, i2);
+        let a = to_world(inst, skin_point(inst, c, i0, r0, false));
+        let b = to_world(inst, skin_point(inst, c, i1, r1, false));
+        let e = to_world(inst, skin_point(inst, c, i2, r2, false));
+        let w = plane_bary(a, b, e, origin, dir);
+        let then = skin_point(inst, c, i0, r0, true) * (1.0 - w.x - w.y) + skin_point(inst, c, i1, r1, true) * w.x +
+                   skin_point(inst, c, i2, r2, true) * w.y;
+        p = to_world(load_prev_instance(instance), then);
+      } else if (inst.anim != 0u) {
         let bounds = meshes[inst.mesh].bounds;
         let rest = undeform(inst, bounds, from_world(inst, p), frame.time);
         p = to_world(load_prev_instance(instance), deform(inst, bounds, rest, frame.prev_time));

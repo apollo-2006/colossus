@@ -3,7 +3,9 @@ import { fetchModel } from './geometry.js';
 import { FLAG_CONE, FLAG_FRUSTUM, FLAG_OCCLUSION, FLAG_AO, FLAG_BOUNCE, FLAG_SHADOWS, FLAG_SOFT_SHADOWS, FLAG_SOFTWARE, FLAG_TAA, Renderer } from './renderer.js';
 
 const $ = (id) => document.getElementById(id);
-const MODELS = ['models/lucy', 'models/dragon', 'models/washington'];  // washington textured
+const MODELS = ['models/lucy', 'models/dragon', 'models/washington', 'models/fox'];  // washington textured, the fox skinned
+// the scenes: which models a crowd alternates.
+const SCENES = { statues: [0, 1, 2], foxes: [3] };
 // streamed pages; the rest stay on the server. a slot fits the largest page (washington's are
 // up to 30 kb, with texture coordinates), so this holds about 16,000 pages.
 const POOL_BYTES = 512 << 20;
@@ -24,8 +26,11 @@ function random(seed) {
 
 const GRID_SIDES = [1, 2, 3, 4, 6, 8, 10, 15, 20, 30, 45, 60, 100, 150, 200, 300, 450, 600, 800, 1000];
 
-// n x n grid, models alternating, turned and sized at random.
-export function crowd(n, models, spacing = 1.25) {
+// n x n grid, the scene's models (`models`, indices) alternating, turned and sized at random.
+// a skinned model's instances (skins[model]: the renderer's skinInfo) each play one of its
+// animations at a random phase: bit 11 and the pose slot from bit 16 (common.wgsl).
+export function crowd(n, models, spacing = 1.25, skins = []) {
+  if (typeof models === 'number') models = [...Array(models).keys()];
   const rand = random(7), materialRand = random(11), motionRand = random(13);
   const out = [];
   for (let z = 0; z < n; z++)
@@ -44,7 +49,12 @@ export function crowd(n, models, spacing = 1.25) {
       let anim = n > 1 && middle && motionRand() < 0.25 ? 512 | Math.floor(motionRand() * 512) : 0;
       // and some of the rest of the middle sway (deform() in common.wgsl, bit 10).
       if (n > 1 && middle && !anim && motionRand() < 0.15) anim = 1024 | Math.floor(motionRand() * 256);
-      out.push({ model: (z * n + x) % models, scale, material, anim, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
+      const model = models[(z * n + x) % models.length], skin = skins[model];
+      if (skin) {
+        const a = Math.floor(motionRand() * Math.max(skin.animations.length, 1)), phase = Math.floor(motionRand() * skin.phases);
+        anim = 2048 | ((skin.firstSlot + a * skin.phases + phase) << 16);
+      }
+      out.push({ model, scale, material, anim, matrix: [c, 0, s, tx, 0, scale, 0, 0, -s, 0, c, tz] });
     }
   // in cells of 8 x 8 neighbours, each cell's instances consecutive (the renderer culls cells
   // first); drawn above in row order so the crowd is the same.
@@ -120,11 +130,12 @@ async function main() {
   const build = () => {
     // the slider steps through grid sides, up to a million instances.
     const n = GRID_SIDES[Number($('grid').value)];
-    renderer.setPlacements(crowd(n, models.length));
+    renderer.setPlacements(crowd(n, SCENES[$('scene').value], 1.25, renderer.skinInfo));
     $('grid-label').textContent = `${(n * n).toLocaleString('en-US')} instances`;
     $('full').textContent = human(renderer.fullDetail);
   };
   $('grid').oninput = build;
+  $('scene').onchange = build;
   build();
   $('threshold').oninput = () => {
     settings.threshold = 2 ** Number($('threshold').value);

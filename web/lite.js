@@ -5,6 +5,7 @@
 import { fetchModel } from './geometry.js';
 import { Streamer } from './streamer.js';
 import { lookTo, normalize } from './math.js';
+import { poseJoints, spectralNorm } from './skeleton.js';
 
 const NONE = 0xffffffff;
 const POOL_BYTES = 32 << 20;  // packed pages resident at once; decoded, about four times that
@@ -15,17 +16,32 @@ layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in uint info;  // cluster | level << 24
 layout(location = 3) in vec2 uv;
+layout(location = 4) in uvec4 joints;
+layout(location = 5) in vec4 weights;
 uniform mat4 view_proj;
+uniform bool skinned;
+uniform vec4 joint_rows[192];  // 64 joints, three rows each
 out vec3 v_normal;
 out vec3 v_position;
 out vec2 v_uv;
 flat out uint v_info;
 void main() {
-  v_normal = normal;
-  v_position = position;
+  vec3 p = position, n = normal;
+  if (skinned) {  // linear blend skinning: the joints' images blended by the weights
+    p = vec3(0.0);
+    n = vec3(0.0);
+    for (int k = 0; k < 4; ++k) {
+      int j = 3 * int(joints[k]);
+      vec4 r0 = joint_rows[j], r1 = joint_rows[j + 1], r2 = joint_rows[j + 2];
+      p += weights[k] * vec3(dot(r0, vec4(position, 1.0)), dot(r1, vec4(position, 1.0)), dot(r2, vec4(position, 1.0)));
+      n += weights[k] * vec3(dot(r0.xyz, normal), dot(r1.xyz, normal), dot(r2.xyz, normal));
+    }
+  }
+  v_normal = n;
+  v_position = p;
   v_uv = uv;
   v_info = info;
-  gl_Position = view_proj * vec4(position, 1.0);
+  gl_Position = view_proj * vec4(p, 1.0);
 }`;
 
 const FRAGMENT = `#version 300 es
@@ -235,8 +251,9 @@ function decodePage(gl, model, c, page, data) {
   const list = c.byPage[page];
   let vertices = 0, indices = 0;
   for (const i of list) { vertices += c.counts[i] & 0xffff; indices += 3 * (c.counts[i] >>> 16); }
-  const buffer = new ArrayBuffer(vertices * 24);
+  const buffer = new ArrayBuffer(vertices * 32);
   const pos = new Float32Array(buffer), bytes = new Int8Array(buffer), info = new Uint32Array(buffer), uvs = new Uint16Array(buffer);
+  const skinned = !!model.skeleton;
   const index = vertices > 65535 ? new Uint32Array(indices) : new Uint16Array(indices);
   const runs = new Map();  // cluster -> [first index, count]
   const g = model.grid;
@@ -251,16 +268,22 @@ function decodePage(gl, model, c, page, data) {
     const uvAt = vat + ((vc * stride + 31) >>> 5) + 1;
     const textured = (lw >>> 23) & 1, corner = textured ? words[uvAt] : 0, widths = textured ? words[uvAt + 1] : 0;
     const bu = Math.min(widths & 31, 16), bv = Math.min((widths >>> 5) & 31, 16);
+    // skinned: two words per vertex, joints and weights a byte each, past the coordinates.
+    const skinAt = textured ? uvAt + 2 + ((vc * (bu + bv) + 31) >>> 5) : uvAt;
     for (let q = 0; q < vc; q++, v++) {
       const b = q * stride;
-      pos[6 * v] = g[0] + g[3] * (ox + bits(vat, b, bx));
-      pos[6 * v + 1] = g[1] + g[3] * (oy + bits(vat, b + bx, by));
-      pos[6 * v + 2] = g[2] + g[3] * (oz + bits(vat, b + bx + by, bz));
-      decodeOctahedral(bits(vat, b + bx + by + bz, 22), bytes, 24 * v + 12);
-      info[6 * v + 4] = tag;
+      pos[8 * v] = g[0] + g[3] * (ox + bits(vat, b, bx));
+      pos[8 * v + 1] = g[1] + g[3] * (oy + bits(vat, b + bx, by));
+      pos[8 * v + 2] = g[2] + g[3] * (oz + bits(vat, b + bx + by, bz));
+      decodeOctahedral(bits(vat, b + bx + by + bz, 22), bytes, 32 * v + 12);
+      info[8 * v + 4] = tag;
       if (textured) {
-        uvs[12 * v + 10] = (corner & 0xffff) + bits(uvAt, 64 + q * (bu + bv), bu);
-        uvs[12 * v + 11] = (corner >>> 16) + bits(uvAt, 64 + q * (bu + bv) + bu, bv);
+        uvs[16 * v + 10] = (corner & 0xffff) + bits(uvAt, 64 + q * (bu + bv), bu);
+        uvs[16 * v + 11] = (corner >>> 16) + bits(uvAt, 64 + q * (bu + bv) + bu, bv);
+      }
+      if (skinned) {
+        info[8 * v + 6] = words[skinAt + 2 * q];
+        info[8 * v + 7] = words[skinAt + 2 * q + 1];
       }
     }
     const mask = (1 << ib) - 1;
@@ -278,13 +301,17 @@ function decodePage(gl, model, c, page, data) {
   gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
   gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(0);
-  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
   gl.enableVertexAttribArray(1);
-  gl.vertexAttribPointer(1, 3, gl.BYTE, true, 24, 12);
+  gl.vertexAttribPointer(1, 3, gl.BYTE, true, 32, 12);
   gl.enableVertexAttribArray(2);
-  gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 24, 16);
+  gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 32, 16);
   gl.enableVertexAttribArray(3);
-  gl.vertexAttribPointer(3, 2, gl.UNSIGNED_SHORT, true, 24, 20);
+  gl.vertexAttribPointer(3, 2, gl.UNSIGNED_SHORT, true, 32, 20);
+  gl.enableVertexAttribArray(4);
+  gl.vertexAttribIPointer(4, 4, gl.UNSIGNED_BYTE, 32, 24);
+  gl.enableVertexAttribArray(5);
+  gl.vertexAttribPointer(5, 4, gl.UNSIGNED_BYTE, true, 32, 28);
   const ibo = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index, gl.STATIC_DRAW);
@@ -353,7 +380,8 @@ export async function startLite(canvas, ui) {
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
   const loc = { viewProj: gl.getUniformLocation(program, 'view_proj'), mode: gl.getUniformLocation(program, 'mode'), eye: gl.getUniformLocation(program, 'eye'),
-    textured: gl.getUniformLocation(program, 'textured'), albedo: gl.getUniformLocation(program, 'albedo_map') };
+    textured: gl.getUniformLocation(program, 'textured'), albedo: gl.getUniformLocation(program, 'albedo_map'),
+    skinned: gl.getUniformLocation(program, 'skinned'), joints: gl.getUniformLocation(program, 'joint_rows') };
   const multiDraw = gl.getExtension('WEBGL_multi_draw');
 
   const state = { yaw: 0.6, pitch: 0.15, distance: 3, threshold: 1, mode: 0, idle: true, dirty: true };
@@ -392,20 +420,51 @@ export async function startLite(canvas, ui) {
       }
       return error * lodScale * sec / z;
     };
+    // skinned: spheres where the points are, the smaller projection of two nested bounds
+    // (lod_sphere() and rest_sphere() in common.wgsl): one following the anchor joint, grown
+    // by how far the page's joints carry points from it; the rest sphere grown by how far
+    // they move points at all.
+    const pose = current.pose, sk = current.model.skeleton;
+    const sphere = new Float32Array(4);
+    const apply = (at, x, y, z, out) => {
+      const q = pose.rows;
+      out[0] = q[at] * x + q[at + 1] * y + q[at + 2] * z + q[at + 3];
+      out[1] = q[at + 4] * x + q[at + 5] * y + q[at + 6] * z + q[at + 7];
+      out[2] = q[at + 8] * x + q[at + 9] * y + q[at + 10] * z + q[at + 11];
+    };
+    const ma = [0, 0, 0], mj = [0, 0, 0];
+    const skinnedError = (page, s, at, error) => {
+      const x = s[at], y = s[at + 1], z = s[at + 2], r = s[at + 3];
+      const lo = sk.pageJoints[2 * page], hi = sk.pageJoints[2 * page + 1];
+      apply(12 * sk.anchor, x, y, z, ma);
+      let grow = 0, reach = 0;
+      for (let j = 0; j < sk.joints.length; j++) {
+        if (!((j < 32 ? lo >>> j : hi >>> (j - 32)) & 1)) continue;
+        apply(12 * j, x, y, z, mj);
+        grow = Math.max(grow, Math.hypot(mj[0] - ma[0], mj[1] - ma[1], mj[2] - ma[2]) + pose.normA[j] * r);
+        reach = Math.max(reach, Math.hypot(mj[0] - x, mj[1] - y, mj[2] - z) + pose.normI[j] * r);
+      }
+      sphere.set([ma[0], ma[1], ma[2], (1 + pose.normI[sk.anchor]) * r + grow]);
+      const anchored = projected(sphere, 0, error);
+      sphere.set([x, y, z, r + reach]);
+      return { error: Math.min(anchored, projected(sphere, 0, error)), reach };
+    };
     const draws = [], wanted = new Map();
     let triangles = 0;
     for (let i = 0; i < c.n; i++) {
       const parentError = c.parentError[i];
-      if (Number.isFinite(parentError) && parentError < 3e38 && projected(c.parent, 4 * i, parentError) <= threshold) continue;
-      // frustum: left, right, bottom, top.
-      const at = 4 * i, r = c.center[at + 3];
+      if (Number.isFinite(parentError) && parentError < 3e38 &&
+          (pose ? skinnedError(c.page[i], c.parent, 4 * i, parentError).error : projected(c.parent, 4 * i, parentError)) <= threshold) continue;
+      // frustum: left, right, bottom, top (skinned: the rest sphere grown by its reach).
+      const at = 4 * i, r = c.center[at + 3] + (pose ? skinnedError(c.page[i], c.center, at, 0).reach : 0);
       let inside = true;
       for (let p = 0; p < 4 && inside; p++) {
         const pl = planes[p];
         inside = pl[0] * c.center[at] + pl[1] * c.center[at + 1] + pl[2] * c.center[at + 2] + pl[3] >= -r;
       }
       if (!inside) continue;
-      const self = c.lodError[i] === 0 ? 0 : projected(c.lod, 4 * i, c.lodError[i]);
+      const lodPage = c.creator[i] !== NONE ? c.creator[i] : c.page[i];
+      const self = c.lodError[i] === 0 ? 0 : pose ? skinnedError(lodPage, c.lod, 4 * i, c.lodError[i]).error : projected(c.lod, 4 * i, c.lodError[i]);
       const creator = c.creator[i];
       const finerResident = creator !== NONE && table[creator] !== NONE;
       if (self > threshold && creator !== NONE && !finerResident) wanted.set(creator, Math.max(wanted.get(creator) || 0, self));
@@ -481,6 +540,21 @@ export async function startLite(canvas, ui) {
     const r0 = row(0), r1 = row(1), r3 = row(3);
     const planes = [r3.map((v, i) => v + r0[i]), r3.map((v, i) => v - r0[i]), r3.map((v, i) => v + r1[i]), r3.map((v, i) => v - r1[i])];
 
+    // skinned: posed for now (the walk, else the first animation), and picked every frame.
+    if (model.skeleton) {
+      const sk = model.skeleton;
+      if (!current.pose) current.pose = { rows: new Float32Array(12 * sk.joints.length), uniform: new Float32Array(192 * 4), normI: [], normA: [] };
+      const anim = Math.max(0, sk.animations.findIndex((a) => a.name === 'Walk'));
+      const pose = current.pose;
+      poseJoints(sk, sk.animations.length ? anim : -1, now / 1000, pose.rows);
+      const a = 12 * sk.anchor;
+      for (let j = 0; j < sk.joints.length; j++) {
+        pose.uniform.set(pose.rows.subarray(12 * j, 12 * j + 12), 12 * j);
+        pose.normI[j] = spectralNorm(pose.rows, 12 * j, true);
+        pose.normA[j] = spectralNorm(pose.rows, 12 * j, false, pose.rows, a);
+      }
+      state.dirty = true;
+    }
     // pick again when the view or the resident pages change.
     if (state.dirty || !picked || streamer.stats.inFlight) picked = select(eye, forward, width, height, planes, near);
     state.dirty = false;
@@ -504,6 +578,8 @@ export async function startLite(canvas, ui) {
     gl.uniform1i(loc.mode, state.mode);
     gl.uniform3fv(loc.eye, eye);
     gl.uniform1i(loc.textured, current.texture ? 1 : 0);
+    gl.uniform1i(loc.skinned, current.pose ? 1 : 0);
+    if (current.pose) gl.uniform4fv(loc.joints, current.pose.uniform);
     gl.uniform1i(loc.albedo, 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, current.texture ? current.texture.texture : null);

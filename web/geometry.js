@@ -2,6 +2,8 @@
 // and dependencies, all of a .cgeo but page data, which streams from name.pages
 // (web/streamer.js). layout: include/paged_file.hpp.
 
+import { fetchSkeleton } from './skeleton.js';
+
 const MAGIC = 'CGEOv009';
 
 // streams a url, reporting (bytes so far, total or 0), gunzipping .gz names.
@@ -21,10 +23,13 @@ export async function fetchBytes(url, onProgress) {
   return new Response(stream).arrayBuffer();
 }
 
-// a model and, if it has one, its texture: name.texture.json describing name.tiles (web/split.py).
+// a model and, if it has them, its texture (name.texture.json describing name.tiles: web/split.py)
+// and skeleton (name.cskn: web/skeleton.js).
 export async function fetchModel(stem, onProgress) {
   const model = parseMeta(await fetchBytes(`${stem}.meta.gz`, onProgress));
   model.pagesUrl = `${stem}.pages`;
+  model.skeleton = await fetchSkeleton(`${stem}.cskn`);
+  if (model.skeleton && model.skeleton.pageJoints.length !== 2 * model.pages.length) throw new Error(`${stem}.cskn does not match its pages`);
   const t = await fetch(`${stem}.texture.json`).catch(() => null);
   if (t && t.ok) {
     model.texture = await t.json();

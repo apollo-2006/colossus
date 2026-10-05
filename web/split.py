@@ -2,7 +2,7 @@
 gzipped) and name.pages (raw page data, read a page at a time by http
 range request). a .ctex beside it (include/texture_file.hpp) becomes
 name.texture.json (its levels) and name.tiles (its tiles, read the same
-way)."""
+way); a .cskn (include/skeleton.hpp) is kept as it is."""
 import gzip
 import json
 import os
@@ -48,3 +48,5 @@ for path in sys.argv[1:]:
     print(f"{stem}: metadata {start / 1e6:.1f} MB, pages {size / 1e6:.1f} MB")
     if os.path.exists(stem + ".ctex"):
         split_texture(stem)
+    if os.path.exists(stem + ".cskn"):
+        print(f"{stem}: skeleton {os.path.getsize(stem + '.cskn') / 1e3:.0f} kb")
