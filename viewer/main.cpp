@@ -1425,7 +1425,7 @@ private:
         info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
                      (updatable ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0) |
                      (ctx_.position_fetch && type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
-                          ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR : 0);
+                          ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR : 0);
         info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         info.geometryCount = 1;
         info.pGeometries = &geom;
