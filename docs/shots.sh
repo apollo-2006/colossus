@@ -20,6 +20,10 @@ rm -f /tmp/colossus_{marble,sandstone,bronze,gold,granite}.png
 if [[ -f models/washington.cgeo ]]; then
   shot --model models/washington.cgeo --camera 0.32,0.78,0.0,-1.5708,-0.05 --screenshot docs/washington.png
 fi
+# the skinned crowd, if fetched (models/fetch.sh fox).
+if [[ -f models/fox.cgeo ]]; then
+  shot --model models/fox.cgeo --grid 30 --spacing 1.2 --camera -1.2,0.45,3.2,0.45,-0.12 --screenshot docs/foxes.png
+fi
 python3 docs/recompress.py docs/*.png
 # the web demo's fallback frames, when imagemagick or ffmpeg is around.
 if command -v convert >/dev/null || command -v ffmpeg >/dev/null; then web/gallery.sh; fi

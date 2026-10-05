@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p web/gallery
-for n in crowd clusters lod_levels rasterizers materials; do
+for n in crowd clusters lod_levels rasterizers materials washington foxes; do
   if command -v convert >/dev/null; then
     convert docs/$n.png -resize '1280x>' -strip -quality 82 -sampling-factor 4:2:0 -interlace JPEG web/gallery/$n.jpg
   else

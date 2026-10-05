@@ -17,12 +17,13 @@ threshold and the crowd size there to play with.
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
 900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
-billion triangles at full detail, drawn at 1920x1080 in 1.45 ms on an rx 9070 xt, soft
+billion triangles at full detail, drawn at 1920x1080 in 1.48 ms on an rx 9070 xt, soft
 shadows, bounce light, ambient occlusion, weathered stone and bronze, and antialiasing
 included. about
 4.8 million triangles reach the screen, from about 20 mb of the 427 mb on disk, each
 cluster provably within a pixel of the original. a million instances (17.6 trillion
-triangles) take 1.79 ms, and instances can move and sway.
+triangles) take 1.81 ms. instances can move and sway, a museum scan streams its own
+texture, and skinned models run their animations, every cluster still picking its level.
 
 ## how it works
 
@@ -236,19 +237,19 @@ last transform, and the shadow maps redraw the pages it crossed.
 
 | instances | moving | shadow maps (soft) | ray traced (hard) |
 |---|---|---|---|
-| 900 | none | 1.46 ms | 1.61 ms |
-| 900 | 1% | 1.54 ms | 1.77 ms |
-| 900 | half | 1.95 ms | 1.86 ms |
-| 90,000 | 1% | 1.81 ms | 2.05 ms |
-| 1,000,000 | none | 1.79 ms | 2.03 ms |
-| 1,000,000 | 1% | 1.99 ms | 2.17 ms |
+| 900 | none | 1.47 ms | 1.62 ms |
+| 900 | 1% | 1.56 ms | 1.79 ms |
+| 900 | half | 1.96 ms | 1.85 ms |
+| 90,000 | 1% | 1.82 ms | 2.04 ms |
+| 1,000,000 | none | 1.81 ms | 2.01 ms |
+| 1,000,000 | 1% | 2.01 ms | 2.22 ms |
 
 the crowd view at 1920x1080, ambient occlusion and bounce light on in both; runs vary by
 a few hundredths. half the crowd moving is where the shadow maps lose: 450 statues redrawn
 into their pages every frame. a ray traced refit on radv costs by the size of the whole
 structure (2.7k entries 0.25 ms, 270k 0.94 ms), so still instances get a structure of
 their own. at a million, occlusion culling is what makes it work: without it the view
-draws 103 million triangles in 2.96 ms.
+draws 103 million triangles in 2.92 ms.
 
 `--deforming f` makes a share of them sway like trees in wind: a bend growing with the
 square of the height and a ripple running up it (`deform()` in `common.glsl`), both
@@ -257,8 +258,35 @@ cluster and cuts stay crack-free, and the bend inverts exactly, which antialiasi
 to find where a point was last frame. the guarantee holds too: the bend's slope is at
 most 0.128, a shear stretching lengths by at most 1.066, so errors are scaled by 1.07
 and every culling sphere grows by the farthest a point moves, a tenth of the radius.
-deforming instances share the moving instances' shadow layer: 1% of the crowd costs 1.55
-ms, a tenth 1.61, half 2.00.
+deforming instances share the moving instances' shadow layer: 1% of the crowd costs 1.57
+ms, a tenth 1.63, half 1.99.
+
+skinned models play their own animations. `colossus_build` reads gltf (a small json parser
+inside, no new dependencies) and keeps each vertex's four joints and weights in the pages,
+the skeleton and animations in a `.cskn` beside the model; `--subdivide n` runs loop
+subdivision first, so the 576 triangle khronos fox becomes 589,824 and has levels worth
+streaming. each skinned instance follows one of every animation at 16 phases, posed on the
+cpu once a frame, so a crowd shares a few dozen poses, and the shaders skin each vertex
+they decode. antialiasing finds where a pixel was through its triangle posed as last frame.
+
+the errors had to change. a proven bound on linear blend skinning has to assume the worst
+weight mix against the worst joint separation, which at coarse levels is a body length:
+measured that way, 900 foxes drew 51.9 million triangles in 8.86 ms. the animations are
+known when building, though, so each group's simplification is measured posed instead, in
+49 poses, the worst joining its error, and collapses are priced in 13 of them (mohr and
+gleicher's summed quadrics: a rest pose quadric happily removes the vertices a bent knee
+needs). level 1's median error went from four times the rigid fox's to the same. spheres
+take the smaller of two nested bounds, the rest sphere grown by how far its joints move
+points and one following the most weighted joint, grown by how far the others move points
+from it; the joints a page uses only grow toward the roots, so cuts stay whole. the posed
+error is measured over the shipped animations, not proven.
+
+900 skinned foxes draw 3.41 million triangles in 1.86 ms; the same foxes rigid draw 1.27
+million in 0.58. most of the difference is shadows (0.74 ms: every fox redraws its
+pages every frame) and the posed errors, two to three times the rigid ones at the coarse
+levels. a fox filling the screen draws 64 to 81 thousand triangles (rigid: 36 thousand).
+a million of them take 8.77 ms, shadows 4.32 of it: animated instances are expensive in
+the shadow maps, as moving ones are.
 
 ![lucy, each cluster in its own colour](docs/clusters.png)
 
@@ -282,8 +310,13 @@ sandstone, bronze greening in its folds, hammered gold, granite.
 ![horatio greenough's george washington, scanned by the smithsonian, close up in its own texture](docs/washington.png)
 
 horatio greenough's george washington (1840), the smithsonian american art museum's scan:
-17 million triangles and a 4096x4096 texture, in its own marble and staining. 0.95 ms at
-1600x1000.
+17 million triangles and a 4096x4096 texture, in its own marble and staining. 1.04 ms at
+1920x1080; in the crowd above with lucy and the dragon, 1.69 ms.
+
+![a crowd of running, walking and watchful foxes, each skinned and animated](docs/foxes.png)
+
+900 khronos foxes, subdivided to 590 thousand triangles each, walking, running and looking
+round (`models/fetch.sh fox`).
 
 ## in the browser
 
@@ -298,6 +331,11 @@ or push constants:
   (`web/streamer.js`), same rules, neighbouring pages merged into one request.
 * occlusion runs in the same two passes, the pass number from a uniform bound at an
   offset per dispatch.
+* washington's texture streams as the viewer's does: `web/split.py` turns a `.ctex` into
+  tiles read by range request into the same pool, and the shading pass decodes bc1 by
+  hand. a pool slot fits the largest page, and washington's run to 30 kb with their
+  texture coordinates (the others' to 12), so the pool is 512 mb: at 192 it held fewer
+  pages than a frame wanted and fetched 569 mb without settling.
 * shadows are the viewer's virtual shadow maps, in a module of their own
   (`web/vsm.wgsl`) to keep the bind group small, their indirect arguments in their own
   buffer (a dispatch can't write the buffer it reads arguments from). soft shadows use
@@ -321,10 +359,11 @@ or push constants:
   +faststart web/flythrough.mp4`. `?fallback` shows it
   anywhere.
 
-the models are trimmed to 4 million triangles at their finest (`--max-triangles`): about
-2.6 mb of gzipped metadata each, up front, and about 55 mb of pages, streamed. in chrome
-on the rx 9070 xt at 1600x813, 900 instances take 1.36 ms of gpu time once streaming
-settles, 2.14 ms with the middle moving and swaying, and a million 2.09 ms. it needs 16
+the models are trimmed to 4 million triangles at their finest (`--max-triangles`): 2.5 to
+2.9 mb of gzipped metadata each, up front, and 54 to 88 mb of pages, streamed, with 14 mb
+of washington's tiles. in chrome on the rx 9070 xt at 1600x813, 900 instances of the
+three take 1.67 ms of gpu time once streaming settles (61 mb fetched), 2.64 ms with the
+middle moving and swaying, and a million 2.31 ms. it needs 16
 storage buffers per shader stage, which desktop gpus allow. `web/build.sh` builds the models;
 `node tests/web_screenshot.mjs` renders the page headless.
 
@@ -339,6 +378,7 @@ cd colossus
 make
 models/fetch.sh            # downloads lucy and the dragon (380 mb) and builds both
 models/fetch.sh washington # the textured scan (720 mb, needs ffmpeg for its texture)
+models/fetch.sh fox        # the skinned fox (a small gltf, subdivided when built)
 
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30
 ./colossus --model models/lucy.cgeo                       # one lucy
@@ -346,6 +386,8 @@ models/fetch.sh washington # the textured scan (720 mb, needs ffmpeg for its tex
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30 --deforming 0.2
 ./colossus --model models/lucy.cgeo --materials bronze    # one lucy, in bronze
 ./colossus --model models/washington.cgeo                 # textured
+./colossus --model models/fox.cgeo --grid 30 --spacing 1.2 # 900 foxes, each animation
+./colossus --model models/fox.cgeo --animation Run        # one, running
 ./colossus_build any.ply out.cgeo --check                 # your own model, checked for cracks
 ./colossus_build any.obj out.cgeo --texture t.ppm         # textured (writes out.ctex too)
 ```
@@ -379,7 +421,9 @@ back exactly, shared vertices identical from every cluster. without the group lo
 crack check finds 39,095 cracked edges on the closed sphere alone. it also checks the
 proven error against brute force on about 94,000 random points, and that packed normal
 cones never cull a view the exact cone keeps, and that bc1 tiles match their image,
-borders included.
+borders included. a skinned gltf, built in the test, checks reading, the rest pose as the
+identity, a bent joint, posing after placement, and joints and weights through
+subdivision and pages, the joints of each page only growing toward the roots.
 
 `tests/streamer_test.cpp` runs 3,000 frames of random requests into a pool a tenth of a
 model (synchronous, loader threads, loader threads with prefetch), checking after every
@@ -393,22 +437,23 @@ streaming. shading includes shadows and antialiasing.
 
 | camera | frame | culling | raster | pass 2 | shadow pages | shading | triangles |
 |---|---|---|---|---|---|---|---|
-| beside lucy (top image) | 1.45 ms | 0.17 | 0.28 | 0.10 | 0.07 | 0.83 | 4.75m |
-| raised (lod image) | 1.57 ms | 0.11 | 0.35 | 0.08 | 0.08 | 0.95 | 7.43m |
-| ground level | 1.35 ms | 0.14 | 0.22 | 0.11 | 0.07 | 0.80 | 3.87m |
+| beside lucy (top image) | 1.48 ms | 0.17 | 0.26 | 0.10 | 0.08 | 0.88 | 4.77m |
+| raised (lod image) | 1.67 ms | 0.11 | 0.36 | 0.09 | 0.08 | 1.03 | 7.44m |
+| ground level | 1.37 ms | 0.14 | 0.22 | 0.10 | 0.07 | 0.83 | 3.86m |
 
-no bounce light: 1.27, 1.50 and 1.19 ms; plain materials: 1.22, 1.39 and 1.14; hard
-shadows: 1.38, 1.53 and 1.28; no ambient occlusion (nor bounce light): 1.19, 1.40 and
-1.10; no shadows: 1.15, 1.27 and 1.05; ray traced (hard): 1.61, 1.87 and 1.45; traced
-bounce light (`--gi rt`): 1.95, 2.05 and 1.96; no antialiasing: 1.33, 1.52 and 1.22.
-the compute rasterizer saves 0.33 to 0.39 ms. occlusion culling removes 54% of the
-triangles at ground level (1.51 to 1.35 ms) and next to nothing from the raised camera,
-which sees over the crowd.
+no bounce light: 1.30, 1.54 and 1.21 ms; plain materials: 1.26, 1.44 and 1.19; hard
+shadows: 1.40, 1.55 and 1.30; no ambient occlusion (nor bounce light): 1.22, 1.44 and
+1.12; no shadows: 1.16, 1.28 and 1.06; ray traced (hard): 1.62, 1.87 and 1.47; traced
+bounce light (`--gi rt`): 2.02, 2.05 and 1.94; no antialiasing: 1.34, 1.55 and 1.24.
+the compute rasterizer saves 0.33 to 0.37 ms. occlusion culling removes 54% of the
+triangles at ground level (1.54 to 1.37 ms) and next to nothing from the raised camera,
+which sees over the crowd. measured on mesa 26.2.4; the same code measured 1.45, 1.57 and
+1.35 ms before that update.
 
 the triangle counts have climbed as the errors got honest: 0.86 million beside lucy
 when errors were quadric estimates, 2.99 million once measured by samples, 4.77 million
 now that both the error and its projection are proven. a threshold of two pixels
-(`--threshold 2`, or ]) draws 2.34 million in 1.34 ms, about the old picture. the commit
+(`--threshold 2`, or ]) draws 2.34 million in 1.36 ms, about the old picture. the commit
 messages have every step's numbers.
 
 ## limitations
@@ -417,15 +462,17 @@ messages have every step's numbers.
   shift by more than a pixel's worth where they depend on detail the cut removed.
 * proving the bounds makes building slower, 5.6 minutes for lucy (and about two hours on
   a hosted ci runner, so the demo workflow caches the result).
-* motion and deformation are built in and procedural: no skinning, no animation data.
-  many moving instances are costly in the shadow maps (half the crowd turning redraws
+* motion and deformation are procedural; skinning is linear blend, its errors measured
+  over the shipped animations rather than proven, and only gltf brings skeletons. many
+  moving or animated instances are costly in the shadow maps (half the crowd turning redraws
   about 550 pages a frame, 0.78 ms: turning statues move too fast to skip frames even
-  at coarse levels), and ray traced shadows bend swaying statues only to a chord.
+  at coarse levels), and ray traced shadows bend swaying statues only to a chord and
+  keep skinned ones in their rest pose.
 * shadow pages draw from streamed geometry too, so shadows sharpen with everything else,
   and a page that finds the pool full falls back a level.
 * a texture is colour only, one per model: no normal or roughness maps. where seams had
-  to move, the texture can slip across them by up to the cluster's error. the browser
-  port draws no textures yet.
+  to move, the texture can slip across them by up to the cluster's error. the webgl2
+  fallback draws no textures, and the browser no skinning yet.
 * bounce light is a single bounce. by default it comes off the ground and what's on
   screen; `--gi rt` reaches everything but needs ray queries, traces the coarse shadow
   copies and costs 0.5 to 0.6 ms more. the browser has the screen space kind only.
@@ -437,4 +484,7 @@ lucy and the xyz rgb asian dragon come from the
 thanks to the stanford computer graphics laboratory (and xyz rgb inc. for the dragon).
 they aren't redistributed here; `models/fetch.sh` downloads them. horatio greenough's
 george washington is the [smithsonian american art museum](https://americanart.si.edu)'s
-scan, released cc0 through [smithsonian open access](https://3d.si.edu).
+scan, released cc0 through [smithsonian open access](https://3d.si.edu). the fox is from
+the [khronos gltf sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets): model
+by pixelmannen (cc0), rigging and animation by tomkranis (cc by 4.0), gltf conversion by
+asobostudio and scurest (cc by 4.0).

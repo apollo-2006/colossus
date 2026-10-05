@@ -55,7 +55,8 @@
   <p class="help">Each model is 4M triangles at its finest. Only their outlines load up front; the rest
     streams in, page by page, as you look closer. The
     <a href="https://github.com/apollo-2006/colossus">native viewer</a> draws all 28M of Lucy's, with mesh
-    shaders and ray traced shadows. Lucy and the dragon: Stanford 3D Scanning Repository.</p>
+    shaders and ray traced shadows. Lucy and the dragon: Stanford 3D Scanning Repository. George Washington:
+    Smithsonian American Art Museum, CC0.</p>
 </aside>
 <!-- shown instead of the demo when the browser has no webgpu, or the gpu too few storage
      buffers (app.js), or with ?fallback. flythrough.mp4, if present, plays at the top. -->
@@ -92,7 +93,7 @@
   <figure>
     <img src="gallery/crowd.jpg" width="1280" height="720" alt="900 instances of Lucy and the XYZ RGB dragon in sunlight, shadowed by virtual shadow maps">
     <figcaption>900 statues of Lucy and the XYZ RGB dragon: 15.9 billion triangles at full detail, drawn at
-      1920x1080 in 1.45 ms with soft shadows, bounce light, ambient occlusion and antialiasing. About 4.8 million reach the
+      1920x1080 in 1.48 ms with soft shadows, bounce light, ambient occlusion and antialiasing. About 4.8 million reach the
       screen.</figcaption>
   </figure>
   <figure>
@@ -112,15 +113,27 @@
   </figure>
   <figure>
     <img src="gallery/materials.jpg" width="1280" height="418" alt="Lucy in each material: veined marble, layered sandstone, patinated bronze, hammered gold, speckled granite" loading="lazy">
-    <figcaption>The scans have no UVs, so materials come from noise in each model's own space: veined marble,
-      layered sandstone, bronze greening in its folds, hammered gold, granite.</figcaption>
+    <figcaption>Lucy and the dragon have no UVs, so their materials come from noise in each model's own space:
+      veined marble, layered sandstone, bronze greening in its folds, hammered gold, granite.</figcaption>
+  </figure>
+  <figure>
+    <img src="gallery/washington.jpg" width="1280" height="720" alt="Horatio Greenough's George Washington, scanned by the Smithsonian, close up in its own texture" loading="lazy">
+    <figcaption>Horatio Greenough's George Washington (1840), the Smithsonian American Art Museum's scan: 17 million
+      triangles and its own 4096x4096 texture, streamed in tiles beside the geometry.</figcaption>
+  </figure>
+  <figure>
+    <img src="gallery/foxes.jpg" width="1280" height="720" alt="a crowd of running, walking and watchful foxes, each skinned and animated" loading="lazy">
+    <figcaption>900 Khronos foxes, skinned and animated, each subdivided to 590 thousand triangles and still picking
+      its level per cluster: errors are measured in every pose of their animations.</figcaption>
   </figure>
   <footer>
     <p>To fly through it yourself you need WebGPU: Chrome or Edge 113 or later on a desktop, Safari 26, or
       Firefox 141 or later on Windows, and a GPU that allows 16 storage buffers per shader stage, as desktop
       GPUs do.</p>
     <p><a href="https://github.com/apollo-2006/colossus">Source, numbers and the native viewer on GitHub</a>.
-      Lucy and the dragon: Stanford 3D Scanning Repository.</p>
+      Lucy and the dragon: Stanford 3D Scanning Repository. George Washington: Smithsonian American Art Museum,
+      CC0. Fox: model by PixelMannen (CC0), rigging and animation by tomkranis, glTF by AsoboStudio and scurest
+      (CC BY 4.0), from the Khronos glTF sample assets.</p>
   </footer>
 </main>
 <script type="module" src="app.js"></script>
