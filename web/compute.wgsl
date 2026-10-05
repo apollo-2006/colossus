@@ -699,9 +699,11 @@ fn args_draw() {
 }
 
 // --- software rasterizer: a workgroup per small cluster, an invocation per
-// vertex then per triangle. 1/256 pixel snapping, top-left rule, edges from
-// each triangle's corner to fit 32 bits. pass 1 keeps the nearest depth; pass 2
-// writes the triangle where its depth won.
+// vertex then per triangle. 1/256 pixel snapping, edges from each triangle's
+// corner to fit 32 bits. pass 1 keeps the nearest depth; pass 2 writes the
+// triangle where its depth won. triangles grow by a step (1/256): where this
+// meets the render pipeline, a vertex can land a step apart and leave a sliver
+// neither draws (viewer/shaders/sw_raster.comp).
 
 var<workgroup> screen: array<vec2i, 128>;
 var<workgroup> depth: array<f32, 128>;
@@ -709,13 +711,6 @@ var<workgroup> wg_valid: u32;
 
 fn edge(a: vec2i, b: vec2i, p: vec2i) -> i32 {
   return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
-}
-
-// top-left rule, y down: an edge running up (or flat, running right, in this
-// winding) owns its pixel centres.
-fn owns_edge(a: vec2i, b: vec2i) -> bool {
-  let d = b - a;
-  return d.y < 0 || (d.y == 0 && d.x > 0);
 }
 
 fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
@@ -744,8 +739,9 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
   var a = screen[i0];
   var b = screen[i1];
   var d = screen[i2];
-  let lo_abs = max((min(a, min(b, d)) - vec2i(128) + vec2i(255)) >> vec2u(8u), vec2i(0));
-  let hi = min((max(a, max(b, d)) - vec2i(128)) >> vec2u(8u), vec2i(i32(frame.width), i32(frame.height)) - vec2i(1)) - lo_abs;
+  // the box widened as the triangle grows.
+  let lo_abs = max((min(a, min(b, d)) - vec2i(2 + 128) + vec2i(255)) >> vec2u(8u), vec2i(0));
+  let hi = min((max(a, max(b, d)) + vec2i(2 - 128)) >> vec2u(8u), vec2i(i32(frame.width), i32(frame.height)) - vec2i(1)) - lo_abs;
   if (hi.x < 0 || hi.y < 0) { return; }
   let origin = lo_abs * 256;
   a -= origin;
@@ -762,9 +758,11 @@ fn sw_raster(wid: vec3u, lane: u32, write_id: bool) {
     let tz = zb; zb = zd; zd = tz;
     area = -area;
   }
-  let bias0 = select(-1, 0, owns_edge(b, d));
-  let bias1 = select(-1, 0, owns_edge(d, a));
-  let bias2 = select(-1, 0, owns_edge(a, b));
+  // each edge out by a step: an edge function is its length times the distance, and
+  // |x| + |y| is at least the length.
+  let bias0 = abs(d.x - b.x) + abs(d.y - b.y);
+  let bias1 = abs(a.x - d.x) + abs(a.y - d.y);
+  let bias2 = abs(b.x - a.x) + abs(b.y - a.y);
   let p0 = vec2i(128);
   var row0 = edge(b, d, p0) + bias0;
   var row1 = edge(d, a, p0) + bias1;

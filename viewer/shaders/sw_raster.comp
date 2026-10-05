@@ -4,10 +4,14 @@
 // triangle into the visibility buffer with the hardware path's 64-bit atomic
 // max, so the two mix.
 //
-// vertices snap to 1/256 pixel like the hardware, and a top-left rule gives
-// each shared pixel centre to one triangle. edge functions are relative to the
-// triangle's corner, staying 32-bit: clusters here are under 64 pixels,
-// coordinates under 2^14, products under 2^28. (rdna has no 64-bit multiply;
+// vertices snap to 1/256 pixel like the hardware, but where the two rasterizers
+// meet, a vertex can still land a step apart (the hardware doesn't place it
+// bit for bit as this shader does), leaving a sliver whose pixel centres
+// neither draws. so triangles
+// here grow by a step: the depth test settles the overlap, and a silhouette can
+// gain a pixel whose centre lies within 1.5/256 of it. edge functions are
+// relative to the triangle's corner, staying 32-bit: clusters here are under 64
+// pixels, coordinates under 2^14, products under 2^28. (rdna has no 64-bit multiply;
 // the 64-bit version lost at every size.)
 //
 // each pixel reads before its atomic and skips it if something nearer is there,
@@ -23,13 +27,6 @@ shared float depth[128];   // reversed: near_z / w
 
 int edge(ivec2 a, ivec2 b, ivec2 p) {
     return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
-}
-
-// top-left rule, y down: an edge running up (or flat, running right, in this
-// winding) owns its pixels.
-bool owns_edge(ivec2 a, ivec2 b) {
-    const ivec2 d = b - a;
-    return d.y < 0 || (d.y == 0 && d.x > 0);
 }
 
 void main() {
@@ -58,9 +55,10 @@ void main() {
     uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
     ivec2 a = screen[i0], b = screen[i1], d = screen[i2];
     float za = depth[i0], zb = depth[i1], zd = depth[i2];
-    // positions now relative to the box's corner pixel.
-    const ivec2 lo_abs = max((min(a, min(b, d)) - 128 + 255) >> 8, ivec2(0));
-    const ivec2 hi = min((max(a, max(b, d)) - 128) >> 8, ivec2(frame.width, frame.height) - 1) - lo_abs;
+    // positions now relative to the box's corner pixel (the box widened as the triangle
+    // grows: by at most 1.5 steps).
+    const ivec2 lo_abs = max((min(a, min(b, d)) - 2 - 128 + 255) >> 8, ivec2(0));
+    const ivec2 hi = min((max(a, max(b, d)) + 2 - 128) >> 8, ivec2(frame.width, frame.height) - 1) - lo_abs;
     if (any(lessThan(hi, ivec2(0)))) return;
     const ivec2 origin = lo_abs * 256;
     a -= origin;
@@ -76,12 +74,13 @@ void main() {
         area = -area;
     }
 
-    // edge functions at the first pixel centre, and steps. pixels on edges not
-    // owned are biased just outside.
+    // edge functions at the first pixel centre, and steps. each edge moves out by a step:
+    // an edge function is its length times the distance, and |x| + |y| is at least the
+    // length.
     const ivec2 p0 = ivec2(128);
-    const int bias0 = owns_edge(b, d) ? 0 : -1;
-    const int bias1 = owns_edge(d, a) ? 0 : -1;
-    const int bias2 = owns_edge(a, b) ? 0 : -1;
+    const int bias0 = abs(d.x - b.x) + abs(d.y - b.y);
+    const int bias1 = abs(a.x - d.x) + abs(a.y - d.y);
+    const int bias2 = abs(b.x - a.x) + abs(b.y - a.y);
     int row0 = edge(b, d, p0) + bias0, row1 = edge(d, a, p0) + bias1, row2 = edge(a, b, p0) + bias2;
     const int dx0 = (d.y - b.y) * -256, dy0 = (d.x - b.x) * 256;
     const int dx1 = (a.y - d.y) * -256, dy1 = (a.x - d.x) * 256;
