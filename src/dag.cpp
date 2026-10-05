@@ -77,7 +77,7 @@ std::vector<std::vector<uint32_t>> partition(const std::vector<lod_cluster>& all
         for (size_t k = 0; k < pairs.size();) {
             size_t j = k;
             while (j < pairs.size() && pairs[j] == pairs[k]) ++j;
-            const uint32_t w = static_cast<uint32_t>(j - k);
+            const uint32_t w = static_cast<uint32_t>(j - k) * 64;  // spatial links (below) weigh 1
             adjacency[pairs[k].first].push_back({pairs[k].second, w});
             adjacency[pairs[k].second].push_back({pairs[k].first, w});
             k = j;
@@ -100,6 +100,32 @@ std::vector<std::vector<uint32_t>> partition(const std::vector<lod_cluster>& all
     std::vector<uint32_t> order(n);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return code[a] < code[b]; });
+
+    // islands (needles, leaves, blades: clusters with at most one neighbour by edges) would make
+    // groups of their own, too small to simplify: they link to their four nearest clusters
+    // (among the 32 round them in morton order), weighing less than any shared edge.
+    {
+        std::vector<std::vector<uint32_t>> near(n);
+        parallel_for(n, [&](size_t k) {
+            const uint32_t c = order[k];
+            if (adjacency[c].size() > 1) return;
+            std::vector<std::pair<float, uint32_t>> cand;
+            for (size_t j = k >= 16 ? k - 16 : 0; j < std::min(n, k + 17); ++j)
+                if (j != k) cand.push_back({length(all[level[order[j]]].bounds.center - all[level[c]].bounds.center), order[j]});
+            std::partial_sort(cand.begin(), cand.begin() + std::min<size_t>(4, cand.size()), cand.end());
+            for (size_t q = 0; q < std::min<size_t>(4, cand.size()); ++q) near[c].push_back(cand[q].second);
+        });
+        for (uint32_t c = 0; c < n; ++c)
+            for (uint32_t o : near[c]) {
+                auto has = [&](uint32_t a, uint32_t b) {
+                    for (auto [x, w] : adjacency[a]) if (x == b) return true;
+                    return false;
+                };
+                if (has(c, o)) continue;
+                adjacency[c].push_back({o, 1});
+                adjacency[o].push_back({c, 1});
+            }
+    }
 
     std::vector<uint32_t> group_of(n, UINT32_MAX);
     std::vector<std::vector<uint32_t>> groups;
@@ -227,13 +253,14 @@ std::vector<uint32_t> make_wedges(const mesh& m, lod_mesh& out) {
             auto [it, added] = split.emplace(std::make_pair(w, chart), uint32_t(out.wedge_uvs.size()));
             if (added) {
                 out.wedge_uvs.push_back(m.wedge_uvs[w]);
+                out.wedge_material.push_back(m.wedge_material[w]);
                 out.wedge_vertex.push_back(m.wedge_vertex[w]);
                 out.wedge_chart.push_back(chart);
             }
             corners[3 * t + c] = it->second;
         }
     }
-    out.texture = m.texture;
+    out.materials = m.materials;
     return corners;
 }
 
@@ -380,15 +407,18 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
                 stuck[g] = 1;
                 return;
             }
-            wedges w{merged_corners, out.wedge_chart, out.wedge_vertex, out.wedge_uvs};
+            wedges w{merged_corners, out.wedge_chart, out.wedge_vertex, out.wedge_uvs, out.wedge_material};
             simplify_result s = simplify(out.positions, merged, locked, tris / 2, &w, priced);
             // seams of many small texture charts can pin a group: let them move.
             if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && !out.wedge_uvs.empty()) {
                 w.relax = true;
                 s = simplify(out.positions, merged, locked, tris / 2, &w, priced);
             }
-            if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && last)
-                s = cluster_vertices(out.positions, merged, std::max<size_t>(tris / 2, 1), &w);
+            // still stuck: islands (needles, leaves, blades) no collapse may remove, or thin parts.
+            // vertex clustering merges them, the group's outline (locked vertices) kept in place
+            // so its neighbours still meet it; the last group has no outline.
+            if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris)
+                s = cluster_vertices(out.positions, merged, std::max<size_t>(tris / 2, 1), &w, &locked);
             if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) {
                 stuck[g] = 1;
                 return;
@@ -466,6 +496,7 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
             const uint32_t wedge_base = static_cast<uint32_t>(out.wedge_uvs.size());
             for (const new_wedge& nw : made_wedges[g]) {
                 out.wedge_uvs.push_back(nw.uv);
+                out.wedge_material.push_back(nw.material);
                 out.wedge_vertex.push_back(nw.vertex);
                 out.wedge_chart.push_back(nw.chart);
             }

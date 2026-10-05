@@ -48,11 +48,14 @@ TextureLevel texture_level(uvec4 tex, uint level) {
 // units: as if each level coarser were a pixel of error more, doubling).
 vec3 sample_resident(uvec4 tex, vec2 uv, uint level) {
     uint wanted = NO_PAGE;
-    for (uint k = level; k < tex.y; ++k) {
+    const uint levels = tex.y & 255u;
+    // a repeating texture wraps (its tile borders wrap round too); else clamps.
+    const vec2 st = (tex.y & 256u) != 0u ? fract(uv) : clamp(uv, 0.0, 1.0);
+    for (uint k = level; k < levels; ++k) {
         const TextureLevel l = texture_level(tex, k);
         // the texel left of and above uv's centre, and the weights to the next. at is at least
         // -0.5, so b at least -1: that texel is the tile border's.
-        const vec2 at = clamp(uv, 0.0, 1.0) * vec2(l.size) - 0.5;
+        const vec2 at = st * vec2(l.size) - 0.5;
         const vec2 base = floor(at), f = at - base;
         const ivec2 b = ivec2(base);
         const uvec2 tile = min(uvec2(max(b, ivec2(0))) / tile_payload, l.tiles - 1u);
@@ -77,10 +80,11 @@ vec3 sample_resident(uvec4 tex, vec2 uv, uint level) {
 vec3 sample_texture(uvec4 tex, vec2 uv, vec2 duv_dx, vec2 duv_dy) {
     const vec2 size = vec2(tex.zw);
     const float footprint = max(length(duv_dx * size), length(duv_dy * size));
-    const float lod = clamp(log2(max(footprint, 1e-8)), 0.0, float(tex.y - 1u));
+    const uint levels = tex.y & 255u;
+    const float lod = clamp(log2(max(footprint, 1e-8)), 0.0, float(levels - 1u));
     const uint level = uint(lod);
     const float f = lod - float(level);
     const vec3 a = sample_resident(tex, uv, level);
-    if (f < 1.0 / 64.0 || level + 1u >= tex.y) return a;
+    if (f < 1.0 / 64.0 || level + 1u >= levels) return a;
     return mix(a, sample_resident(tex, uv, level + 1u), f);
 }

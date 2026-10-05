@@ -9,8 +9,12 @@
 #include "texture_file.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -56,6 +60,11 @@ struct shadow_mesh {
 };
 
 struct scene {
+    // the look: the ground's albedo, the fog's density, grid lines (a scene file's).
+    float ground[3] = {0.41f, 0.39f, 0.36f};
+    float fog = 0.012f;
+    bool grid = true;
+    uint64_t pool_mb = 1024;  // the page pool: --pool-mb, the scene file's, or 1024
     std::vector<packed_cluster> clusters;  // every model's, page numbers made global
     std::vector<page_bounds> shared_bounds;  // per global page
     std::vector<stream_page> pages;
@@ -63,6 +72,9 @@ struct scene {
     std::vector<uint32_t> children;     // global page numbers, for prefetch
     std::vector<int> files;
     std::vector<gpu_mesh> meshes;
+    // per material: its texture's first tile page, level count | repeat << 8 | double sided << 9,
+    // width, height (texture.glsl).
+    std::vector<std::array<uint32_t, 4>> materials;
     std::vector<gpu_instance> instances;
     std::vector<gpu_cell> cells;
     std::vector<shadow_mesh> shadow_meshes;  // shadow_lods per model
@@ -139,9 +151,71 @@ float shadow_cut(const paged_geometry& g, int fd, size_t budget, std::vector<flo
 
 // reads models' clusters and page lists (geometry streams later) and places them on a grid,
 // turned and sized at random.
+// a scene file: lines `model NAME PATH` (relative to the file) and `place NAME x y z yaw scale`
+// (metres and radians, about the vertical), and optionally `ground r g b` (its albedo), `fog D`
+// (density per metre), `grid off` and `pool MB` (the page pool it needs); `#` comments. its models, and its placements as
+// (model index, transform).
+struct scene_file {
+    float ground[3] = {0.41f, 0.39f, 0.36f};
+    float fog = 0.012f;
+    bool grid = true;
+    uint64_t pool_mb = 0;  // the page pool it wants, unless --pool-mb says otherwise
+    std::vector<std::string> models;
+    struct placement { uint32_t model; vec3 at; float yaw, scale; };
+    std::vector<placement> placements;
+};
+
+inline scene_file read_scene_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    const std::string dir = path.substr(0, path.find_last_of('/') + 1);
+    scene_file out;
+    std::vector<std::string> names;
+    std::string line;
+    for (int number = 1; std::getline(f, line); ++number) {
+        std::istringstream in(line);
+        std::string word;
+        if (!(in >> word) || word[0] == '#') continue;
+        auto fail = [&] { throw std::runtime_error(path + ":" + std::to_string(number) + ": cannot read '" + line + "'"); };
+        if (word == "model") {
+            std::string name, file;
+            if (!(in >> name >> file)) fail();
+            names.push_back(name);
+            out.models.push_back(file[0] == '/' ? file : dir + file);
+        } else if (word == "ground") {
+            if (!(in >> out.ground[0] >> out.ground[1] >> out.ground[2])) fail();
+        } else if (word == "fog") {
+            if (!(in >> out.fog)) fail();
+        } else if (word == "pool") {
+            if (!(in >> out.pool_mb) || out.pool_mb < 16 || out.pool_mb > 4095) fail();
+        } else if (word == "grid") {
+            std::string v;
+            if (!(in >> v) || (v != "on" && v != "off")) fail();
+            out.grid = v == "on";
+        } else if (word == "place") {
+            std::string name;
+            scene_file::placement p{};
+            if (!(in >> name >> p.at.x >> p.at.y >> p.at.z >> p.yaw >> p.scale)) fail();
+            const auto it = std::find(names.begin(), names.end(), name);
+            if (it == names.end()) fail();
+            p.model = uint32_t(it - names.begin());
+            out.placements.push_back(p);
+        } else {
+            fail();
+        }
+    }
+    if (out.models.empty() || out.placements.empty()) throw std::runtime_error(path + ": no models or nothing placed");
+    return out;
+}
+
 void make_scene(const options& opt, scene& s) {
+    const scene_file file = opt.scene.empty() ? scene_file{} : read_scene_file(opt.scene);
+    std::copy_n(file.ground, 3, s.ground);
+    s.fog = file.fog;
+    s.grid = file.grid;
+    s.pool_mb = opt.pool_mb ? opt.pool_mb : file.pool_mb ? file.pool_mb : 1024;
     std::vector<size_t> leaf_triangles;
-    for (const std::string& path : opt.models) {
+    for (const std::string& path : opt.scene.empty() ? opt.models : file.models) {
         const paged_geometry g = load_paged(path, false);
         const int fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path);
@@ -200,6 +274,7 @@ void make_scene(const options& opt, scene& s) {
         const std::string ctex = path.substr(0, path.find_last_of('.')) + ".ctex";
         if (access(ctex.c_str(), R_OK) == 0) {
             const texture_info t = load_texture_info(ctex);
+            if (t.textures.size() > 255) throw std::runtime_error(ctex + ": too many textures");
             const int tfd = open(ctex.c_str(), O_RDONLY);
             if (tfd < 0) throw std::runtime_error("cannot open " + ctex);
             if (opt.cold) posix_fadvise(tfd, 0, 0, POSIX_FADV_DONTNEED);
@@ -214,13 +289,19 @@ void make_scene(const options& opt, scene& s) {
                 sp.child_first = static_cast<uint32_t>(s.children.size());
                 s.pages.push_back(sp);
             }
-            m.texture[0] = first;
-            m.texture[1] = static_cast<uint32_t>(t.levels.size());
-            m.texture[2] = t.width;
-            m.texture[3] = t.height;
+            m.texture[0] = static_cast<uint32_t>(s.materials.size());
+            m.texture[1] = static_cast<uint32_t>(t.textures.size());
+            for (const texture_entry& e : t.textures) {
+                s.materials.push_back({first + e.levels[0].first_tile,
+                                       uint32_t(e.levels.size()) | uint32_t(e.repeat) << 8 | uint32_t(e.double_sided) << 9, e.width, e.height});
+                m.texture[2] |= e.double_sided ? 1u : 0u;
+            }
+            m.uv_map[0] = t.uv_min.x;
+            m.uv_map[1] = t.uv_min.y;
+            m.uv_map[2] = t.uv_extent;
             s.total_page_bytes += uint64_t(t.tile_count()) * tile_bytes;
-            std::printf("  texture %u x %u: %zu levels, %u tiles, %.0f MB\n", t.width, t.height, t.levels.size(), t.tile_count(),
-                        t.tile_count() * double(tile_bytes) / 1048576.0);
+            std::printf("  %zu textures (%u x %u first), %u tiles, %.0f MB\n", t.textures.size(), t.textures[0].width,
+                        t.textures[0].height, t.tile_count(), t.tile_count() * double(tile_bytes) / 1048576.0);
         }
         // a skeleton beside the model makes it skinned: its pages' skin bounds, and pose slots
         // (every animation at pose_phases phases).
@@ -290,81 +371,105 @@ void make_scene(const options& opt, scene& s) {
     // mostly marble; some sandstone, bronze, gold, granite (shade.comp's table). a lone statue
     // is marble.
     const uint32_t mix[20] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5};
-    const int n = std::max(1, opt.grid);
-    // tiles of cell_side x cell_side so cells are consecutive; random draws stay in row order.
-    std::vector<gpu_instance> placed(size_t(n) * n);
-    for (int z = 0; z < n; ++z)
-        for (int x = 0; x < n; ++x) {
-            const uint32_t mesh = static_cast<uint32_t>((z * n + x) % s.meshes.size());
-            const float scale = n == 1 ? 1.0f : size(rng);
-            const float angle = n == 1 ? 0.0f : turn(rng);
-            const vec3 at = {(x - (n - 1) * 0.5f) * opt.spacing, 0, (z - (n - 1) * 0.5f) * -opt.spacing};
-            const mat4 m = trs(at, {0, 1, 0}, angle, scale);
-            gpu_instance inst{};
+    // an instance with its motion: moving (bit 9, bit 8 the direction, low 8 bits the phase),
+    // deforming (bit 10: deform() in common.glsl), skinned (bit 11 and the pose slot from bit 16:
+    // an animation, the named one or one at random, at a random phase; no sway on top).
+    auto make_instance = [&](uint32_t mesh, vec3 at, float angle, float scale, uint32_t material) {
+        const mat4 m = trs(at, {0, 1, 0}, angle, scale);
+        gpu_instance inst{};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c) inst.rows[r][c] = m.at(r, c);
+        inst.mesh = mesh;
+        inst.scale = scale;
+        inst.material = material;
+        if (opt.material >= 0) inst.material = uint32_t(opt.material);
+        if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
+        if (opt.deforming > 0 && chance(motion_rng) < opt.deforming) inst.anim |= 1024u | (inst.anim ? 0u : motion_rng() & 255u);
+        if (const uint32_t* sk = s.meshes[mesh].skin; sk[0]) {
+            const skeleton& skel = s.skeletons[s.pose_slots[sk[1]].skeleton];
+            const uint32_t anims = std::max<uint32_t>(uint32_t(skel.animations.size()), 1);
+            uint32_t a = motion_rng() % anims;
+            for (uint32_t k = 0; k < skel.animations.size(); ++k)
+                if (skel.animations[k].name == opt.animation) a = k;
+            const uint32_t phases = skel.animations.empty() ? 1 : pose_phases;
+            const uint32_t slot = sk[1] + a * phases + motion_rng() % phases;
+            inst.anim = (inst.anim & ~1024u) | 2048u | slot << 16;
+        }
+        s.moving += inst.anim != 0;
+        s.instanced_triangles += leaf_triangles[mesh];
+        return inst;
+    };
+    // groups of at most 64 neighbours: the cells (cell_cull.comp), each's instances consecutive.
+    std::vector<std::vector<gpu_instance>> groups;
+    if (!file.placements.empty()) {
+        // a scene: buckets of a square of ground, about 32 instances to a bucket on average,
+        // split at 64.
+        vec3 lo = file.placements[0].at, hi = lo;
+        for (const auto& p : file.placements) { lo = min(lo, p.at); hi = max(hi, p.at); }
+        const float area = std::max((hi.x - lo.x) * (hi.z - lo.z), 1e-6f);
+        const float side = std::max(std::sqrt(area * 32 / float(file.placements.size())), 1e-3f);
+        std::map<std::pair<int, int>, std::vector<gpu_instance>> buckets;
+        for (const auto& p : file.placements)
+            buckets[{int(std::floor((p.at.x - lo.x) / side)), int(std::floor((p.at.z - lo.z) / side))}].push_back(
+                make_instance(p.model, p.at, p.yaw, p.scale, 1));
+        for (auto& [key, list] : buckets)
+            for (size_t k = 0; k < list.size(); k += 64)
+                groups.emplace_back(list.begin() + long(k), list.begin() + long(std::min(list.size(), k + 64)));
+    } else {
+        const int n = std::max(1, opt.grid);
+        // tiles of cell_side x cell_side so cells are consecutive; random draws stay in row order.
+        std::vector<gpu_instance> placed(size_t(n) * n);
+        for (int z = 0; z < n; ++z)
+            for (int x = 0; x < n; ++x) {
+                const uint32_t mesh = static_cast<uint32_t>((z * n + x) % s.meshes.size());
+                const float scale = n == 1 ? 1.0f : size(rng);
+                const float angle = n == 1 ? 0.0f : turn(rng);
+                const vec3 at = {(x - (n - 1) * 0.5f) * opt.spacing, 0, (z - (n - 1) * 0.5f) * -opt.spacing};
+                const uint32_t material = !opt.mixed_materials ? 0 : n == 1 ? 1 : mix[material_rng() % 20];
+                placed[size_t(z) * n + x] = make_instance(mesh, at, angle, scale, material);
+            }
+        for (int tz = 0; tz < n; tz += cell_side)
+            for (int tx = 0; tx < n; tx += cell_side) {
+                groups.emplace_back();
+                for (int z = tz; z < std::min(n, tz + int(cell_side)); ++z)
+                    for (int x = tx; x < std::min(n, tx + int(cell_side)); ++x) groups.back().push_back(placed[size_t(z) * n + x]);
+            }
+    }
+    for (const std::vector<gpu_instance>& group : groups) {
+        gpu_cell cell{};
+        cell.first = uint32_t(s.instances.size());
+        // each instance's sphere: its bounds, or for a moving one its whole path (turns about its
+        // origin, drifts 0.2: animate() in common.glsl).
+        std::vector<std::pair<vec3, float>> spheres;
+        for (const gpu_instance& inst : group) {
+            const gpu_mesh& m = s.meshes[inst.mesh];
+            const vec3 local = {m.bounds[0], m.bounds[1], m.bounds[2]};
+            const vec3 origin = {inst.rows[0][3], inst.rows[1][3], inst.rows[2][3]};
+            vec3 c = origin;
             for (int r = 0; r < 3; ++r)
-                for (int c = 0; c < 4; ++c) inst.rows[r][c] = m.at(r, c);
-            inst.mesh = mesh;
-            inst.scale = scale;
-            inst.material = !opt.mixed_materials ? 0 : n == 1 ? 1 : mix[material_rng() % 20];
-            if (opt.material >= 0) inst.material = uint32_t(opt.material);
-            // moving: bit 9 marks it, bit 8 the direction, low 8 bits the phase. deforming: bit 10
-            // (deform() in common.glsl), shadows and motion vectors as for movers.
-            if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
-            if (opt.deforming > 0 && chance(motion_rng) < opt.deforming) inst.anim |= 1024u | (inst.anim ? 0u : motion_rng() & 255u);
-            // skinned: an animation (the named one, or one at random) at a random phase; bit 11
-            // and the pose slot from bit 16 (common.glsl). no sway on top.
-            if (const uint32_t* sk = s.meshes[mesh].skin; sk[0]) {
-                const skeleton& skel = s.skeletons[s.pose_slots[sk[1]].skeleton];
-                const uint32_t anims = std::max<uint32_t>(uint32_t(skel.animations.size()), 1);
-                uint32_t a = motion_rng() % anims;
-                for (uint32_t k = 0; k < skel.animations.size(); ++k)
-                    if (skel.animations[k].name == opt.animation) a = k;
-                const uint32_t phases = skel.animations.empty() ? 1 : pose_phases;
-                const uint32_t slot = sk[1] + a * phases + motion_rng() % phases;
-                inst.anim = (inst.anim & ~1024u) | 2048u | slot << 16;
+                (&c.x)[r] += inst.rows[r][0] * local.x + inst.rows[r][1] * local.y + inst.rows[r][2] * local.z;
+            // deforming: points move up to the reach (deform_reach in common.glsl).
+            float radius = (m.bounds[3] * ((inst.anim & 1024u) ? 1.1f : 1.0f) + s.skin_reach[inst.mesh]) * inst.scale;
+            if (inst.anim & 512u) {
+                radius += length(c - origin) + 0.2f;
+                c = origin;
             }
-            s.moving += inst.anim != 0;
-            placed[size_t(z) * n + x] = inst;
-            s.instanced_triangles += leaf_triangles[mesh];
+            spheres.push_back({c, radius});
+            s.instances.push_back(inst);
         }
-    for (int tz = 0; tz < n; tz += cell_side)
-        for (int tx = 0; tx < n; tx += cell_side) {
-            gpu_cell cell{};
-            cell.first = uint32_t(s.instances.size());
-            // each instance's sphere: its bounds, or for a moving one its whole path (turns
-            // about its origin, drifts 0.2: animate() in common.glsl).
-            std::vector<std::pair<vec3, float>> spheres;
-            for (int z = tz; z < std::min(n, tz + int(cell_side)); ++z)
-                for (int x = tx; x < std::min(n, tx + int(cell_side)); ++x) {
-                    const gpu_instance& inst = placed[size_t(z) * n + x];
-                    const gpu_mesh& m = s.meshes[inst.mesh];
-                    const vec3 local = {m.bounds[0], m.bounds[1], m.bounds[2]};
-                    const vec3 origin = {inst.rows[0][3], inst.rows[1][3], inst.rows[2][3]};
-                    vec3 c = origin;
-                    for (int r = 0; r < 3; ++r)
-                        (&c.x)[r] += inst.rows[r][0] * local.x + inst.rows[r][1] * local.y + inst.rows[r][2] * local.z;
-                    // deforming: points move up to the reach (deform_reach in common.glsl).
-                    float radius = (m.bounds[3] * ((inst.anim & 1024u) ? 1.1f : 1.0f) + s.skin_reach[inst.mesh]) * inst.scale;
-                    if (inst.anim & 512u) {
-                        radius += length(c - origin) + 0.2f;
-                        c = origin;
-                    }
-                    spheres.push_back({c, radius});
-                    s.instances.push_back(inst);
-                }
-            cell.count = uint32_t(s.instances.size()) - cell.first;
-            vec3 lo = spheres[0].first, hi = lo;
-            for (const auto& [c, r] : spheres) {
-                lo = min(lo, c);
-                hi = max(hi, c);
-            }
-            const vec3 center = (lo + hi) * 0.5f;
-            float radius = 0;
-            for (const auto& [c, r] : spheres) radius = std::max(radius, length(c - center) + r);
-            cell.center[0] = center.x; cell.center[1] = center.y; cell.center[2] = center.z;
-            cell.radius = radius;
-            s.cells.push_back(cell);
+        cell.count = uint32_t(s.instances.size()) - cell.first;
+        vec3 lo = spheres[0].first, hi = lo;
+        for (const auto& [c, r] : spheres) {
+            lo = min(lo, c);
+            hi = max(hi, c);
         }
+        const vec3 center = (lo + hi) * 0.5f;
+        float radius = 0;
+        for (const auto& [c, r] : spheres) radius = std::max(radius, length(c - center) + r);
+        cell.center[0] = center.x; cell.center[1] = center.y; cell.center[2] = center.z;
+        cell.radius = radius;
+        s.cells.push_back(cell);
+    }
 }
 
 }  // namespace viewer

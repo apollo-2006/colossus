@@ -41,8 +41,10 @@ void main() {
             const float r = drawn.w * s;
             if (draw && (frame.flags & flag_frustum_culling) != 0u) draw = sphere_in_frustum(center, r);
             // all triangles face away when the view direction lies in the cone:
-            // include/dag.hpp. (a deforming or skinned instance's normals turn: no cone.)
-            if (draw && (frame.flags & flag_cone_culling) != 0u && c.cone_cutoff < 1.0 && !deforming(inst) && !skinned(inst)) {
+            // include/dag.hpp. (a deforming or skinned instance's normals turn, and a double sided
+            // material's back faces show: no cone.)
+            if (draw && (frame.flags & flag_cone_culling) != 0u && c.cone_cutoff < 1.0 && !deforming(inst) && !skinned(inst) &&
+                (meshes[inst.mesh].tex.z & 1u) == 0u) {
                 const vec3 axis = normalize(to_world_dir(inst, c.cone_axis));
                 const vec3 view = center - frame.cull_origin.xyz;
                 if (dot(view, axis) >= c.cone_cutoff * length(view) + r) draw = false;

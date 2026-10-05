@@ -298,17 +298,21 @@ mesh load_obj(const std::string& data, const std::string& path) {
             if (a == std::string::npos || line.compare(a, 7, "map_Kd ") != 0) continue;
             std::string name = line.substr(a + 7);
             while (!name.empty() && (name.back() == '\r' || name.back() == ' ')) name.pop_back();
-            m.texture = dir + name.substr(name.find_last_of(' ') == std::string::npos ? 0 : name.find_last_of(' ') + 1);
+            material mat;
+            mat.texture = dir + name.substr(name.find_last_of(' ') == std::string::npos ? 0 : name.find_last_of(' ') + 1);
+            m.materials.push_back(mat);
             break;
         }
     }
+    if (m.materials.empty()) m.materials.push_back(material{});  // no texture: a flat grey
+    m.wedge_material.assign(m.wedge_uvs.size(), 0);
     return m;
 }
 
 }  // namespace
 
-mesh load_mesh(const std::string& path, skeleton* skin) {
-    if (ends_with(path, ".gltf") || ends_with(path, ".glb")) return load_gltf(path, skin);
+mesh load_mesh(const std::string& path, skeleton* skin, const std::string& node) {
+    if (ends_with(path, ".gltf") || ends_with(path, ".glb")) return load_gltf(path, skin, node);
     const std::string data = read_file(path);
     if (ends_with(path, ".ply")) return load_ply(data);
     if (ends_with(path, ".obj")) return load_obj(data, path);
@@ -393,16 +397,19 @@ void weld(mesh& m) {
     }
     std::vector<vec2> uvs;
     std::vector<uint32_t> wedge_vertex;
+    std::vector<uint8_t> wedge_material;
     for (size_t v = 0; v < m.positions.size(); ++v) {
         const size_t first_wedge = uvs.size();
         for (uint32_t k = start[v]; k < start[v + 1]; ++k) {
             const uint32_t i = order[k];
             const vec2 uv = m.wedge_uvs[corners[i]];
+            const uint8_t mat = m.wedge_material[corners[i]];
             size_t w = first_wedge;
-            while (w < uvs.size() && (uvs[w].x != uv.x || uvs[w].y != uv.y)) ++w;
+            while (w < uvs.size() && (uvs[w].x != uv.x || uvs[w].y != uv.y || wedge_material[w] != mat)) ++w;
             if (w == uvs.size()) {
                 uvs.push_back(uv);
                 wedge_vertex.push_back(uint32_t(v));
+                wedge_material.push_back(mat);
             }
             corners[i] = uint32_t(w);
         }
@@ -410,9 +417,10 @@ void weld(mesh& m) {
     m.corners = std::move(corners);
     m.wedge_uvs = std::move(uvs);
     m.wedge_vertex = std::move(wedge_vertex);
+    m.wedge_material = std::move(wedge_material);
 }
 
-placement normalize_placement(mesh& m, bool up_z) {
+placement normalize_placement(mesh& m, bool up_z, bool keep_scale) {
     if (m.positions.empty()) return {};
     if (up_z)
         for (vec3& p : m.positions) p = {p.x, p.z, -p.y};
@@ -431,7 +439,7 @@ placement normalize_placement(mesh& m, bool up_z) {
     vec3 lo = m.positions[0], hi = lo;
     for (const vec3& p : m.positions) { lo = min(lo, p); hi = max(hi, p); }
     const vec3 size = hi - lo;
-    const float scale = 1 / std::max({size.x, size.y, size.z});
+    const float scale = keep_scale ? 1.0f : 1 / std::max({size.x, size.y, size.z});
     const vec3 base = {0.5f * (lo.x + hi.x), lo.y, 0.5f * (lo.z + hi.z)};
     for (vec3& p : m.positions) p = (p - base) * scale;
     return {up_z, base, scale};
@@ -517,6 +525,7 @@ void subdivide(mesh& m) {
                     const vec2 a = m.wedge_uvs[w[c]], b = m.wedge_uvs[w[(c + 1) % 3]];
                     m.wedge_uvs.push_back({0.5f * (a.x + b.x), 0.5f * (a.y + b.y)});
                     m.wedge_vertex.push_back(mid[c]);
+                    m.wedge_material.push_back(m.wedge_material[w[c]]);
                 }
                 wmid[c] = it->second;
             }

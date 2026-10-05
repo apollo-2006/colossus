@@ -273,8 +273,10 @@ void main() {
         // with --gi rt the ao pass traced what reaches the ground, statues' bounce included.
         if ((frame.flags & (flag_gi_rt | flag_ao)) == (flag_gi_rt | flag_ao))
             ground_light = ground_radiance(sunlight(px, s), 0.0) + ground_albedo * indirect_light(px, vec3(0.0, 1.0, 0.0));
-        const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), line) / ground_albedo * ground_light;
-        color = mix(ground, color, 1.0 - exp(-s.t * 0.012));
+        // the grid's lines and cells, as ratios to the default albedo's (any ground's tinted the same).
+        const vec3 ground = mix(vec3(0.42, 0.4, 0.37), vec3(0.33, 0.31, 0.29), (frame.flags & flag_no_grid) != 0u ? 0.0 : line) /
+                            vec3(0.41, 0.39, 0.36) * ground_light;
+        color = mix(ground, color, 1.0 - exp(-s.t * frame.ground.a));
     }
     if (s.kind != surface_sky && frame.debug_mode == 9u) {
         color = vec3(occlusion(px));  // ambient occlusion alone
@@ -292,12 +294,15 @@ void main() {
         const float ao = occlusion(px);
         vec3 n = s.n;
         float wrap = 0.0, coat = 0.0;
-        const uvec4 tex = meshes[inst.mesh].tex;
-        if (frame.debug_mode == 0u && tex.y != 0u && cluster_textured(c)) {
+        const Mesh mesh = meshes[inst.mesh];
+        if (frame.debug_mode == 0u && mesh.tex.y != 0u && cluster_textured(c)) {
+            // the triangle's material (its corners share one), and its texture.
+            const uvec4 tex = texture_materials[mesh.tex.x + min(cluster_material(s.base, c, s.corners.x), mesh.tex.y - 1u)];
             // a scan's own colour: no procedural detail. texture coordinates where this pixel's
             // ray and its neighbours' meet the triangle's plane: their differences pick the level.
-            const vec2 uv0 = cluster_uv(s.base, c, s.corners.x), uv1 = cluster_uv(s.base, c, s.corners.y),
-                       uv2 = cluster_uv(s.base, c, s.corners.z);
+            const vec2 uv0 = mesh.uv_map.xy + cluster_uv(s.base, c, s.corners.x) * mesh.uv_map.z,
+                       uv1 = mesh.uv_map.xy + cluster_uv(s.base, c, s.corners.y) * mesh.uv_map.z,
+                       uv2 = mesh.uv_map.xy + cluster_uv(s.base, c, s.corners.z) * mesh.uv_map.z;
             const vec2 b = plane_bary(s.p0, s.p1, s.p2, s.dir);
             const vec2 bx = plane_bary(s.p0, s.p1, s.p2, pixel_ray_at(vec2(px) + vec2(1.5, 0.5)));
             const vec2 by = plane_bary(s.p0, s.p1, s.p2, pixel_ray_at(vec2(px) + vec2(0.5, 1.5)));
@@ -348,7 +353,7 @@ void main() {
             const float d = min(edge_distance(p, s0, s1), min(edge_distance(p, s1, s2), edge_distance(p, s2, s0)));
             color = mix(color * 0.25, color, smoothstep(0.0, 1.0, d));
         }
-        color = mix(color, sky(s.dir), 1.0 - exp(-s.t * 0.012));
+        color = mix(color, sky(s.dir), 1.0 - exp(-s.t * frame.ground.a));
     }
     // coverage (view 10, not on a key): white where a model is drawn, black elsewhere, for
     // measuring how far a cut's silhouettes stray from full detail (docs/quality.py).

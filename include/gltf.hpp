@@ -7,7 +7,9 @@
 
 #include <string>
 
-// every triangle primitive of the scene's meshes, placed by their nodes. a skinned mesh is
-// read in its bind pose (gltf ignores its node's transform) and `skin` filled; only one skin
-// is supported. the base colour texture of the first material that has one, if any.
-mesh load_gltf(const std::string& path, skeleton* skin);
+// every triangle primitive of the scene's meshes (only `node`'s, if named), placed by their
+// nodes. a skinned mesh is read in its bind pose (gltf ignores its node's transform) and `skin`
+// filled; only one skin is supported. if any material has a base colour texture the mesh is
+// textured: each material its texture (texture transforms baked into the coordinates, repeat
+// from its sampler) or its base colour, and whether it is double sided.
+mesh load_gltf(const std::string& path, skeleton* skin, const std::string& node = "");

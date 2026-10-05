@@ -30,7 +30,7 @@ struct options {
     uint32_t disable = 0;  // flags turned off on the command line
     bool cull_only = false;
     float sw_pixels = 32;
-    uint64_t pool_mb = 1024;   // page pool
+    uint64_t pool_mb = 0;      // page pool: 0 for the scene's (`pool` in a scene file) or 1024
     bool vsm = true;           // virtual shadow maps, not ray queries (--shadows rt)
     uint32_t vsm_side = 48;    // physical shadow pages a side: 48 is 2304 pages, 288 mb (two layers)
     uint64_t upload_mb = 64;   // pages loaded per frame, at most
@@ -47,6 +47,7 @@ struct options {
     bool merge_reads = true;   // pages close in the file share a read
     bool gi_rt = false;        // --gi rt: bounce light traced in world space
     std::string animation;     // skinned models: play only this animation (default: each at random)
+    std::string scene;         // --scene FILE: models and their placements (scene.hpp) in place of --model and --grid
 };
 
 // command line to options; exits with usage on a bad one.
@@ -107,6 +108,7 @@ options parse(int argc, char** argv) {
         else if (a == "--moving") o.moving = std::stof(next());
         else if (a == "--deforming") o.deforming = std::stof(next());
         else if (a == "--animation") o.animation = next();
+        else if (a == "--scene") o.scene = next();
         else if (a == "--pool-mb") o.pool_mb = std::clamp<uint64_t>(std::stoull(next()), 16, 4095);
         else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
         else if (a == "--warmup") o.warmup = std::stoi(next());
@@ -128,7 +130,8 @@ options parse(int argc, char** argv) {
             o.camera_set = true;
         } else throw std::runtime_error("unknown argument " + a);
     }
-    if (o.models.empty()) throw std::runtime_error("usage: colossus --model FILE.cgeo [--model ...] [--grid N] [--headless --frames N --screenshot out.png]");
+    if (o.models.empty() && o.scene.empty())
+        throw std::runtime_error("usage: colossus --model FILE.cgeo [--model ...] [--grid N] | --scene FILE  [--headless --frames N --screenshot out.png]");
     if (o.headless && o.frames <= 0) o.frames = 1;
     return o;
 }

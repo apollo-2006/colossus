@@ -8,6 +8,8 @@
 /models/fox/
 /models/*.cskn
 /models/dragon_recon/
+/models/forest/
+/models/forest.scene
 *.png
 !/docs/*.png
 *.d

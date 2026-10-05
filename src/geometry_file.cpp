@@ -31,7 +31,16 @@ geometry pack(const lod_mesh& lod) {
     if (!lod.wedge_uvs.empty()) {
         g.wedge_vertex = lod.wedge_vertex;
         g.wedge_uvs = lod.wedge_uvs;
-        g.texture = lod.texture;
+        g.wedge_material = lod.wedge_material;
+        g.materials = lod.materials;
+        vec2 lo = g.wedge_uvs[0], hi = lo;
+        for (const vec2& uv : g.wedge_uvs) {
+            lo = {std::min(lo.x, uv.x), std::min(lo.y, uv.y)};
+            hi = {std::max(hi.x, uv.x), std::max(hi.y, uv.y)};
+        }
+        // a square range, at least 0 to 1 (an unrepeated texture keeps its 65535 steps).
+        g.uv_min = {std::min(lo.x, 0.0f), std::min(lo.y, 0.0f)};
+        g.uv_extent = std::max({hi.x - g.uv_min.x, hi.y - g.uv_min.y, 1.0f});
     }
     g.bounds = bounding_sphere(lod.positions.size(), [&](size_t i) { return lod.positions[i]; });
     // every lod sphere, which can stick out past the model.
@@ -114,7 +123,9 @@ geometry trim(const geometry& g, size_t max_triangles) {
     geometry out;
     out.bounds = g.bounds;
     out.lod_bounds = g.lod_bounds;
-    out.texture = g.texture;
+    out.materials = g.materials;
+    out.uv_min = g.uv_min;
+    out.uv_extent = g.uv_extent;
     std::vector<uint32_t> remap(g.positions.size() / 3, UINT32_MAX);
     std::vector<uint32_t> wedge_remap(g.textured() ? g.wedge_uvs.size() : 0, UINT32_MAX);
     for (const gpu_cluster& c : g.clusters) {
@@ -150,6 +161,7 @@ geometry trim(const geometry& g, size_t max_triangles) {
                 nw = static_cast<uint32_t>(out.wedge_uvs.size());
                 out.wedge_uvs.push_back(g.wedge_uvs[w]);
                 out.wedge_vertex.push_back(v);
+                out.wedge_material.push_back(g.wedge_material[w]);
             }
             out.cluster_vertices.push_back(nw);
         }

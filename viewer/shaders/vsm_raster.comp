@@ -35,7 +35,7 @@ struct Tri {
     int area, bias0, bias1, bias2;
 };
 
-bool setup(uint packed, uint level, uint layer, out Tri tri) {
+bool setup(uint packed, uint level, uint layer, bool two_sided, out Tri tri) {
     const uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
     tri.a = snapped[i0];
     tri.b = snapped[i1];
@@ -53,8 +53,18 @@ bool setup(uint packed, uint level, uint layer, out Tri tri) {
     tri.d -= origin;
     // sun facing only (counterclockwise seen from the sun): a closed surface's far side is never
     // nearer the sun, and shading leaves faces turned away dark anyway. through a scan's holes
-    // this lets a little light in.
+    // this lets a little light in. a double sided material's thin surfaces (leaves, needles)
+    // cast from either side: turned round.
     tri.area = edge(tri.a, tri.b, tri.d);
+    if (tri.area < 0 && two_sided) {
+        const ivec2 sb = tri.b;
+        tri.b = tri.d;
+        tri.d = sb;
+        const float zb = tri.zb;
+        tri.zb = tri.zd;
+        tri.zd = zb;
+        tri.area = -tri.area;
+    }
     if (tri.area <= 0) return false;
     // the box, clipped to the pages rendering at this level.
     const ivec4 rect = vsm_rendered(layer, level);
@@ -157,6 +167,7 @@ void main() {
     const uvec2 v = vsm_visible[k];
     const uint instance = v.x & 0xffffffu, level = (v.x >> 24) & 15u, layer = v.x >> 28;
     const Instance inst = load_instance(instance);
+    const bool two_sided = (meshes[inst.mesh].tex.z & 1u) != 0u;
     const Cluster c = load_cluster(v.y);
     const uint t = gl_LocalInvocationIndex;
     const float texel = vsm_texel(level);
@@ -169,7 +180,7 @@ void main() {
     }
     barrier();
     Tri tri;
-    if (t < c.triangle_count && setup(cluster_triangle(page_table[c.group], c, t), level, layer, tri)) {
+    if (t < c.triangle_count && setup(cluster_triangle(page_table[c.group], c, t), level, layer, two_sided, tri)) {
         const ivec2 size = tri.hi - tri.start + 1;
         if (size.x * size.y > 64) together[atomicAdd(together_count, 1u)] = t;
         else walk(tri, level, layer);
@@ -177,7 +188,7 @@ void main() {
     barrier();
     const uint count = together_count;
     for (uint j = 0u; j < count; ++j) {
-        setup(cluster_triangle(page_table[c.group], c, together[j]), level, layer, tri);
+        setup(cluster_triangle(page_table[c.group], c, together[j]), level, layer, two_sided, tri);
         walk_together(tri, level, layer);
     }
 }

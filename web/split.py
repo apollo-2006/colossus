@@ -13,17 +13,23 @@ TILE_BYTES = 128 * 128 // 2
 
 
 def split_texture(stem):
+    # the demo draws one texture over coordinates 0 to 1 (a model with several materials, or
+    # coordinates past that, needs the native viewer).
     data = open(stem + ".ctex", "rb").read()
-    if data[:8] != b"CTEXv001":
-        raise SystemExit(stem + ".ctex: not a texture file")
-    width, height, count = struct.unpack_from("<3I", data, 8)
+    if data[:8] != b"CTEXv002":
+        raise SystemExit(stem + ".ctex: not a texture file (or an old one: rebuild it)")
+    count, u0, v0, extent = struct.unpack_from("<I3f", data, 8)
+    if count != 1 or (u0, v0, extent) != (0.0, 0.0, 1.0):
+        raise SystemExit(f"{stem}.ctex: {count} textures over ({u0}, {v0}) + {extent}: the demo takes one over 0 to 1")
+    width, height, count, flags = struct.unpack_from("<4I", data, 24)
     levels = []
     for l in range(count):
-        tx, ty, first = struct.unpack_from("<3I", data, 20 + 12 * l)
+        tx, ty, first = struct.unpack_from("<3I", data, 40 + 12 * l)
         levels.append({"tilesX": tx, "tilesY": ty, "first": first})
-    start = (20 + 12 * count + 15) // 16 * 16
+    start = (40 + 12 * count + 15) // 16 * 16
     tiles = levels[-1]["first"] + levels[-1]["tilesX"] * levels[-1]["tilesY"]
-    json.dump({"width": width, "height": height, "levels": levels, "tileBytes": TILE_BYTES}, open(stem + ".texture.json", "w"))
+    json.dump({"width": width, "height": height, "repeat": bool(flags & 1), "levels": levels, "tileBytes": TILE_BYTES},
+              open(stem + ".texture.json", "w"))
     open(stem + ".tiles", "wb").write(data[start : start + tiles * TILE_BYTES])
     print(f"{stem}: texture {width} x {height}, {tiles} tiles, {tiles * TILE_BYTES / 1e6:.1f} MB")
 

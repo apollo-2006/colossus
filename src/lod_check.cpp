@@ -11,7 +11,8 @@ struct tri_edge {
     bool operator==(const tri_edge& o) const { return a == o.a && b == o.b; }
 };
 
-// edges used by exactly one of the triangles, and the area.
+// edges used by an odd number of the triangles (once, or three times where duplicates were kept:
+// a rim either way), and the area.
 template <class ForEachTriangle>
 std::vector<tri_edge> single_edges(ForEachTriangle&& each, const geometry& g, double& area) {
     std::vector<tri_edge> e;
@@ -27,7 +28,7 @@ std::vector<tri_edge> single_edges(ForEachTriangle&& each, const geometry& g, do
     for (size_t k = 0; k < e.size();) {
         size_t j = k;
         while (j < e.size() && e[j] == e[k]) ++j;
-        if (j - k == 1) out.push_back(e[k]);
+        if ((j - k) % 2 == 1) out.push_back(e[k]);
         k = j;
     }
     return out;

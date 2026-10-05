@@ -58,13 +58,15 @@ texture, and skinned models run their animations, every cluster still picking it
   every path, one gpu thread per cluster, no tree to walk.
 * **checked for cracks.** every level uses the original vertices, so a crack is exact:
   an edge used by one cut triangle whose ends aren't both on a hole. `--check` tests 25
-  cuts. lucy builds 23 levels in 5.6 minutes, the dragon 21 in 52 s (proving the bounds
-  is most of it; sampling took 84 and 21 s), every cut with 0 cracked edges.
+  cuts. lucy builds 24 levels in 4.4 minutes, the dragon 21 in 40 s (proving the bounds
+  is most of it; sampling took 84 and 21 s), every cut with 0 cracked edges. the bound's
+  nearest-triangle searches skip triangles whose spheres can't be nearer and reuse each
+  vertex's nearest: 23% off (lucy took 5.7 minutes), output byte for byte the same.
 * **one small root.** near the top, thin parts and hole rims stall edge collapses (lucy
-  used to stop at three roots of 313 triangles). nothing borders the last group, so
-  vertex clustering takes over there, keeping duplicate triangles and hole vertices so
-  the crack check still holds. lucy now ends in one root of 20 triangles, the dragon in
-  one of 32.
+  used to stop at three roots of 313 triangles). a group whose collapses stall is
+  simplified by vertex clustering instead, keeping its outline, duplicate triangles and
+  hole vertices so the crack check still holds (foliage leans on it far harder, below).
+  lucy now ends in one root of 16 triangles, the dragon in one of 30.
 * **texture coordinates.** a textured obj's corners become wedges: a vertex as one texture
   chart sees it, so a vertex on a seam has one per chart. a collapse moves each corner onto
   the kept vertex's wedge in the same chart and is refused where there is none, so seams
@@ -95,9 +97,13 @@ texture, and skinned models run their animations, every cluster still picking it
 3. **two rasterizers.** clusters over 32 pixels go to mesh shaders; smaller ones to
    `sw_raster.comp`, a compute rasterizer, since pixel-sized triangles are what the
    hardware handles worst. both write `depth << 32 | (cluster, triangle)` into one
-   64-bit visibility buffer by atomic max. the compute path snaps to 1/256 pixel with a
-   top-left rule, so the two meet without gaps, and keeps its edge functions in 32 bits
-   (rdna has no 64-bit multiply; the 64-bit version lost at every size).
+   64-bit visibility buffer by atomic max. the compute path snaps to 1/256 pixel like
+   the hardware, but the two don't place a vertex bit for bit alike, so where they meet a
+   shared vertex can land a step apart and drop a pixel centre (nine holes over sixteen
+   crowd views). its triangles grow by a step and the depth test settles the overlap: no
+   holes, and a silhouette gains the odd pixel whose centre lies within 1.5/256 of it. its
+   edge functions stay in 32 bits (rdna has no 64-bit multiply; the 64-bit version lost
+   at every size).
 4. **occlusion in two passes.** pass 1 tests cells, instances and clusters against last
    frame's depth pyramid and draws what it can't prove hidden; a pyramid built from that
    lets pass 2 recover anything newly visible. moving instances are tested where they
@@ -318,6 +324,45 @@ horatio greenough's george washington (1840), the smithsonian american art museu
 900 khronos foxes, subdivided to 590 thousand triangles each, walking, running and looking
 round (`models/fetch.sh fox`).
 
+### foliage, materials and scenes
+
+a photoscanned pine is about seven million triangles, most of them needles: thousands of
+separate pieces, which edge collapse won't delete, so a group of needles can't halve. two
+things get it moving. the partitioner links clusters with no neighbour (islands) to their
+nearest few in morton order, weighted far below a shared edge, so needles group with their
+neighbours. and a group that collapses can't halve is simplified by vertex clustering
+instead: vertices snap to one per grid cell while every vertex on the group's outline (and
+any shared with other groups) stays put, so the cut is still crack-free. clustering keeps
+duplicate triangles, so a rim edge can be used three times: rims are edges used an odd
+number of times, in the simplifier and in `--check` alike. needles merge into coarser
+shapes and crowns thin at a distance; nothing yet keeps their coverage.
+
+a model can have several materials, each its own texture (or a flat colour) in the
+`.ctex`, repeating or clamped, seen from one side or both. a vertex keeps its material
+through simplification as it keeps its texture coordinates: a wedge is a vertex as one
+material and chart sees it. the pages store each vertex's material in the bits its
+cluster's span needs (none, for one material), and coordinates as fractions of the model's
+range, so repeating textures keep their precision. double-sided materials skip cone
+culling and draw both faces into the shadow maps. gltf brings it all: per primitive
+materials, base colour factors, `KHR_texture_transform`, `doubleSided` and wrap modes;
+`--node` builds one node of a file and `--keep-scale` keeps its metres.
+
+a scene file places models: `model NAME PATH`, `place NAME x y z yaw scale`, and
+optionally the ground's colour, the fog, `grid off` and the page pool it needs.
+`models/forest.py` builds poly haven's cc0 pine forest collection (55 models, 2 gb) and
+scatters it into `models/forest.scene`: 14,780 instances on 100 x 100 metres, 753
+million triangles at full detail.
+
+![a pine forest at eye level: tall pines and firs, saplings, ferns, grass and mossy rocks in hazy light](docs/forest.png)
+
+the forest at eye level: 89.8 million triangles drawn in 5.63 ms at 1920x1080, raster
+3.54 of it. foliage is the worst case for this design: crowns are mostly pixel-sized
+triangles that hide little behind them, so far more is drawn than a solid scene of the
+same size would need, nearly all of it (98.5% of clusters) through the compute
+rasterizer. the scene streams 1.3 gb into a 4 gb pool; in the default 1 gb it thrashes:
+24.6 ms, shadow pages redraw every frame (17.7 ms of it) and coarse stand-ins show as
+shards while pages wait.
+
 ## in the browser
 
 `web/` is the renderer in webgpu, which has no mesh shaders, 64-bit atomics, ray queries
@@ -397,6 +442,8 @@ models/fetch.sh fox        # the skinned fox (a small gltf, subdivided when buil
 ./colossus --model models/washington.cgeo                 # textured
 ./colossus --model models/fox.cgeo --grid 30 --spacing 1.2 # 900 foxes, each animation
 ./colossus --model models/fox.cgeo --animation Run        # one, running
+python3 models/forest.py                                  # the forest (2.2 gb download, 2 gb built)
+./colossus --scene models/forest.scene                    # walk through it
 ./colossus_build any.ply out.cgeo --check                 # your own model, checked for cracks
 ./colossus_build any.obj out.cgeo --texture t.ppm         # textured (writes out.ctex too)
 ```
@@ -439,6 +486,31 @@ model (synchronous, loader threads, loader threads with prefetch), checking afte
 frame that resident pages' dependencies are resident. it caught one real bug before the
 streamer landed. ci runs both and builds the viewer on every push.
 
+## quality
+
+the bound is about distances; `docs/quality.py` checks what it means in pixels. it
+renders five views at a threshold of 0.05 pixels (full detail, near enough) and at 1 to
+16, with antialiasing, ambient occlusion and soft shadows off so that two renders of a
+cut are byte for byte the same. a coverage view (10) draws white where a model is: every
+pixel whose coverage changes is measured from the full-detail silhouette. nvidia's
+[flip](https://github.com/NVlabs/flip) compares the shaded images.
+
+| view | full detail | at 1 px | coverage differs | farthest from silhouette | flip | pixels off by over 8/255 |
+|---|---|---|---|---|---|---|
+| lucy, close | 6.21m | 374.1k | 0.011% | 1.41 px | 0.0119 | 1.06% |
+| dragon, whole | 3.72m | 273.9k | 0.007% | 0.00 px | 0.0044 | 0.68% |
+| washington, face | 2.18m | 313.5k | 0.010% | 0.00 px | 0.0088 | 0.59% |
+| fox, walking | 554.0k | 62.3k | 0.001% | 0.00 px | 0.0003 | 0.03% |
+| crowd of nine | 21.66m | 1.10m | 0.020% | 1.41 px | 0.0096 | 1.77% |
+
+at one pixel every pixel whose coverage changes touches the full-detail silhouette, at
+most a diagonal step from it. silhouettes stray further only from 4 pixels in the crowd
+and 8 to 16 elsewhere (lucy at 16 pixels: 39.2k triangles, within 2.24 px). what's left
+is shading: a coarse triangle interpolates its corners' normals over a larger span, and
+the bound says nothing about normals.
+
+![lucy at one pixel against full detail, by flip: differences along creases and folds](docs/quality_flip.png)
+
 ## performance
 
 rx 9070 xt (radv), 1920x1080, the 900 instance scene, median of 200 frames after 100 of
@@ -469,7 +541,7 @@ messages have every step's numbers.
 
 * the bound is proven for the geometry, not for shading: a normal or a shadow can still
   shift by more than a pixel's worth where they depend on detail the cut removed.
-* proving the bounds makes building slower, 5.6 minutes for lucy (and about two hours on
+* proving the bounds makes building slower, 4.4 minutes for lucy (and about two hours on
   a hosted ci runner, so the demo workflow caches the result).
 * motion and deformation are procedural; skinning is linear blend, its errors measured
   over the shipped animations rather than proven, and only gltf brings skeletons. many
@@ -479,9 +551,17 @@ messages have every step's numbers.
   keep skinned ones in their rest pose.
 * shadow pages draw from streamed geometry too, so shadows sharpen with everything else,
   and a page that finds the pool full falls back a level.
-* a texture is colour only, one per model: no normal or roughness maps. where seams had
-  to move, the texture can slip across them by up to the cluster's error. the webgl2
-  fallback samples one level of a texture, decoded up front.
+* a texture is colour only, one per material: no normal or roughness maps, and no alpha,
+  so a card meant as an alpha cutout draws as its whole quad (in the forest, only the
+  moss). where seams had to move, the texture can slip across them by up to the cluster's
+  error. the browser takes one texture over coordinates 0 to 1, and the webgl2 fallback
+  samples one level of it, decoded up front.
+* foliage is simplified by vertex clustering, which thins crowns at a distance, and it's
+  the costliest content there is: the forest draws 90 million triangles in 5.6 ms where
+  900 statues draw 4.8 million in 1.5. a scene whose pages outgrow the pool thrashes:
+  coarse stand-ins show while pages wait and shadow pages redraw every frame (the forest
+  in a 1 gb pool, 24.6 ms instead of 5.6).
+* every number here is from one gpu, an rx 9070 xt on radv.
 * bounce light is a single bounce. by default it comes off the ground and what's on
   screen; `--gi rt` reaches everything but needs ray queries, traces the coarse shadow
   copies and costs 0.5 to 0.6 ms more. the browser has the screen space kind only.
@@ -496,4 +576,5 @@ george washington is the [smithsonian american art museum](https://americanart.s
 scan, released cc0 through [smithsonian open access](https://3d.si.edu). the fox is from
 the [khronos gltf sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets): model
 by pixelmannen (cc0), rigging and animation by tomkranis (cc by 4.0), gltf conversion by
-asobostudio and scurest (cc by 4.0).
+asobostudio and scurest (cc by 4.0). the forest is [poly haven](https://polyhaven.com)'s pine forest
+collection (cc0), downloaded by `models/forest.py`.

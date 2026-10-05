@@ -21,6 +21,7 @@
 #include "swapchain.hpp"
 #include "vk.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -32,6 +33,8 @@ namespace viewer {
 namespace {
 
 struct view_state {
+    float ground[4] = {0.41f, 0.39f, 0.36f, 0.012f};  // the scene's ground albedo and fog density
+    bool grid = true;
     camera cam;
     camera cull_cam;  // cam unless frozen
     bool frozen = false;
@@ -47,6 +50,7 @@ struct view_state {
 
 gpu_frame frame_data(const view_state& v, uint32_t width, uint32_t height, float time) {
     gpu_frame f{};
+    std::copy_n(v.ground, 4, f.ground);
     const float aspect = float(width) / float(height);
     const mat4 vp = v.cam.view_proj(aspect);
     std::memcpy(f.view_proj, vp.m, sizeof f.view_proj);
@@ -61,7 +65,7 @@ gpu_frame frame_data(const view_state& v, uint32_t width, uint32_t height, float
     const mat4 proj = perspective_reverse_z(v.cam.fov, aspect, v.cam.near_z);
     f.p00 = proj.at(0, 0);
     f.p11 = -proj.at(1, 1);  // the projection flips y for vulkan; the sphere test wants it upright
-    f.flags = v.flags;
+    f.flags = v.flags | (v.grid ? 0u : flag_no_grid);
     // depth from the drawing camera says nothing about a frozen culling camera.
     if (v.frozen) f.flags &= ~flag_occlusion;
     f.lod_scale = float(height) / (2 * std::tan(v.cam.fov / 2));
@@ -165,6 +169,9 @@ int main(int argc, char** argv) {
                     human(double(sc.instanced_triangles)).c_str());
 
         view_state v;
+        std::copy_n(sc.ground, 3, v.ground);
+        v.ground[3] = sc.fog;
+        v.grid = sc.grid;
         v.threshold = opt.threshold;
         v.mode = opt.mode;
         if (opt.wireframe) v.flags |= flag_wireframe;
@@ -186,7 +193,7 @@ int main(int argc, char** argv) {
         if (opt.headless) {
             vk::context ctx(nullptr, opt.validate);
             std::printf("GPU: %s\n", ctx.device_name.c_str());
-            renderer r(ctx, sc, opt.width, opt.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch, opt.cull_only,
+            renderer r(ctx, sc, opt.width, opt.height, sc.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch, opt.cull_only,
                        opt.vsm ? opt.vsm_side : 1, opt.merge_reads);
             std::vector<renderer::frame_result> results;
             const int total = opt.warmup + opt.frames;
@@ -279,7 +286,7 @@ int main(int argc, char** argv) {
             glfwGetFramebufferSize(window, &fw, &fh);
             swapchain swap(ctx, opt.vsync);
             swap.create(fw, fh);
-            renderer r(ctx, sc, swap.extent.width, swap.extent.height, opt.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch,
+            renderer r(ctx, sc, swap.extent.width, swap.extent.height, sc.pool_mb << 20, opt.upload_mb << 20, opt.loader_threads, opt.prefetch,
                        false, opt.vsm ? opt.vsm_side : 1, opt.merge_reads);
             std::printf("keys: wasd/qe move, drag to look, scroll for speed, shift to hurry\n"
                         "      1-9, 0 view (shaded, clusters, triangles, lod level, groups, instances, holes, rasterizer,\n"

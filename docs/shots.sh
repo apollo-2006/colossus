@@ -24,6 +24,10 @@ fi
 if [[ -f models/fox.cgeo ]]; then
   shot --model models/fox.cgeo --grid 30 --spacing 1.2 --camera -1.2,0.45,3.2,0.45,-0.12 --screenshot docs/foxes.png
 fi
+# the forest, if built (models/forest.py): longer, its pages take a second to settle.
+if [[ -f models/forest.scene ]]; then
+  shot --scene models/forest.scene --camera 0,1.7,6,0,0.08 --warmup 300 --screenshot docs/forest.png
+fi
 python3 docs/recompress.py docs/*.png
 # the web demo's fallback frames, when imagemagick or ffmpeg is around.
 if command -v convert >/dev/null || command -v ffmpeg >/dev/null; then web/gallery.sh; fi

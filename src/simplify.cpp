@@ -91,6 +91,7 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
         return id & new_wedge_bit ? out.new_wedges[id & ~new_wedge_bit].chart : w->chart[id];
     };
     auto uv_of = [&](uint32_t id) { return id & new_wedge_bit ? out.new_wedges[id & ~new_wedge_bit].uv : w->uv[id]; };
+    auto material_of = [&](uint32_t id) { return id & new_wedge_bit ? out.new_wedges[id & ~new_wedge_bit].material : w->material[id]; };
     auto wedge_in = [&](uint32_t v, uint32_t chart) -> uint32_t {
         for (const auto& [c, x] : chart_wedges[v])
             if (c == chart) return x;
@@ -134,9 +135,9 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
         }
     }
 
-    // edges, once each, with use counts. an edge used once is a border: a plane
-    // through it, perpendicular to its triangle, keeps collapses from pulling
-    // the border in.
+    // edges, once each, with use counts. an edge used an odd number of times is a border (once,
+    // or three times where vertex clustering kept duplicates): a plane through it,
+    // perpendicular to its triangle, keeps collapses from pulling the border in.
     struct edge { uint32_t a, b, uses; size_t tri; };
     std::vector<edge> edges;
     edges.reserve(3 * n);
@@ -157,7 +158,7 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
     }
     std::vector<uint8_t> border(nv, 0);
     for (const edge& e : edges) {
-        if (e.uses != 1) continue;
+        if (e.uses % 2 == 0) continue;
         border[e.a] = border[e.b] = 1;
         const vec3 fn = normalize(face_normal(e.tri));
         const vec3 along = pos[e.b] - pos[e.a];
@@ -220,9 +221,9 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
             for (int k = 0; k < 3; ++k) mark[tri[3 * t + k]] = mark_id;
         }
         if (shared == 0) continue;  // edge gone
-        // border vertices slide along the border onto the next border vertex
-        // only.
-        if (border[from] && shared != 1) continue;
+        // border vertices slide along the border onto the next border vertex only: along an
+        // edge the remaining triangles use an odd number of times.
+        if (border[from] && shared % 2 == 0) continue;
         // no collapse may delete a piece of surface: no triangle left at `to`
         // means an island vanished.
         {
@@ -288,7 +289,7 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
                             uint32_t x = wedge_in(to, chart);
                             if (x == UINT32_MAX) {  // relaxed: a new wedge of this chart at `to`
                                 x = new_wedge_bit | uint32_t(out.new_wedges.size());
-                                out.new_wedges.push_back({uv_of(old), verts[to], chart});
+                                out.new_wedges.push_back({uv_of(old), verts[to], chart, material_of(old)});
                                 chart_wedges[to].push_back({chart, x});
                             }
                             corner[3 * t + k] = x;
@@ -327,7 +328,8 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
 }
 
 simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                                 size_t target_triangles, const wedges* w) {
+                                 size_t target_triangles, const wedges* w, const std::vector<uint8_t>* locked) {
+    auto is_locked = [&](uint32_t v) { return locked && (*locked)[v]; };
     // each vertex's wedges by chart.
     std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> chart_wedges;
     if (w)
@@ -344,7 +346,7 @@ simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::
             if (c == w->chart[from_wedge]) return x;
         return list[0].second;
     };
-    // open edges (used once) give border vertices.
+    // open edges (used an odd number of times: duplicates are kept) give border vertices.
     std::vector<std::pair<uint32_t, uint32_t>> edges;
     for (size_t t = 0; t < indices.size(); t += 3)
         for (int c = 0; c < 3; ++c) {
@@ -357,7 +359,7 @@ simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::
     for (size_t k = 0; k < edges.size();) {
         size_t j = k;
         while (j < edges.size() && edges[j] == edges[k]) ++j;
-        if (j - k == 1) border[edges[k].first] = border[edges[k].second] = true;
+        if ((j - k) % 2 == 1) border[edges[k].first] = border[edges[k].second] = true;  // odd: a rim, duplicates or not
         k = j;
     }
     vec3 lo = positions[indices[0]], hi = lo;
@@ -377,27 +379,41 @@ simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::
         };
         // each cell's vertex: a border vertex if any, else the one nearest the
         // cell's mean.
-        struct cell { vec3 sum{0, 0, 0}; uint32_t count = 0; bool border = false; };
+        // a cell with locked vertices: the others snap onto its lowest locked one, and every
+        // locked vertex stays.
+        struct cell { vec3 sum{0, 0, 0}; uint32_t count = 0; bool border = false; uint32_t locked = UINT32_MAX; };
         std::unordered_map<uint64_t, cell> grid;
         for (const auto& [v, b] : border) {
             cell& c = grid[cell_of(v)];
             c.sum += positions[v];
             ++c.count;
             c.border |= b;
+            if (is_locked(v)) c.locked = std::min(c.locked, v);
         }
         std::unordered_map<uint64_t, std::pair<uint32_t, float>> pick;
         for (const auto& [v, b] : border) {
             const uint64_t k = cell_of(v);
             const cell& c = grid[k];
+            if (c.locked != UINT32_MAX) {
+                pick[k] = {c.locked, 0};
+                continue;
+            }
             if (c.border && !b) continue;
             const float d = length(positions[v] - c.sum * (1.0f / float(c.count)));
             auto it = pick.find(k);
             if (it == pick.end() || d < it->second.second || (d == it->second.second && v < it->second.first)) pick[k] = {v, d};
         }
+        // a hole's rim vertex in a cell with locked ones stays too: snapped onto a locked vertex it
+        // would drag the rim across the outline.
+        auto target = [&](uint32_t v) {
+            if (is_locked(v)) return v;
+            const uint64_t k = cell_of(v);
+            if (border[v] && grid[k].locked != UINT32_MAX) return v;
+            return pick[k].first;
+        };
         std::vector<uint32_t> out, corners;
         for (size_t t = 0; t < indices.size(); t += 3) {
-            const uint32_t a = pick[cell_of(indices[t])].first, b = pick[cell_of(indices[t + 1])].first,
-                           c = pick[cell_of(indices[t + 2])].first;
+            const uint32_t a = target(indices[t]), b = target(indices[t + 1]), c = target(indices[t + 2]);
             if (a == b || b == c || a == c) continue;
             out.insert(out.end(), {a, b, c});
             if (w)

@@ -26,8 +26,10 @@ struct gpu_mesh {
     float bounds[4];
     float lod_bounds[4];
     float grid[4];  // grid point 0 and step: see paged_file.hpp
-    // texture tiles: first page, level count (0: untextured), width, height (texture_file.hpp)
+    // textured: first material in the material table, material count (0: untextured), bit 0 of
+    // the third: some material is double sided (no back face culling)
     uint32_t texture[4];
+    float uv_map[4];  // texture coordinates' range: u min, v min, extent (paged_file.hpp)
     // skinned: joints (0: none), first pose slot, its first joint in the pose buffers, anchor joint
     uint32_t skin[4];
 };
@@ -78,6 +80,7 @@ struct gpu_frame {
     uint32_t taa_valid;
     float jitter[2];
     uint32_t page_count;  // where the page table's shared bounds start
+    float ground[4];      // the ground's albedo (rgb) and the fog's density (per unit of distance)
 };
 struct gpu_stats {
     uint32_t instances_visible, work_items, clusters_tested, clusters_drawn, triangles_drawn;
@@ -107,7 +110,8 @@ constexpr uint32_t flag_cone_culling = 1, flag_frustum_culling = 2, flag_wirefra
                    flag_ao = 2048,     // ambient occlusion (ao.comp)
                    flag_soft_shadows = 4096,  // contact-hardening penumbras
                    flag_bounce = 8192,        // light bounced off the ground (ambient_light() in shade.comp)
-                   flag_gi_rt = 16384;        // bounce light traced in world space (traced_light() in ao.comp)
+                   flag_gi_rt = 16384,        // bounce light traced in world space (traced_light() in ao.comp)
+                   flag_no_grid = 32768;      // the ground without its grid lines (a scene's `grid off`)
 // ray traced shadows use the finest cut within each budget; far surfaces use coarser ones
 // (trace_surface() in surface.glsl).
 constexpr size_t shadow_budgets[] = {1u << 18, 1u << 15, 1u << 12};

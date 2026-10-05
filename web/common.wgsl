@@ -93,7 +93,7 @@ struct Mesh {
   bounds: vec4f,
   lod_bounds: vec4f,
   grid: vec4f,  // position snapping: xyz grid point 0, w step
-  tex: vec4u,   // texture tiles: first page, levels (0: none), width, height (compute.wgsl)
+  tex: vec4u,   // texture tiles: first page, levels (0: none) | repeat << 8, width, height (compute.wgsl)
   skin: vec4u,  // skinned: joints (0: none), first pose slot, its first joint, anchor joint
 }
 
@@ -426,7 +426,8 @@ fn skin_run(c: Cluster) -> u32 {
   let widths = pool[page_table[c.group] + c.vertex_offset + at + 1u];
   let bu = min(widths & 31u, 16u);
   let bv = min((widths >> 5u) & 31u, 16u);
-  return at + 2u + (c.vertex_count * (bu + bv) + 31u) / 32u;
+  let bm = (widths >> 10u) & 7u;
+  return at + 2u + (c.vertex_count * (bu + bv + bm) + 31u) / 32u;
 }
 
 // vertex k skinned, now or as last frame; a direction turned by its joints.
@@ -482,8 +483,9 @@ fn cluster_normal(c: Cluster, k: u32) -> vec3f {
 }
 
 // a textured cluster's (level bit 23) texture coordinates follow its vertex run and the word
-// after it: corner u0 | v0 << 16 on a 65535-step grid, widths bu | bv << 5, then per vertex its
-// offsets (include/paged_file.hpp). widths past 16 are corrupt: capped.
+// after it: corner u0 | v0 << 16 on a 65535-step grid, widths bu | bv << 5 | bm << 10 (bm: the
+// material's, which the demo skips: one texture), then per vertex its offsets
+// (include/paged_file.hpp). widths past 16 are corrupt: capped.
 fn cluster_uv(c: Cluster, k: u32) -> vec2f {
   let b = cluster_widths(c);
   let run = page_table[c.group] + c.vertex_offset + (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
@@ -491,7 +493,7 @@ fn cluster_uv(c: Cluster, k: u32) -> vec2f {
   let widths = pool[run + 1u];
   let bu = min(widths & 31u, 16u);
   let bv = min((widths >> 5u) & 31u, 16u);
-  let bit = 64u + k * (bu + bv);
+  let bit = 64u + k * (bu + bv + ((widths >> 10u) & 7u));
   return vec2f(f32((corner & 0xffffu) + read_bits(run, bit, bu)), f32((corner >> 16u) + read_bits(run, bit + bu, bv))) / 65535.0;
 }
 

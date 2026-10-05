@@ -48,7 +48,8 @@ struct Mesh {
     vec4 bounds;      // xyz centre, w radius
     vec4 lod_bounds;  // holds every lod sphere
     vec4 grid;        // position snapping: xyz grid point 0, w step
-    uvec4 tex;        // texture tiles: first page, levels (0: none), width, height (texture.glsl)
+    uvec4 tex;        // textured: first material, materials (0: none), bit 0 of z: some double sided
+    vec4 uv_map;      // texture coordinates' range: u min, v min, extent (paged_file.hpp)
     uvec4 skin;       // skinned: joints (0: none), first pose slot, its first joint, pose slots
 };
 
@@ -97,6 +98,7 @@ layout(set = 0, binding = 0, scalar) uniform Frame {
     uint taa_valid;         // last frame's image fits this one
     vec2 jitter;            // this frame's sub-pixel offset, clip space
     uint page_count;  // page_table's entries; its shared bounds follow
+    vec4 ground;      // the ground's albedo (rgb), the fog's density (a)
 } frame;
 
 const uint flag_cone_culling = 1u;
@@ -112,6 +114,7 @@ const uint flag_ao = 2048u;  // ambient occlusion (ao.comp)
 const uint flag_soft_shadows = 4096u;  // contact-hardening penumbras (vsm_lookup())
 const uint flag_bounce = 8192u;  // light bounced off the ground (ambient_light() in shade.comp)
 const uint flag_gi_rt = 16384u;  // bounce light traced in world space (traced_light() in ao.comp)
+const uint flag_no_grid = 32768u;  // the ground without its grid lines
 const uint flag_vsm = 1024u;  // virtual shadow maps (vsm.glsl), not rays
 const uint flag_moving = 512u;  // some instances move: rays also test shadow_moving
 
@@ -219,16 +222,31 @@ vec3 cluster_normal(uint base, Cluster c, uint k) {
 }
 
 // a textured cluster's (level bit 23) texture coordinates follow its vertex run and the word
-// after it: corner u0 | v0 << 16 on a 65535-step grid, widths bu | bv << 5, then per vertex
-// its offsets. widths past 16 are corrupt: capped, so reads stay near the run.
+// after it: corner u0 | v0 << 16 on a 65535-step grid over the model's range, widths bu | bv << 5
+// | bm << 10 | m0 << 16, then per vertex its offsets and its material's offset from m0. widths
+// past 16 are corrupt: capped, so reads stay near the run. coordinates as fractions of the
+// range (the caller maps them: uv_map).
 vec2 cluster_uv(uint base, Cluster c, uint k) {
     const uvec4 b = cluster_widths(c);
     const uint run = base + c.vertex_offset + (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
     const uint corner = pool[run], widths = pool[run + 1u];
-    const uint bu = min(widths & 31u, 16u), bv = min((widths >> 5u) & 31u, 16u);
-    const uint bit = 64u + k * (bu + bv);
+    const uint bu = min(widths & 31u, 16u), bv = min((widths >> 5u) & 31u, 16u), bm = (widths >> 10u) & 7u;
+    const uint bit = 64u + k * (bu + bv + bm);
     return vec2(float((corner & 0xffffu) + read_bits(run, bit, bu)), float((corner >> 16u) + read_bits(run, bit + bu, bv))) / 65535.0;
 }
+
+// vertex k's material, within its model's.
+uint cluster_material(uint base, Cluster c, uint k) {
+    const uvec4 b = cluster_widths(c);
+    const uint run = base + c.vertex_offset + (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
+    const uint widths = pool[run + 1u];
+    const uint bu = min(widths & 31u, 16u), bv = min((widths >> 5u) & 31u, 16u), bm = (widths >> 10u) & 7u;
+    return (widths >> 16u) + read_bits(run, 64u + k * (bu + bv + bm) + bu + bv, bm);
+}
+
+// per material: its texture's first tile page, levels | repeat << 8 | double sided << 9,
+// width, height (texture.glsl).
+layout(set = 0, binding = 42, scalar) readonly buffer TextureMaterials { uvec4 texture_materials[]; };
 
 bool cluster_textured(Cluster c) { return (c.level & 0x800000u) != 0u; }
 
@@ -433,8 +451,8 @@ uint skin_run(uint base, Cluster c) {
     const uint at = (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
     if ((c.level & 0x800000u) == 0u) return at;
     const uint widths = pool[base + c.vertex_offset + at + 1u];
-    const uint bu = min(widths & 31u, 16u), bv = min((widths >> 5u) & 31u, 16u);
-    return at + 2u + (c.vertex_count * (bu + bv) + 31u) / 32u;
+    const uint bu = min(widths & 31u, 16u), bv = min((widths >> 5u) & 31u, 16u), bm = (widths >> 10u) & 7u;
+    return at + 2u + (c.vertex_count * (bu + bv + bm) + 31u) / 32u;
 }
 
 // vertex k skinned: its joints' images blended by its weights; now, or as last frame.

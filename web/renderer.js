@@ -294,9 +294,9 @@ export class Renderer {
       mf.set(m.lodBounds, 4);
       mf.set(m.grid, 8);
       if (m.texture) {
-        // first tile page, levels, width, height (Mesh::tex in common.wgsl).
+        // first tile page, levels | repeat << 8, width, height (Mesh::tex in common.wgsl).
         const tileBase = pages.length;
-        new Uint32Array(meshes, k * 96 + 64, 4).set([tileBase, m.texture.levels.length, m.texture.width, m.texture.height]);
+        new Uint32Array(meshes, k * 96 + 64, 4).set([tileBase, m.texture.levels.length | (m.texture.repeat ? 256 : 0), m.texture.width, m.texture.height]);
         for (const t of tiles[k])
           pages.push({ url: m.texture.tilesUrl, offset: t.offset, size: t.size, pinned: t.parent < 0,
                        deps: t.parent < 0 ? [] : [tileBase + t.parent], children: [], error: 0 });

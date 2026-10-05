@@ -16,8 +16,10 @@
 //   level (8) | bx (4) << 8 | by (4) << 12 | bz (4) << 16 | ib (3) << 20 | textured (1) << 23
 //
 // a textured cluster's texture coordinates follow its vertex run (and the word after it): a
-// word u0 | v0 << 16, the cluster's corner on a 65535-step grid over [0, 1], a word bu | bv << 5,
-// then per vertex its offsets from the corner in bu and bv bits.
+// word u0 | v0 << 16, the cluster's corner on a 65535-step grid over the model's range
+// (geometry::uv_min, uv_extent, also in the .ctex), a word bu | bv << 5 | bm << 10 | m0 << 16,
+// then per vertex its offsets from the corner in bu and bv bits and its material's offset from
+// m0, the cluster's lowest, in bm bits.
 //
 // a skinned model's clusters then carry per vertex two words, its four joints and its four
 // weights (summing to 255), a byte each: after the texture coordinates, or after the vertex
@@ -115,8 +117,9 @@ inline uint32_t cluster_level(const gpu_cluster& c) { return c.level & 0xff; }
 // vertex k of a cluster, from its page's words.
 vec3 decode_position(const paged_geometry& g, const gpu_cluster& c, const uint32_t* page, uint32_t k);
 vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k);
-// texture coordinates of vertex k of a textured cluster.
-vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k);
+// texture coordinates of vertex k of a textured cluster, as fractions of the model's range, and
+// its material.
+vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k, uint32_t* material = nullptr);
 inline bool cluster_textured(const gpu_cluster& c) { return (c.level >> 23) & 1; }
 // vertex k's joints and weights (a byte each) in a skinned model's cluster.
 void decode_skin(const gpu_cluster& c, const uint32_t* page, uint32_t k, uint32_t& joints, uint32_t& weights);

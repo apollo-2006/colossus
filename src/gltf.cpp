@@ -228,7 +228,7 @@ mat4c node_local(const json& n) {
 
 }  // namespace
 
-mesh load_gltf(const std::string& path, skeleton* skin) {
+mesh load_gltf(const std::string& path, skeleton* skin, const std::string& only_node) {
     gltf_file g;
     g.dir = path.substr(0, path.find_last_of('/') + 1);
     std::string data = read_file(path);
@@ -278,12 +278,44 @@ mesh load_gltf(const std::string& path, skeleton* skin) {
 
     mesh m;
     int skin_index = -1;
-    bool any_uv = false, any_without = false;
     std::vector<vec2> uvs;
-    std::vector<uint8_t> joints, weights;
+    std::vector<uint8_t> joints, weights, vertex_material;
+    // materials: the gltf's, in order, plus a default for primitives without one. textured if
+    // any has a base colour texture.
+    const json& mats = g.root["materials"];
+    bool textured = false;
+    for (size_t i = 0; i < mats.size(); ++i) textured |= mats[i]["pbrMetallicRoughness"]["baseColorTexture"].has("index");
+    for (size_t i = 0; i <= mats.size(); ++i) {
+        material mat;
+        if (i < mats.size()) {
+            const json& pbr = mats[i]["pbrMetallicRoughness"];
+            for (int k = 0; k < 3; ++k) mat.color[k] = float(pbr["baseColorFactor"][size_t(k)].num_or(1));
+            mat.double_sided = mats[i]["doubleSided"].b;
+            const json& t = pbr["baseColorTexture"];
+            if (t.has("index")) {
+                const json& tex = g.root["textures"][t["index"].index()];
+                const json& img = g.root["images"][tex["source"].index()];
+                if (img.has("uri") && img["uri"].str.compare(0, 5, "data:") != 0) mat.texture = g.dir + img["uri"].str;
+                const json& smp = tex.has("sampler") ? g.root["samplers"][tex["sampler"].index()] : json();
+                mat.repeat = smp["wrapS"].num_or(10497) != 33071 || smp["wrapT"].num_or(10497) != 33071;  // anything but clamp
+            }
+        }
+        m.materials.push_back(mat);
+        if (m.materials.size() > 255) throw std::runtime_error("glTF: more than 255 materials");
+    }
+    // a material's texture transform (KHR_texture_transform): offset, rotation, scale.
+    auto transform_uv = [&](int mi, vec2 uv) {
+        if (mi < 0 || size_t(mi) >= mats.size()) return uv;
+        const json& x = mats[size_t(mi)]["pbrMetallicRoughness"]["baseColorTexture"]["extensions"]["KHR_texture_transform"];
+        if (x.kind != json::object) return uv;
+        const float sx = float(x["scale"][0].num_or(1)), sy = float(x["scale"][1].num_or(1)), r = float(x["rotation"].num_or(0));
+        const float c = std::cos(r), s = std::sin(r), u = uv.x * sx, v = uv.y * sy;
+        return vec2{c * u + s * v + float(x["offset"][0].num_or(0)), -s * u + c * v + float(x["offset"][1].num_or(0))};
+    };
     for (size_t ni = 0; ni < nodes.size(); ++ni) {
         const json& n = nodes[ni];
         if (!n.has("mesh")) continue;
+        if (!only_node.empty() && n["name"].str != only_node) continue;
         const bool skinned = n.has("skin");
         if (skinned) {
             if (skin_index >= 0 && int(n["skin"].index()) != skin_index) throw std::runtime_error("glTF: more than one skin");
@@ -310,11 +342,10 @@ mesh load_gltf(const std::string& path, skeleton* skin) {
             if (p["attributes"].has("TEXCOORD_0")) {
                 const std::vector<float> t = g.floats(p["attributes"]["TEXCOORD_0"].index(), width);
                 if (width != 2 || t.size() / 2 != count) throw std::runtime_error("glTF: bad TEXCOORD_0");
-                for (size_t i = 0; i < count; ++i) uvs.push_back({t[2 * i], t[2 * i + 1]});  // gltf's v already runs down
-                any_uv = true;
+                const int mi = p.has("material") ? int(p["material"].index()) : -1;
+                for (size_t i = 0; i < count; ++i) uvs.push_back(transform_uv(mi, {t[2 * i], t[2 * i + 1]}));  // gltf's v already runs down
             } else {
-                uvs.resize(uvs.size() + count);
-                any_without = true;
+                uvs.resize(uvs.size() + count);  // a flat colour, or a texture's corner
             }
             if (skinned) {
                 if (!p["attributes"].has("JOINTS_0") || !p["attributes"].has("WEIGHTS_0"))
@@ -345,6 +376,8 @@ mesh load_gltf(const std::string& path, skeleton* skin) {
             } else if (skin_index >= 0 || !joints.empty()) {
                 throw std::runtime_error("glTF: skinned and unskinned meshes together are not supported");
             }
+            const int mi = p.has("material") ? int(p["material"].index()) : int(mats.size());
+            vertex_material.insert(vertex_material.end(), count, uint8_t(mi));
             if (p.has("indices")) {
                 const std::vector<float> idx = g.floats(p["indices"].index(), width);
                 for (float v : idx) {
@@ -359,21 +392,17 @@ mesh load_gltf(const std::string& path, skeleton* skin) {
             if (!skinned && skin_index >= 0) throw std::runtime_error("glTF: skinned and unskinned meshes together are not supported");
         }
     }
-    if (m.indices.empty()) throw std::runtime_error(path + ": no triangles");
-    if (any_uv && any_without) throw std::runtime_error("glTF: some primitives have texture coordinates and some not");
-    if (any_uv) {  // a wedge per vertex; weld() merges equal ones
+    if (m.indices.empty()) throw std::runtime_error(path + (only_node.empty() ? "" : " node " + only_node) + ": no triangles");
+    // the default material, last, only if a primitive has none.
+    if (std::find(vertex_material.begin(), vertex_material.end(), uint8_t(mats.size())) == vertex_material.end()) m.materials.pop_back();
+    if (textured) {  // a wedge per vertex; weld() merges equal ones
         m.wedge_uvs = uvs;
         m.wedge_vertex.resize(uvs.size());
         for (uint32_t i = 0; i < uvs.size(); ++i) m.wedge_vertex[i] = i;
+        m.wedge_material = vertex_material;
         m.corners = m.indices;
-        // the base colour texture: a file beside the gltf.
-        const json& mats = g.root["materials"];
-        for (size_t i = 0; i < mats.size() && m.texture.empty(); ++i) {
-            const json& t = mats[i]["pbrMetallicRoughness"]["baseColorTexture"];
-            if (!t.has("index")) continue;
-            const json& img = g.root["images"][g.root["textures"][t["index"].index()]["source"].index()];
-            if (img.has("uri") && img["uri"].str.compare(0, 5, "data:") != 0) m.texture = g.dir + img["uri"].str;
-        }
+    } else {
+        m.materials.clear();
     }
     m.skin_joints = std::move(joints);
     m.skin_weights = std::move(weights);

@@ -271,9 +271,9 @@ fn texture_level(tex: vec4u, level: u32) -> TextureLevel {
 // asked for, more urgently the coarser the copy drawn instead.
 fn sample_resident(tex: vec4u, uv: vec2f, level: u32) -> vec3f {
   var wanted = NO_PAGE;
-  for (var k = level; k < tex.y; k++) {
+  for (var k = level; k < (tex.y & 255u); k++) {
     let l = texture_level(tex, k);
-    let at = clamp(uv, vec2f(0.0), vec2f(1.0)) * vec2f(l.size) - 0.5;
+    let at = select(clamp(uv, vec2f(0.0), vec2f(1.0)), fract(uv), (tex.y & 256u) != 0u) * vec2f(l.size) - 0.5;
     let base = floor(at);
     let f = at - base;
     let b = vec2i(base);
@@ -303,11 +303,12 @@ fn sample_resident(tex: vec4u, uv: vec2f, level: u32) -> vec3f {
 fn sample_texture(tex: vec4u, uv: vec2f, duv_dx: vec2f, duv_dy: vec2f) -> vec3f {
   let size = vec2f(tex.zw);
   let footprint = max(length(duv_dx * size), length(duv_dy * size));
-  let lod = clamp(log2(max(footprint, 1e-8)), 0.0, f32(tex.y - 1u));
+  let levels = tex.y & 255u;
+  let lod = clamp(log2(max(footprint, 1e-8)), 0.0, f32(levels - 1u));
   let level = u32(lod);
   let f = lod - f32(level);
   let a = sample_resident(tex, uv, level);
-  if (f < 1.0 / 64.0 || level + 1u >= tex.y) { return a; }
+  if (f < 1.0 / 64.0 || level + 1u >= levels) { return a; }
   return mix(a, sample_resident(tex, uv, level + 1u), f);
 }
 

@@ -21,6 +21,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <random>
 #include <string>
 
 namespace {
@@ -112,8 +113,35 @@ mesh grid_textured(mesh m, uint32_t cells) {
             if (added) {
                 m.wedge_uvs.push_back(chart_uv(m.positions[v], chart));
                 m.wedge_vertex.push_back(v);
+                m.wedge_material.push_back(0);
             }
             m.corners.push_back(it->second);
+        }
+    }
+    m.materials.push_back(material{});
+    return m;
+}
+
+// foliage: islands no edge collapse may remove, scattered through a ball: small closed
+// tetrahedra and open cards (two triangles, a hole's rim all round), like needles and leaves.
+mesh islands(int count, unsigned seed) {
+    mesh m;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-1, 1);
+    for (int k = 0; k < count; ++k) {
+        vec3 c;
+        do c = vec3(u(rng), u(rng), u(rng));
+        while (length(c) > 1);
+        const vec3 a(u(rng), u(rng), u(rng)), b(u(rng), u(rng), u(rng));
+        const float r = 0.02f;
+        const uint32_t base = uint32_t(m.positions.size());
+        if (k % 2) {  // a tetrahedron
+            m.positions.insert(m.positions.end(), {c + a * r, c + b * r, c + cross(a, b) * r, c - (a + b) * (r * 0.5f)});
+            m.indices.insert(m.indices.end(), {base, base + 1, base + 2, base, base + 3, base + 1, base + 1, base + 3, base + 2,
+                                               base + 2, base + 3, base});
+        } else {  // a card
+            m.positions.insert(m.positions.end(), {c - a * r, c + a * r, c + a * r + b * r * 3.0f, c - a * r + b * r * 3.0f});
+            m.indices.insert(m.indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
         }
     }
     return m;
@@ -181,7 +209,7 @@ void test_ply_and_obj() {
         CHECK(t.corners[2] == t.corners[4] && c.x == 1 && c.y == 0);
         CHECK(t.wedge_vertex[t.corners[0]] == t.indices[0] && t.wedge_vertex[t.corners[3]] == t.indices[3]);
     }
-    CHECK(t.texture == temp_path("") .substr(0, temp_path("").find_last_of('/') + 1) + "tex.jpg");
+    CHECK(t.materials.size() == 1 && t.materials[0].texture == temp_path("").substr(0, temp_path("").find_last_of('/') + 1) + "tex.jpg");
 }
 
 void test_weld() {
@@ -251,7 +279,9 @@ void test_simplify() {
 }
 
 // exact: texture coordinates checked exact (no seam had to move).
-void test_hierarchy(const char* name, const mesh& input, bool exact = true) {
+// min_area: the smallest share of the surface a cut above 1000 triangles keeps (foliage thins:
+// merged islands cover less).
+void test_hierarchy(const char* name, const mesh& input, bool exact = true, double min_area = 0.97) {
     std::printf("hierarchy: %s, %zu triangles\n", name, input.triangle_count());
     mesh m = input;
     // texture coordinates come from the unplaced positions: keep them.
@@ -303,7 +333,7 @@ void test_hierarchy(const char* name, const mesh& input, bool exact = true) {
     }
     std::printf("  cracked edges over 31 cuts: %zu; smallest area ratio above 1000 triangles: %.4f\n", cracked, worst_area);
     CHECK(cracked == 0);
-    CHECK(worst_area > 0.97);
+    CHECK(worst_area > min_area);
 
     // paged, written, read back: every cluster's vertices and triangles come
     // out of its page as they went in; dependencies are coarser pages.
@@ -401,8 +431,10 @@ void test_texture() {
     const std::string path = temp_path("test.ctex");
     save_texture(im, path);
     const texture_info t = load_texture_info(path);
-    CHECK(t.levels.size() == 3);  // 300 x 130, 150 x 65, 75 x 33
-    CHECK(t.levels.size() == 3 && t.levels[0].tiles_x == 3 && t.levels[0].tiles_y == 2 && t.levels[2].tiles_x == 1);
+    CHECK(t.textures.size() == 1);
+    const std::vector<texture_level>& lv = t.textures[0].levels;
+    CHECK(lv.size() == 3);  // 300 x 130, 150 x 65, 75 x 33
+    CHECK(lv.size() == 3 && lv[0].tiles_x == 3 && lv[0].tiles_y == 2 && lv[2].tiles_x == 1);
     CHECK(t.tile_count() == 6 + 2 + 1);
     CHECK(t.parent(4) == 6);  // (1, 1) of level 0 -> (0, 0) of level 1
     CHECK(t.parent(5) == 7);  // (2, 1) -> (1, 0)
@@ -581,6 +613,81 @@ void test_skinning() {
           back.animations[0].channels[0].values == sk.animations[0].channels[0].values);
 }
 
+// two materials and repeating coordinates: a grid, its left half one material and its right
+// the other (a seam down the middle), coordinates four and three repeats across. every vertex
+// decodes back to its coordinates (within a step of the range) and material, and no triangle
+// has two; a repeating texture's tile borders wrap.
+void test_materials() {
+    std::printf("materials\n");
+    mesh m = grid(60);
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> wedge_of;
+    for (size_t t = 0; t < m.triangle_count(); ++t) {
+        const vec3 c = (m.positions[m.indices[3 * t]] + m.positions[m.indices[3 * t + 1]] + m.positions[m.indices[3 * t + 2]]) * (1.0f / 3);
+        const uint32_t mat = c.x > 0.5f ? 1 : 0;
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t v = m.indices[3 * t + k];
+            auto [it, added] = wedge_of.emplace(std::make_pair(v, mat), uint32_t(m.wedge_uvs.size()));
+            if (added) {
+                m.wedge_uvs.push_back({4 * m.positions[v].x, 3 * m.positions[v].z - 1});
+                m.wedge_vertex.push_back(v);
+                m.wedge_material.push_back(uint8_t(mat));
+            }
+            m.corners.push_back(it->second);
+        }
+    }
+    m.materials = {material{}, material{}};
+    const lod_mesh lod = build_lod(m, false);
+    const geometry g = pack(lod);
+    const paged_geometry pg = page(g);
+    CHECK(g.uv_min.x == 0 && g.uv_min.y == -1 && g.uv_extent == 4);
+    size_t wrong_uv = 0, wrong_material = 0, mixed = 0;
+    for (size_t i = 0; i < g.clusters.size(); ++i) {
+        const gpu_cluster& c = g.clusters[i];
+        const uint32_t* base = &pg.data[pg.pages[pg.clusters[i].group].offset / 4];
+        uint32_t mats[cluster_max_vertices];
+        for (uint32_t k = 0; k < c.vertex_count; ++k) {
+            const uint32_t w = g.cluster_vertices[c.vertex_offset + k];
+            const vec2 q = decode_uv(pg.clusters[i], base, k, &mats[k]);
+            const vec2 uv = {g.uv_min.x + q.x * g.uv_extent, g.uv_min.y + q.y * g.uv_extent};
+            wrong_uv += std::abs(uv.x - g.wedge_uvs[w].x) > g.uv_extent / 65535 || std::abs(uv.y - g.wedge_uvs[w].y) > g.uv_extent / 65535;
+            wrong_material += mats[k] != g.wedge_material[w];
+        }
+        for (uint32_t t = 0; t < c.triangle_count; ++t) {
+            const uint32_t p = g.cluster_triangles[c.triangle_offset + t];
+            mixed += mats[p & 255] != mats[p >> 8 & 255] || mats[p & 255] != mats[p >> 16 & 255];
+        }
+    }
+    std::printf("  %zu clusters; coordinates off %zu, materials off %zu, triangles of two materials %zu\n", g.clusters.size(),
+                wrong_uv, wrong_material, mixed);
+    CHECK(wrong_uv == 0 && wrong_material == 0 && mixed == 0);
+
+    // a repeating 200 x 50 texture: tile (0, 0)'s left border is the image's right edge.
+    image im;
+    im.width = 200;
+    im.height = 50;
+    for (uint32_t y = 0; y < 50; ++y)
+        for (uint32_t x = 0; x < 200; ++x) im.rgb.insert(im.rgb.end(), {uint8_t(x), uint8_t(4 * y), uint8_t(255 - x)});
+    const std::string path = temp_path("wrap.ctex");
+    save_textures({im}, {1}, {0, 0}, 1, path);
+    const texture_info t = load_texture_info(path);
+    CHECK(t.textures.size() == 1 && t.textures[0].repeat);
+    std::ifstream f(path, std::ios::binary);
+    std::vector<uint8_t> tile(tile_bytes);
+    f.seekg(static_cast<std::streamoff>(t.data_offset));
+    f.read(reinterpret_cast<char*>(tile.data()), tile_bytes);
+    uint8_t back[48];
+    int worst = 0;
+    for (uint32_t by = 1; by < 4; ++by) {  // the border block column, rows inside the image
+        decode_bc1(&tile[(by * 32) * 8], back);
+        for (int i = 0; i < 16; ++i) {
+            const int x = 200 - 4 + i % 4, y = int(4 * by) - 4 + i / 4;  // wrapped from the right edge
+            for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(back[3 * i + c] - im.rgb[(size_t(y) * 200 + x) * 3 + c]));
+        }
+    }
+    std::printf("  a repeating texture's border against the far edge: within %d of 255\n", worst);
+    CHECK(worst <= 12);
+}
+
 }  // namespace
 
 // packed normal cones (packed_cluster) never cull what the exact cone keeps: the culling test
@@ -662,6 +769,7 @@ void test_deviation_bound() {
 }
 
 int main() {
+    test_materials();
     test_skinning();
     test_texture();
     test_deviation_bound();
@@ -675,6 +783,7 @@ int main() {
     test_hierarchy("sphere with holes", holed_sphere(7));
     test_hierarchy("flat grid", grid(250));
     test_hierarchy("textured sphere with holes", grid_textured(holed_sphere(7), 2));
+    test_hierarchy("foliage: 30000 islands", islands(30000, 5), true, 0.15);
     texture_charts = 216;
     test_hierarchy("sphere with holes, 216 small charts", grid_textured(holed_sphere(7), 6), false);
     if (failures) {

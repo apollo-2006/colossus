@@ -14,6 +14,7 @@
 struct new_wedge {
     vec2 uv;
     uint32_t vertex, chart;
+    uint8_t material;
 };
 constexpr uint32_t new_wedge_bit = 0x80000000u;
 
@@ -34,6 +35,7 @@ struct wedges {
     const std::vector<uint32_t>& chart;
     const std::vector<uint32_t>& vertex;
     const std::vector<vec2>& uv;
+    const std::vector<uint8_t>& material;
     // seams may move: a corner whose chart has no wedge at the vertex it moves onto gets a new
     // one there, keeping its old coordinates. positions stay shared, so no cracks; the texture
     // shifts across the seam by at most the collapse's distance, which the error measures.
@@ -63,5 +65,10 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
 // cell with a border vertex keeps one. error is 0: measure it.
 // with wedges, a corner takes its cell's vertex's wedge in its chart (any wedge of that vertex
 // where it has none: at the coarsest level a seam may smear).
+//
+// with locked (indexed by vertex), locked vertices never move: other vertices in their cell
+// snap onto one of them, so a group's outline stays and its neighbours still meet it. this is
+// what gets islands (needles, leaves, blades: pieces no collapse may remove) to merge.
 simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                                 size_t target_triangles, const wedges* w = nullptr);
+                                 size_t target_triangles, const wedges* w = nullptr,
+                                 const std::vector<uint8_t>* locked = nullptr);

@@ -57,7 +57,8 @@ struct lod_mesh {
     std::vector<vec3> positions, normals;
     std::vector<uint32_t> wedge_vertex, wedge_chart;
     std::vector<vec2> wedge_uvs;  // empty if untextured
-    std::string texture;
+    std::vector<uint8_t> wedge_material;
+    std::vector<material> materials;
     std::vector<uint8_t> skin_joints, skin_weights;  // per vertex, empty if unskinned (mesh.hpp)
     std::vector<lod_cluster> clusters;  // level 0, then each level
     std::vector<lod_level_stats> levels;

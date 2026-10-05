@@ -230,8 +230,9 @@ async function loadTexture(gl, texture, limit) {
   gl.generateMipmap(gl.TEXTURE_2D);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const wrap = texture.repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
   const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
   if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
   return { texture: tex, width: w, height: h, bytes: end - start };
@@ -267,9 +268,9 @@ function decodePage(gl, model, c, page, data) {
     // textured (level bit 23): corner and widths after the vertex run's following word.
     const uvAt = vat + ((vc * stride + 31) >>> 5) + 1;
     const textured = (lw >>> 23) & 1, corner = textured ? words[uvAt] : 0, widths = textured ? words[uvAt + 1] : 0;
-    const bu = Math.min(widths & 31, 16), bv = Math.min((widths >>> 5) & 31, 16);
+    const bu = Math.min(widths & 31, 16), bv = Math.min((widths >>> 5) & 31, 16), bm = (widths >>> 10) & 7;
     // skinned: two words per vertex, joints and weights a byte each, past the coordinates.
-    const skinAt = textured ? uvAt + 2 + ((vc * (bu + bv) + 31) >>> 5) : uvAt;
+    const skinAt = textured ? uvAt + 2 + ((vc * (bu + bv + bm) + 31) >>> 5) : uvAt;
     for (let q = 0; q < vc; q++, v++) {
       const b = q * stride;
       pos[8 * v] = g[0] + g[3] * (ox + bits(vat, b, bx));
@@ -278,8 +279,8 @@ function decodePage(gl, model, c, page, data) {
       decodeOctahedral(bits(vat, b + bx + by + bz, 22), bytes, 32 * v + 12);
       info[8 * v + 4] = tag;
       if (textured) {
-        uvs[16 * v + 10] = (corner & 0xffff) + bits(uvAt, 64 + q * (bu + bv), bu);
-        uvs[16 * v + 11] = (corner >>> 16) + bits(uvAt, 64 + q * (bu + bv) + bu, bv);
+        uvs[16 * v + 10] = (corner & 0xffff) + bits(uvAt, 64 + q * (bu + bv + bm), bu);
+        uvs[16 * v + 11] = (corner >>> 16) + bits(uvAt, 64 + q * (bu + bv + bm) + bu, bv);
       }
       if (skinned) {
         info[8 * v + 6] = words[skinAt + 2 * q];

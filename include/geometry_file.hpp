@@ -42,7 +42,12 @@ struct geometry {
     // untextured, both are empty and a wedge is its vertex.
     std::vector<uint32_t> wedge_vertex;
     std::vector<vec2> wedge_uvs;
-    std::string texture;
+    std::vector<uint8_t> wedge_material;
+    std::vector<material> materials;
+    // texture coordinates are stored as fractions of their range (they may repeat past 0 to
+    // 1): uv = uv_min + stored * uv_extent.
+    vec2 uv_min;
+    float uv_extent = 1;
     std::vector<uint8_t> skin_joints, skin_weights;  // per vertex, four each, if skinned
     std::vector<uint32_t> cluster_vertices;  // wedges
     std::vector<uint32_t> cluster_triangles;  // a | b << 8 | c << 16

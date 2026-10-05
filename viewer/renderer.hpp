@@ -68,7 +68,7 @@ public:
         for (vk::buffer* b : {&clusters_, &page_table_, &pool_buffer_, &page_used_, &requests_, &request_stamp_, &shadow_positions_, &meshes_,
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_,
                               &cells_, &cell_lists_, &vsm_entries_, &vsm_phys_, &vsm_lists_, &vsm_atlas_, &vsm_work_,
-                              &vsm_visible_, &vsm_args_, &moving_instances_, &page_skins_})
+                              &vsm_visible_, &vsm_args_, &moving_instances_, &page_skins_, &materials_})
             ctx_.destroy(*b);
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
         for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_, cell_cull_,
@@ -591,7 +591,7 @@ private:
     uint32_t slot_ = 0;
 
     vk::buffer clusters_, page_table_, pool_buffer_, page_used_, requests_, request_stamp_, shadow_positions_, meshes_, instances_;
-    vk::buffer page_skins_;
+    vk::buffer page_skins_, materials_;
     std::vector<float> last_pose_;  // last frame's joints (16 floats each), for motion
     vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_, cells_, cell_lists_;
     // virtual shadow maps: see vsm.glsl.
@@ -889,6 +889,9 @@ private:
         }
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
         page_skins_ = ctx_.upload(sc_.page_skins, ssbo);
+        std::vector<std::array<uint32_t, 4>> materials = sc_.materials;
+        if (materials.empty()) materials.push_back({0, 0, 0, 0});
+        materials_ = ctx_.upload(materials, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
         cells_ = ctx_.upload(sc_.cells, ssbo);
         const VkBufferUsageFlags filled = ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1079,7 +1082,7 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 41; ++i) {
+        for (uint32_t i = 0; i <= 42; ++i) {
             if ((i == 18 || i == 23 || i == 24) && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
@@ -1098,7 +1101,7 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 33 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (3 + max_hzb_levels + ao_depth_levels) * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2 * frames_in_flight}};
@@ -1122,10 +1125,10 @@ private:
                                            nullptr,         &cells_, &cell_lists_, &vsm_entries_, &vsm_phys_, &vsm_lists_,
                                            &vsm_atlas_,     &vsm_work_, &vsm_visible_, &vsm_args_, &moving_instances_,
                                            nullptr,         nullptr,   nullptr,       &f.pose_now, &f.pose_prev,
-                                           &f.pose_info,    &page_skins_};
-            VkDescriptorBufferInfo infos[42];
+                                           &f.pose_info,    &page_skins_, &materials_};
+            VkDescriptorBufferInfo infos[43];
             std::vector<VkWriteDescriptorSet> writes;
-            for (uint32_t i = 0; i < 42; ++i) {
+            for (uint32_t i = 0; i < 43; ++i) {
                 if (!buffers[i]) continue;  // visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};

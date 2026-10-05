@@ -29,7 +29,7 @@ const Material materials[6] = Material[](
 
 // the ground's colour and the light on it, as drawn: its radiance where it is in sun (lit 1) or
 // shadow (lit 0). the grid lines aside.
-const vec3 ground_albedo = vec3(0.41, 0.39, 0.36);
+#define ground_albedo (frame.ground.rgb)  // the scene's (0.41, 0.39, 0.36 by default)
 
 vec3 sky(vec3 dir) {
     const float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);

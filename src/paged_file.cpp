@@ -93,8 +93,8 @@ uint32_t skin_run(const gpu_cluster& c, const uint32_t* page) {
     const uint32_t at = uv_run(c);
     if (!cluster_textured(c)) return at;
     const uint32_t widths = page[c.vertex_offset + at + 1];
-    const uint32_t bu = std::min(widths & 31, 16u), bv = std::min(widths >> 5 & 31, 16u);
-    return at + 2 + (c.vertex_count * (bu + bv) + 31) / 32;
+    const uint32_t bu = std::min(widths & 31, 16u), bv = std::min(widths >> 5 & 31, 16u), bm = std::min(widths >> 10 & 7, 7u);
+    return at + 2 + (c.vertex_count * (bu + bv + bm) + 31) / 32;
 }
 
 }  // namespace
@@ -119,10 +119,11 @@ vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k) {
     return decode_octahedral(read_bits(page + c.vertex_offset, at, 22));
 }
 
-vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k) {
+vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k, uint32_t* material) {
     const uint32_t* run = page + c.vertex_offset + uv_run(c);
-    const uint32_t bu = run[1] & 31, bv = run[1] >> 5 & 31;
-    const uint64_t at = 64 + uint64_t(k) * (bu + bv);
+    const uint32_t bu = run[1] & 31, bv = run[1] >> 5 & 31, bm = run[1] >> 10 & 7;
+    const uint64_t at = 64 + uint64_t(k) * (bu + bv + bm);
+    if (material) *material = (run[1] >> 16) + read_bits(run, at + bu + bv, bm);
     return {float((run[0] & 0xffff) + read_bits(run, at, bu)) / uv_max, float((run[0] >> 16) + read_bits(run, at + bu, bv)) / uv_max};
 }
 
@@ -307,20 +308,26 @@ paged_geometry page(const geometry& g) {
             if (g.textured()) {
                 words.push_back(0);  // the word after the vertex run
                 // corner and widths, then each vertex's offsets.
-                uint32_t q[2][cluster_max_vertices], lo[2] = {uv_max, uv_max}, hi[2] = {0, 0};
+                // coordinates as fractions of the model's range (geometry::uv_min, uv_extent),
+                // and materials: the cluster's lowest and each vertex's offset from it.
+                uint32_t q[3][cluster_max_vertices], lo[3] = {uv_max, uv_max, 255}, hi[3] = {0, 0, 0};
                 for (uint32_t k = 0; k < src.vertex_count; ++k) {
-                    const vec2 uv = g.wedge_uvs[g.cluster_vertices[src.vertex_offset + k]];
-                    q[0][k] = uint32_t(std::lround(std::clamp(uv.x, 0.0f, 1.0f) * uv_max));
-                    q[1][k] = uint32_t(std::lround(std::clamp(uv.y, 0.0f, 1.0f) * uv_max));
-                    for (int a = 0; a < 2; ++a) { lo[a] = std::min(lo[a], q[a][k]); hi[a] = std::max(hi[a], q[a][k]); }
+                    const uint32_t w = g.cluster_vertices[src.vertex_offset + k];
+                    const vec2 uv = g.wedge_uvs[w];
+                    q[0][k] = uint32_t(std::lround(std::clamp((uv.x - g.uv_min.x) / g.uv_extent, 0.0f, 1.0f) * uv_max));
+                    q[1][k] = uint32_t(std::lround(std::clamp((uv.y - g.uv_min.y) / g.uv_extent, 0.0f, 1.0f) * uv_max));
+                    q[2][k] = g.wedge_material[w];
+                    for (int a = 0; a < 3; ++a) { lo[a] = std::min(lo[a], q[a][k]); hi[a] = std::max(hi[a], q[a][k]); }
                 }
-                const uint32_t bu = bits_for(hi[0] - lo[0]), bv = bits_for(hi[1] - lo[1]);
+                const uint32_t bu = bits_for(hi[0] - lo[0]), bv = bits_for(hi[1] - lo[1]), bm = bits_for(hi[2] - lo[2]);
+                if (bm > 7) throw std::logic_error("a cluster's materials span too far to pack");
                 words.push_back(lo[0] | lo[1] << 16);
-                words.push_back(bu | bv << 5);
+                words.push_back(bu | bv << 5 | bm << 10 | lo[2] << 16);
                 bit_writer uw{words};
                 for (uint32_t k = 0; k < src.vertex_count; ++k) {
                     uw.put(q[0][k] - lo[0], bu);
                     uw.put(q[1][k] - lo[1], bv);
+                    uw.put(q[2][k] - lo[2], bm);
                 }
             }
             if (g.skinned()) {
@@ -508,9 +515,9 @@ paged_geometry load_paged(const std::string& path, bool with_data) {
             }
             if (cluster_textured(c)) {
                 const uint32_t widths = base[c.vertex_offset + uv_run(c) + 1];
-                const uint32_t bu = widths & 31, bv = widths >> 5 & 31;
-                const uint64_t end = c.vertex_offset + uv_run(c) + 2 + (uint64_t(c.vertex_count) * (bu + bv) + 31) / 32 + 1;
-                if (bu > 16 || bv > 16 || widths >> 10 || end > p.pages[c.group].size / 4)
+                const uint32_t bu = widths & 31, bv = widths >> 5 & 31, bm = widths >> 10 & 7;
+                const uint64_t end = c.vertex_offset + uv_run(c) + 2 + (uint64_t(c.vertex_count) * (bu + bv + bm) + 31) / 32 + 1;
+                if (bu > 16 || bv > 16 || (widths >> 13 & 7) || end > p.pages[c.group].size / 4)
                     throw std::runtime_error(path + ": texture coordinates out of range");
             }
         }
