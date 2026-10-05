@@ -277,8 +277,11 @@ void make_scene(const options& opt, scene& s) {
             if (c.creator != no_page) c.creator += page_base;
             s.clusters.push_back(c);
         }
+        // per global page: the previous model's texture tiles have none.
+        s.shared_bounds.resize(page_base);
         s.shared_bounds.insert(s.shared_bounds.end(), g.shared_bounds.begin(), g.shared_bounds.end());
     }
+    s.shared_bounds.resize(s.pages.size());
 
     s.page_skins.resize(std::max<size_t>(s.pages.size(), 1));  // texture pages and unskinned models: none
     std::mt19937 rng(7), material_rng(11), motion_rng(13);
