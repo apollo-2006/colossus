@@ -14,13 +14,16 @@ const VERTEX = `#version 300 es
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in uint info;  // cluster | level << 24
+layout(location = 3) in vec2 uv;
 uniform mat4 view_proj;
 out vec3 v_normal;
 out vec3 v_position;
+out vec2 v_uv;
 flat out uint v_info;
 void main() {
   v_normal = normal;
   v_position = position;
+  v_uv = uv;
   v_info = info;
   gl_Position = view_proj * vec4(position, 1.0);
 }`;
@@ -30,9 +33,12 @@ precision highp float;
 precision highp int;
 in vec3 v_normal;
 in vec3 v_position;
+in vec2 v_uv;
 flat in uint v_info;
 uniform int mode;  // 0 shaded, 1 clusters, 2 lod level
 uniform vec3 eye;
+uniform bool textured;
+uniform sampler2D albedo_map;  // as stored: the light here is tuned in display values, as the grey is
 out vec4 color;
 uint hash(uint x) {
   x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u;
@@ -55,6 +61,7 @@ void main() {
   if (!gl_FrontFacing) n = -n;
   vec3 albedo = mode == 1 ? hash_color(v_info & 0xffffffu)
               : mode == 2 ? level_color(v_info >> 24u)
+              : textured  ? texture(albedo_map, v_uv).rgb
                           : vec3(0.82, 0.8, 0.76);
   vec3 sun = normalize(vec3(0.45, 0.8, 0.4));
   float diffuse = max(dot(n, sun), 0.0);
@@ -158,9 +165,65 @@ function unpackClusters(model) {
   return c;
 }
 
-// a page's clusters as webgl buffers (cluster_position(), cluster_normal() and
-// cluster_triangle() in common.wgsl): positions, normals and cluster | level per vertex, and
-// each cluster's run of indices.
+// bc1 block (8 bytes at `at`) to 16 rgba texels, as decode_bc1() in src/texture_file.cpp.
+function decodeBC1(src, at, out, width, x0, y0, skip, keep) {
+  const c0 = src[at] | (src[at + 1] << 8), c1 = src[at + 2] | (src[at + 3] << 8);
+  const bits = (src[at + 4] | (src[at + 5] << 8) | (src[at + 6] << 16) | (src[at + 7] << 24)) >>> 0;
+  const rgb = (v) => [((v >>> 11) * 255 / 31) | 0, (((v >>> 5) & 63) * 255 / 63) | 0, ((v & 31) * 255 / 31) | 0];
+  const p = [rgb(c0), rgb(c1), [0, 0, 0], [0, 0, 0]];
+  for (let k = 0; k < 3; k++) {
+    p[2][k] = c0 > c1 ? ((2 * p[0][k] + p[1][k]) / 3) | 0 : ((p[0][k] + p[1][k]) / 2) | 0;
+    p[3][k] = c0 > c1 ? ((p[0][k] + 2 * p[1][k]) / 3) | 0 : 0;
+  }
+  for (let i = 0; i < 16; i++) {
+    const tx = (i & 3) + skip.x, ty = (i >> 2) + skip.y;  // texel in the tile
+    if (tx < keep.x0 || tx >= keep.x1 || ty < keep.y0 || ty >= keep.y1) continue;
+    const c = p[(bits >>> (2 * i)) & 3], o = 4 * ((y0 + ty - keep.y0) * width + x0 + tx - keep.x0);
+    out[o] = c[0]; out[o + 1] = c[1]; out[o + 2] = c[2]; out[o + 3] = 255;
+  }
+}
+
+// a texture for webgl: the first level at most `limit` a side, its tiles fetched in one range
+// (a level's tiles are consecutive), decoded on the cpu without their borders, and mipmapped.
+// webgl2 can't sample from a page pool, and a phone can't hold every level.
+async function loadTexture(gl, texture, limit) {
+  const levels = texture.levels;
+  let level = 0, w = texture.width, h = texture.height;
+  while (level + 1 < levels.length && Math.max(w, h) > limit) { level++; w = (w + 1) >> 1; h = (h + 1) >> 1; }
+  const l = levels[level], tb = texture.tileBytes;
+  const start = l.first * tb, end = (l.first + l.tilesX * l.tilesY) * tb;
+  const r = await fetch(texture.tilesUrl, { headers: { Range: `bytes=${start}-${end - 1}` } });
+  let bytes = new Uint8Array(await r.arrayBuffer());
+  if (r.status === 200) bytes = bytes.subarray(start, end);  // a server ignoring ranges
+  const rgba = new Uint8Array(w * h * 4);
+  for (let ty = 0; ty < l.tilesY; ty++)
+    for (let tx = 0; tx < l.tilesX; tx++) {
+      const tile = (ty * l.tilesX + tx) * tb;
+      // the tile's payload: 120 texels from 4 in, clipped to the level.
+      const keep = { x0: 4, y0: 4, x1: 4 + Math.min(120, w - 120 * tx), y1: 4 + Math.min(120, h - 120 * ty) };
+      for (let by = 0; by < 32; by++)
+        for (let bx = 0; bx < 32; bx++) {
+          if (4 * bx + 4 <= keep.x0 || 4 * bx >= keep.x1 || 4 * by + 4 <= keep.y0 || 4 * by >= keep.y1) continue;
+          decodeBC1(bytes, tile + 8 * (by * 32 + bx), rgba, w, 120 * tx, 120 * ty, { x: 4 * bx, y: 4 * by }, keep);
+        }
+    }
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, Math.floor(Math.log2(Math.max(w, h))) + 1, gl.RGBA8, w, h);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+  if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  return { texture: tex, width: w, height: h, bytes: end - start };
+}
+
+// a page's clusters as webgl buffers (cluster_position(), cluster_normal(), cluster_uv() and
+// cluster_triangle() in common.wgsl): positions, normals, cluster | level and texture
+// coordinates per vertex, and each cluster's run of indices.
 function decodePage(gl, model, c, page, data) {
   const words = new Uint32Array(data);
   const bits = (at, bit, count) => {
@@ -172,8 +235,8 @@ function decodePage(gl, model, c, page, data) {
   const list = c.byPage[page];
   let vertices = 0, indices = 0;
   for (const i of list) { vertices += c.counts[i] & 0xffff; indices += 3 * (c.counts[i] >>> 16); }
-  const buffer = new ArrayBuffer(vertices * 20);
-  const pos = new Float32Array(buffer), bytes = new Int8Array(buffer), info = new Uint32Array(buffer);
+  const buffer = new ArrayBuffer(vertices * 24);
+  const pos = new Float32Array(buffer), bytes = new Int8Array(buffer), info = new Uint32Array(buffer), uvs = new Uint16Array(buffer);
   const index = vertices > 65535 ? new Uint32Array(indices) : new Uint16Array(indices);
   const runs = new Map();  // cluster -> [first index, count]
   const g = model.grid;
@@ -184,13 +247,21 @@ function decodePage(gl, model, c, page, data) {
     const vat = c.offsets[i] & 0xffff, tat = c.offsets[i] >>> 16, stride = bx + by + bz + 22;
     const ox = c.origin[3 * i], oy = c.origin[3 * i + 1], oz = c.origin[3 * i + 2];
     const first = v, tag = (i & 0xffffff) | ((lw & 255) << 24);
+    // textured (level bit 23): corner and widths after the vertex run's following word.
+    const uvAt = vat + ((vc * stride + 31) >>> 5) + 1;
+    const textured = (lw >>> 23) & 1, corner = textured ? words[uvAt] : 0, widths = textured ? words[uvAt + 1] : 0;
+    const bu = Math.min(widths & 31, 16), bv = Math.min((widths >>> 5) & 31, 16);
     for (let q = 0; q < vc; q++, v++) {
       const b = q * stride;
-      pos[5 * v] = g[0] + g[3] * (ox + bits(vat, b, bx));
-      pos[5 * v + 1] = g[1] + g[3] * (oy + bits(vat, b + bx, by));
-      pos[5 * v + 2] = g[2] + g[3] * (oz + bits(vat, b + bx + by, bz));
-      decodeOctahedral(bits(vat, b + bx + by + bz, 22), bytes, 20 * v + 12);
-      info[5 * v + 4] = tag;
+      pos[6 * v] = g[0] + g[3] * (ox + bits(vat, b, bx));
+      pos[6 * v + 1] = g[1] + g[3] * (oy + bits(vat, b + bx, by));
+      pos[6 * v + 2] = g[2] + g[3] * (oz + bits(vat, b + bx + by, bz));
+      decodeOctahedral(bits(vat, b + bx + by + bz, 22), bytes, 24 * v + 12);
+      info[6 * v + 4] = tag;
+      if (textured) {
+        uvs[12 * v + 10] = (corner & 0xffff) + bits(uvAt, 64 + q * (bu + bv), bu);
+        uvs[12 * v + 11] = (corner >>> 16) + bits(uvAt, 64 + q * (bu + bv) + bu, bv);
+      }
     }
     const mask = (1 << ib) - 1;
     runs.set(i, [k, 3 * tc]);
@@ -207,11 +278,13 @@ function decodePage(gl, model, c, page, data) {
   gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
   gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(0);
-  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 20, 0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
   gl.enableVertexAttribArray(1);
-  gl.vertexAttribPointer(1, 3, gl.BYTE, true, 20, 12);
+  gl.vertexAttribPointer(1, 3, gl.BYTE, true, 24, 12);
   gl.enableVertexAttribArray(2);
-  gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 20, 16);
+  gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 24, 16);
+  gl.enableVertexAttribArray(3);
+  gl.vertexAttribPointer(3, 2, gl.UNSIGNED_SHORT, true, 24, 20);
   const ibo = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index, gl.STATIC_DRAW);
@@ -279,7 +352,8 @@ export async function startLite(canvas, ui) {
   gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAGMENT));
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
-  const loc = { viewProj: gl.getUniformLocation(program, 'view_proj'), mode: gl.getUniformLocation(program, 'mode'), eye: gl.getUniformLocation(program, 'eye') };
+  const loc = { viewProj: gl.getUniformLocation(program, 'view_proj'), mode: gl.getUniformLocation(program, 'mode'), eye: gl.getUniformLocation(program, 'eye'),
+    textured: gl.getUniformLocation(program, 'textured'), albedo: gl.getUniformLocation(program, 'albedo_map') };
   const multiDraw = gl.getExtension('WEBGL_multi_draw');
 
   const state = { yaw: 0.6, pitch: 0.15, distance: 3, threshold: 1, mode: 0, idle: true, dirty: true };
@@ -289,9 +363,11 @@ export async function startLite(canvas, ui) {
     ui.status.textContent = 'loading';
     const model = await fetchModel(stem);
     if (current) for (const b of current.gpu.values()) { gl.deleteVertexArray(b.vao); gl.deleteBuffer(b.vbo); gl.deleteBuffer(b.ibo); }
+    if (current && current.texture) gl.deleteTexture(current.texture.texture);
     const c = unpackClusters(model);
+    const texture = model.texture ? await loadTexture(gl, model.texture, Math.min(2048, gl.getParameter(gl.MAX_TEXTURE_SIZE))) : null;
     const pages = model.pages.map((p, i) => ({ url: model.pagesUrl, offset: p.offset, size: p.size, deps: p.deps, children: p.children, error: p.error, pinned: i === 0 }));
-    current = { model, c, streamer: new Streamer(pages, POOL_BYTES, { maxInFlight: 64 }), gpu: new Map(), stamps: new Uint32Array(pages.length), frame: 0 };
+    current = { model, c, texture, streamer: new Streamer(pages, POOL_BYTES, { maxInFlight: 64 }), gpu: new Map(), stamps: new Uint32Array(pages.length), frame: 0 };
     state.distance = model.bounds[3] * 2.6;
     state.dirty = true;
     ui.full.textContent = model.leafTriangles.toLocaleString('en-US');
@@ -427,6 +503,10 @@ export async function startLite(canvas, ui) {
     gl.uniformMatrix4fv(loc.viewProj, false, viewProj);
     gl.uniform1i(loc.mode, state.mode);
     gl.uniform3fv(loc.eye, eye);
+    gl.uniform1i(loc.textured, current.texture ? 1 : 0);
+    gl.uniform1i(loc.albedo, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, current.texture ? current.texture.texture : null);
     // by page, consecutive runs merged; one multi draw per page where the extension is there.
     const byPage = new Map();
     for (const i of picked.draws) {
