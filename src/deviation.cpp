@@ -116,17 +116,20 @@ struct triangle_grid {
     // distance to the nearest of the seeds' triangles and those around their corners: at least
     // the true distance (so any bound built on it holds), and usually it.
     float nearest_local(vec3 p, const uint32_t (&seeds)[3], uint32_t& which) const {
-        float best_squared = INFINITY;
+        float best = INFINITY, best_squared = INFINITY;
         for (uint32_t s : seeds)
             for (int k = 0; k < 3; ++k)
                 for (uint32_t t : around.at(idx[3 * s + k])) {
+                    const float reach = best + radii[t];
+                    if (squared(p - centres[t]) > reach * reach) continue;  // its sphere is farther
                     const float d = point_triangle_distance_squared(p, pos[idx[3 * t]], pos[idx[3 * t + 1]], pos[idx[3 * t + 2]]);
                     if (d < best_squared) {
                         best_squared = d;
+                        best = std::sqrt(d);
                         which = t;
                     }
                 }
-        return std::sqrt(best_squared);
+        return best;
     }
 
     float distance_to(vec3 p, uint32_t t) const {
@@ -134,9 +137,21 @@ struct triangle_grid {
     }
 };
 
-// every vertex and edge midpoint once, and every triangle centre.
-float one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, const triangle_grid& to) {
-    std::vector<uint32_t> verts(from);
+// each vertex of a mesh, sorted, with its distance to the other and the triangle there.
+struct vertex_nearest {
+    std::vector<uint32_t> verts;
+    std::vector<float> d;
+    std::vector<uint32_t> near;
+    size_t at(uint32_t v) const { return size_t(std::lower_bound(verts.begin(), verts.end(), v) - verts.begin()); }
+};
+
+// every vertex and edge midpoint once, and every triangle centre. the vertices' nearest go
+// to `out` if given.
+float one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, const triangle_grid& to, vertex_nearest* out = nullptr) {
+    vertex_nearest local;
+    vertex_nearest& vn = out ? *out : local;
+    std::vector<uint32_t>& verts = vn.verts;
+    verts = from;
     std::sort(verts.begin(), verts.end());
     verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
     std::vector<uint64_t> edges;
@@ -149,7 +164,12 @@ float one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, c
     std::sort(edges.begin(), edges.end());
     edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
     float worst = 0;
-    for (uint32_t v : verts) worst = std::max(worst, to.nearest(pos[v]));
+    vn.d.resize(verts.size());
+    vn.near.resize(verts.size());
+    for (size_t k = 0; k < verts.size(); ++k) {
+        vn.d[k] = to.nearest(pos[verts[k]], &vn.near[k]);
+        worst = std::max(worst, vn.d[k]);
+    }
     for (uint64_t e : edges) worst = std::max(worst, to.nearest((pos[e >> 32] + pos[e & 0xffffffffu]) * 0.5f));
     for (size_t t = 0; t < from.size(); t += 3)
         worst = std::max(worst, to.nearest((pos[from[t]] + pos[from[t + 1]] + pos[from[t + 2]]) * (1.0f / 3)));
@@ -158,8 +178,8 @@ float one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, c
 
 // an upper bound on the largest distance from `from` to `to`, starting from the sampled one
 // (`worst`, a lower bound).
-float bounded_one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, const triangle_grid& to, float worst,
-                      float slack, float tolerance) {
+float bounded_one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>& from, const triangle_grid& to,
+                      const vertex_nearest& vn, float worst, float slack, float tolerance) {
     struct piece {
         vec3 p[3];
         float d[3];
@@ -168,11 +188,15 @@ float bounded_one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>&
     };
     // over a piece, the distance to one triangle is convex, so largest at a corner, and the
     // distance to the mesh at most that: the corners' nearest triangles are the candidates.
+    // a corner's distance to its own nearest is known, and a triangle nearest two corners is
+    // tried once.
     auto piece_bound = [&](const piece& q) {
         float best = INFINITY;
-        for (uint32_t t : q.near) {
+        for (int j = 0; j < 3; ++j) {
+            const uint32_t t = q.near[j];
+            if ((j > 0 && t == q.near[0]) || (j == 2 && t == q.near[1])) continue;
             float worst = 0;
-            for (int k = 0; k < 3 && worst < best; ++k) worst = std::max(worst, to.distance_to(q.p[k], t));
+            for (int k = 0; k < 3 && worst < best; ++k) worst = std::max(worst, q.near[k] == t ? q.d[k] : to.distance_to(q.p[k], t));
             best = std::min(best, worst);
         }
         return best;
@@ -185,7 +209,9 @@ float bounded_one_way(const std::vector<vec3>& pos, const std::vector<uint32_t>&
         piece first{};
         for (int k = 0; k < 3; ++k) {
             first.p[k] = pos[from[t + k]];
-            first.d[k] = to.nearest(first.p[k], &first.near[k]);
+            const size_t at = vn.at(from[t + k]);
+            first.d[k] = vn.d[at];
+            first.near[k] = vn.near[at];
         }
         stack.push_back(first);
         while (!stack.empty()) {
@@ -233,7 +259,8 @@ float mesh_deviation(const std::vector<vec3>& positions, const std::vector<uint3
     if (a.empty() || b.empty()) return 0;
     const triangle_grid ga(positions, a), gb(positions, b);
     // the samples first: a high lower bound lets most triangles stop at once.
-    const float sampled = std::max(one_way(positions, a, gb), one_way(positions, b, ga));
-    return std::max(bounded_one_way(positions, a, gb, sampled, slack, tolerance),
-                    bounded_one_way(positions, b, ga, sampled, slack, tolerance));
+    vertex_nearest na, nb;
+    const float sampled = std::max(one_way(positions, a, gb, &na), one_way(positions, b, ga, &nb));
+    return std::max(bounded_one_way(positions, a, gb, na, sampled, slack, tolerance),
+                    bounded_one_way(positions, b, ga, nb, sampled, slack, tolerance));
 }
