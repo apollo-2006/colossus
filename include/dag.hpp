@@ -46,7 +46,9 @@ struct lod_cluster {
 struct lod_level_stats {
     size_t clusters = 0, triangles = 0, groups = 0, stuck_groups = 0;
     float max_error = 0;
+    uint32_t unused = 0;  // files store this struct: no stray padding bytes
 };
+static_assert(sizeof(lod_level_stats) == 40, "web/split.py reads 40 bytes a level");
 
 // texture coordinates ride on wedges: a vertex as one texture chart sees it. simplification
 // keeps them exact (a corner only ever takes a wedge of its own chart: see simplify()), so
