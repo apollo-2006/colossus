@@ -350,5 +350,11 @@ void main() {
         }
         color = mix(color, sky(s.dir), 1.0 - exp(-s.t * 0.012));
     }
+    // coverage (view 10, not on a key): white where a model is drawn, black elsewhere, for
+    // measuring how far a cut's silhouettes stray from full detail (docs/quality.py).
+    if (frame.debug_mode == 10u) {
+        imageStore(out_image, ivec2(px), vec4(vec3(s.kind == surface_object ? 1.0 : 0.0), 1.0));
+        return;
+    }
     imageStore(out_image, ivec2(px), vec4(aces(color), 1.0));
 }
