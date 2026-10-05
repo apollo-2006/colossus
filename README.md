@@ -64,6 +64,17 @@ triangles) take 1.79 ms, and instances can move and sway.
   vertex clustering takes over there, keeping duplicate triangles and hole vertices so
   the crack check still holds. lucy now ends in one root of 20 triangles, the dragon in
   one of 32.
+* **texture coordinates.** a textured obj's corners become wedges: a vertex as one texture
+  chart sees it, so a vertex on a seam has one per chart. a collapse moves each corner onto
+  the kept vertex's wedge in the same chart and is refused where there is none, so seams
+  only slide along themselves and every level's coordinates are the original's, exactly.
+  a photogrammetry atlas has hundreds of small charts, which pins that rule down: the
+  washington scan below stalled at 28 thousand triangles with every group stuck. a stuck
+  group retries with its seams free to move, a corner then keeping its coordinates on a
+  new wedge at the kept vertex. positions are still shared, so still no cracks, and the
+  texture slips across the seam by no more than the collapse moved, which the error
+  already counts. clusters count wedges against their 128 vertex limit. the scan builds
+  in 4.7 minutes and 4 gb of memory, 17 million triangles over 20 levels.
 
 ### drawing it (`colossus`)
 
@@ -115,6 +126,12 @@ triangles) take 1.79 ms, and instances can move and sway.
    frames. sunlit ground warms the statues' shadow sides and light carries into the folds.
    0.17 ms; `--no-bounce` or b. with ray traced shadows (`--shadows rt`) the ground's
    shadows are rays too.
+
+   a textured model's colour comes from its texture instead. the neighbouring pixels'
+   rays meet the same triangle's plane for the texture coordinates' change across a pixel,
+   which picks the mip level; texels are decoded by hand from the page pool (below) and
+   blended bilinear within a level and linear between two. on the scan it shades in 0.61
+   ms where the procedural marble took 0.78.
 
    screen space only sees the screen: what's off it or behind something bounces nothing,
    and the ground, in no depth buffer, receives nothing from the statues. on gpus with
@@ -191,6 +208,18 @@ triangles) take 1.79 ms, and instances can move and sway.
    same grid point in each cluster, so quantizing opens no cracks. lucy's pages went
    from 460 mb to 337, the dragon's from 119 to 90.
 
+   textures stream through the same pool (`include/texture_file.hpp`,
+   `viewer/shaders/texture.glsl`). `colossus_build` cuts each mip level into tiles of
+   128x128 texels, 120 of the level and a 4 texel border so bilinear filtering never
+   leaves a tile, bc1 compressed (8 kb a tile; the washington scan's 4096x4096 texture is
+   1,669 tiles, 13 mb). each tile is a page whose dependency is the tile one level
+   coarser over it, so the rule above keeps every resident tile's coarser copies resident
+   and the coarsest is pinned: a missing tile asks to be loaded and the finest resident
+   copy draws meanwhile, its priority doubling with each level coarser. textured
+   clusters add their coordinates after their vertices: the cluster's corner on a 65535
+   step grid and offsets in just the bits its spread needs, 32% more page data on the
+   test sphere.
+
    the crowd above reads about 20 mb. a 300 frame flight with a 16 mb pool evicts 15,029
    pages and reads 114 mb in 7,552 reads, and at frames 100, 200 and 300 shows about as
    many isolated empty pixels as a 1 gb pool (140 and 140, 109 and 110, 55 and 53, of
@@ -250,6 +279,12 @@ nearest surfaces are worth the hardware.
 one lucy in each material (`--materials marble` and so on): veined marble, layered
 sandstone, bronze greening in its folds, hammered gold, granite.
 
+![horatio greenough's george washington, scanned by the smithsonian, close up in its own texture](docs/washington.png)
+
+horatio greenough's george washington (1840), the smithsonian american art museum's scan:
+17 million triangles and a 4096x4096 texture, in its own marble and staining. 0.95 ms at
+1600x1000.
+
 ## in the browser
 
 `web/` is the renderer in webgpu, which has no mesh shaders, 64-bit atomics, ray queries
@@ -303,13 +338,16 @@ git clone https://github.com/apollo-2006/colossus.git
 cd colossus
 make
 models/fetch.sh            # downloads lucy and the dragon (380 mb) and builds both
+models/fetch.sh washington # the textured scan (720 mb, needs ffmpeg for its texture)
 
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30
 ./colossus --model models/lucy.cgeo                       # one lucy
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 1000 --moving 0.01
 ./colossus --model models/lucy.cgeo --model models/xyzrgb_dragon.cgeo --grid 30 --deforming 0.2
 ./colossus --model models/lucy.cgeo --materials bronze    # one lucy, in bronze
+./colossus --model models/washington.cgeo                 # textured
 ./colossus_build any.ply out.cgeo --check                 # your own model, checked for cracks
+./colossus_build any.obj out.cgeo --texture t.ppm         # textured (writes out.ctex too)
 ```
 
 | keys | |
@@ -334,11 +372,14 @@ make test
 
 `tests/builder_test.cpp` needs no gpu or downloads: ply and obj reading, welding,
 cluster limits, the simplifier's locks and flips, and full hierarchies for a closed
-sphere, a holed sphere and a flat grid, crack-checked at 31 cuts, paged, written and read
+sphere, a holed sphere and a flat grid, crack-checked at 31 cuts, and the holed sphere
+textured in 8 charts (every coordinate exact, no triangle across two) and in 216 (seams
+moved, still one chart a triangle), paged, written and read
 back exactly, shared vertices identical from every cluster. without the group locks, the
 crack check finds 39,095 cracked edges on the closed sphere alone. it also checks the
 proven error against brute force on about 94,000 random points, and that packed normal
-cones never cull a view the exact cone keeps.
+cones never cull a view the exact cone keeps, and that bc1 tiles match their image,
+borders included.
 
 `tests/streamer_test.cpp` runs 3,000 frames of random requests into a pool a tenth of a
 model (synchronous, loader threads, loader threads with prefetch), checking after every
@@ -382,8 +423,9 @@ messages have every step's numbers.
   at coarse levels), and ray traced shadows bend swaying statues only to a chord.
 * shadow pages draw from streamed geometry too, so shadows sharpen with everything else,
   and a page that finds the pool full falls back a level.
-* materials are procedural, chosen per instance: there are no texture maps, since the
-  scans have no uvs.
+* a texture is colour only, one per model: no normal or roughness maps. where seams had
+  to move, the texture can slip across them by up to the cluster's error. the browser
+  port draws no textures yet.
 * bounce light is a single bounce. by default it comes off the ground and what's on
   screen; `--gi rt` reaches everything but needs ray queries, traces the coarse shadow
   copies and costs 0.5 to 0.6 ms more. the browser has the screen space kind only.
@@ -393,4 +435,6 @@ messages have every step's numbers.
 lucy and the xyz rgb asian dragon come from the
 [stanford 3d scanning repository](http://graphics.stanford.edu/data/3Dscanrep/), with
 thanks to the stanford computer graphics laboratory (and xyz rgb inc. for the dragon).
-they aren't redistributed here; `models/fetch.sh` downloads them.
+they aren't redistributed here; `models/fetch.sh` downloads them. horatio greenough's
+george washington is the [smithsonian american art museum](https://americanart.si.edu)'s
+scan, released cc0 through [smithsonian open access](https://3d.si.edu).

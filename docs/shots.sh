@@ -16,6 +16,10 @@ for m in marble sandstone bronze gold granite; do
 done
 python3 docs/strip.py docs/materials.png 610 150 380 620 /tmp/colossus_{marble,sandstone,bronze,gold,granite}.png
 rm -f /tmp/colossus_{marble,sandstone,bronze,gold,granite}.png
+# the textured scan, if fetched (models/fetch.sh washington).
+if [[ -f models/washington.cgeo ]]; then
+  shot --model models/washington.cgeo --camera 0.32,0.78,0.0,-1.5708,-0.05 --screenshot docs/washington.png
+fi
 python3 docs/recompress.py docs/*.png
 # the web demo's fallback frames, when imagemagick or ffmpeg is around.
 if command -v convert >/dev/null || command -v ffmpeg >/dev/null; then web/gallery.sh; fi
