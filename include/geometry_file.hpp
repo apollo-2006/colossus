@@ -43,6 +43,7 @@ struct geometry {
     std::vector<uint32_t> wedge_vertex;
     std::vector<vec2> wedge_uvs;
     std::string texture;
+    std::vector<uint8_t> skin_joints, skin_weights;  // per vertex, four each, if skinned
     std::vector<uint32_t> cluster_vertices;  // wedges
     std::vector<uint32_t> cluster_triangles;  // a | b << 8 | c << 16
     std::vector<lod_level_stats> levels;
@@ -51,6 +52,7 @@ struct geometry {
 
     size_t leaf_triangles() const;
     bool textured() const { return !wedge_uvs.empty(); }
+    bool skinned() const { return !skin_weights.empty(); }
     uint32_t vertex_of(uint32_t wedge) const { return wedge_vertex.empty() ? wedge : wedge_vertex[wedge]; }
 };
 

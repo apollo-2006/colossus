@@ -50,7 +50,8 @@ struct collapse {
 }  // namespace
 
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                         const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w) {
+                         const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w,
+                         const std::vector<std::vector<vec3>>* poses) {
     simplify_result out;
     const size_t n = indices.size() / 3;
     if (n <= target_triangles) {
@@ -115,6 +116,23 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
         const quadric plane = quadric::plane(nx, ny, nz, -(nx * p.x + ny * p.y + nz * p.z), 0.5 * len);
         for (int c = 0; c < 3; ++c) q[tri[3 * t + c]] += plane;
     }
+    // posed: local positions and quadrics per pose, pose k's at index k * nv.
+    const size_t pose_count = poses ? poses->size() : 0;
+    std::vector<vec3> posed(pose_count * nv);
+    std::vector<quadric> posed_q(pose_count * nv);
+    for (size_t k = 0; k < pose_count; ++k) {
+        vec3* pp = &posed[k * nv];
+        for (size_t v = 0; v < nv; ++v) pp[v] = (*poses)[k][verts[v]];
+        for (size_t t = 0; t < n; ++t) {
+            const vec3 a = pp[tri[3 * t]], b = pp[tri[3 * t + 1]], c = pp[tri[3 * t + 2]];
+            const vec3 fn = cross(b - a, c - a);
+            const double len = length(fn);
+            if (len <= 0) continue;
+            const double nx = fn.x / len, ny = fn.y / len, nz = fn.z / len;
+            const quadric plane = quadric::plane(nx, ny, nz, -(nx * a.x + ny * a.y + nz * a.z), 0.5 * len);
+            for (int corner = 0; corner < 3; ++corner) posed_q[k * nv + tri[3 * t + corner]] += plane;
+        }
+    }
 
     // edges, once each, with use counts. an edge used once is a border: a plane
     // through it, perpendicular to its triangle, keeps collapses from pulling
@@ -156,10 +174,17 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
     std::vector<uint8_t> tri_alive(n, 1);
     std::priority_queue<collapse, std::vector<collapse>, std::greater<collapse>> heap;
 
+    // the rest pose's mean squared distance, or posed, the worst pose's.
     auto cost_of = [&](uint32_t from, uint32_t to) {
         quadric sum = q[from];
         sum += q[to];
-        return sum.error(pos[to]) / std::max(sum.weight, 1e-30);
+        double cost = sum.error(pos[to]) / std::max(sum.weight, 1e-30);
+        for (size_t k = 0; k < pose_count; ++k) {
+            quadric ps = posed_q[k * nv + from];
+            ps += posed_q[k * nv + to];
+            cost = std::max(cost, ps.error(posed[k * nv + to]) / std::max(ps.weight, 1e-30));
+        }
+        return cost;
     };
     auto push_edge = [&](uint32_t a, uint32_t b) {
         const bool ab = !fixed[a], ba = !fixed[b];
@@ -274,6 +299,7 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
         }
         vertex_tris[from].clear();
         q[to] += q[from];
+        for (size_t k = 0; k < pose_count; ++k) posed_q[k * nv + to] += posed_q[k * nv + from];
         ++version[from];
         ++version[to];
 

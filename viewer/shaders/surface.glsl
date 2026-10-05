@@ -69,10 +69,10 @@ Surface surface_at(uvec2 px) {
     const uint base = page_table[c.group];
     const uint packed = cluster_triangle(base, c, s.id & 127u);
     const uint i0 = packed & 255u, i1 = (packed >> 8) & 255u, i2 = (packed >> 16) & 255u;
-    const vec4 grid = meshes[inst.mesh].grid, bounds = meshes[inst.mesh].bounds;
-    s.p0 = to_world(inst, deform(inst, bounds, cluster_position(base, c, grid, i0), frame.time));
-    s.p1 = to_world(inst, deform(inst, bounds, cluster_position(base, c, grid, i1), frame.time));
-    s.p2 = to_world(inst, deform(inst, bounds, cluster_position(base, c, grid, i2), frame.time));
+    const vec4 bounds = meshes[inst.mesh].bounds;
+    s.p0 = to_world(inst, drawn_vertex(inst, base, c, i0));
+    s.p1 = to_world(inst, drawn_vertex(inst, base, c, i1));
+    s.p2 = to_world(inst, drawn_vertex(inst, base, c, i2));
 
     // ray against the triangle's plane (moller-trumbore, no bounds checks: the
     // rasterizer said it hits).
@@ -94,7 +94,13 @@ Surface surface_at(uvec2 px) {
     const vec3 forward = normalize(center.xyz / center.w - origin);
     s.t = frame.near_z / uintBitsToFloat(uint(v >> 32)) / dot(s.dir, forward);
     s.hit = origin + s.dir * s.t;
-    const vec3 model_n = cluster_normal(base, c, i0) * (1.0 - bu - bv) + cluster_normal(base, c, i1) * bu + cluster_normal(base, c, i2) * bv;
+    vec3 n0 = cluster_normal(base, c, i0), n1 = cluster_normal(base, c, i1), n2 = cluster_normal(base, c, i2);
+    if (skinned(inst)) {  // each vertex's normal turned by its joints
+        n0 = skin_dir(inst, base, c, i0, n0);
+        n1 = skin_dir(inst, base, c, i1, n1);
+        n2 = skin_dir(inst, base, c, i2, n2);
+    }
+    const vec3 model_n = n0 * (1.0 - bu - bv) + n1 * bu + n2 * bv;
     s.n = normalize(to_world_dir(inst, deform_normal(inst, bounds, from_world(inst, s.hit), model_n, frame.time)));
     s.behind = dot(s.n, s.dir) > 0.0;
     if (s.behind) s.n = -s.n;

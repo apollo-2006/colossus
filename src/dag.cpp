@@ -262,12 +262,36 @@ void cluster_bounds(const std::vector<vec3>& positions, lod_cluster& c) {
     }
 }
 
-lod_mesh build_lod(const mesh& m, bool verbose) {
+lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<float>>& poses) {
     const auto start = std::chrono::steady_clock::now();
     lod_mesh out;
     out.positions = m.positions;
     out.normals = vertex_normals(m);
+    out.skin_joints = m.skin_joints;
+    out.skin_weights = m.skin_weights;
     std::vector<uint32_t> corners = make_wedges(m, out);
+    // skinned: the mesh posed. every pose measures errors; every fourth (the rest pose first)
+    // also prices collapses (simplify()).
+    auto pose_mesh = [&](const std::vector<float>& rows) {
+        std::vector<vec3> at(out.positions.size());
+        for (size_t v = 0; v < at.size(); ++v) {
+            const vec3 p = out.positions[v];
+            vec3 q(0, 0, 0);
+            for (int k = 0; k < 4; ++k) {
+                const float w = m.skin_weights[4 * v + k] / 255.0f;
+                if (w == 0) continue;
+                const float* r = &rows[12 * size_t(m.skin_joints[4 * v + k])];
+                q += vec3(r[0] * p.x + r[1] * p.y + r[2] * p.z + r[3], r[4] * p.x + r[5] * p.y + r[6] * p.z + r[7],
+                          r[8] * p.x + r[9] * p.y + r[10] * p.z + r[11]) * w;
+            }
+            at[v] = q;
+        }
+        return at;
+    };
+    std::vector<std::vector<vec3>> pricing;
+    if (m.skinned())
+        for (size_t k = 0; k < poses.size(); k += 4) pricing.push_back(pose_mesh(poses[k]));
+    const std::vector<std::vector<vec3>>* priced = pricing.empty() ? nullptr : &pricing;
 
     auto make_clusters = [&](const std::vector<uint32_t>& indices, const std::vector<uint32_t>& corner_list,
                              std::vector<lod_cluster>& dst) {
@@ -357,11 +381,11 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 return;
             }
             wedges w{merged_corners, out.wedge_chart, out.wedge_vertex, out.wedge_uvs};
-            simplify_result s = simplify(out.positions, merged, locked, tris / 2, &w);
+            simplify_result s = simplify(out.positions, merged, locked, tris / 2, &w, priced);
             // seams of many small texture charts can pin a group: let them move.
             if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && !out.wedge_uvs.empty()) {
                 w.relax = true;
-                s = simplify(out.positions, merged, locked, tris / 2, &w);
+                s = simplify(out.positions, merged, locked, tris / 2, &w, priced);
             }
             if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && last)
                 s = cluster_vertices(out.positions, merged, std::max<size_t>(tris / 2, 1), &w);
@@ -375,7 +399,7 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
             // coincide, flat parts, a bound cannot reach 0).
             float sampled = sampled_deviation(out.positions, merged, s.indices);
             if (sampled > outlier_ratio * s.error) {
-                simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4, &w);
+                simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4, &w, priced);
                 if (!gentle.indices.empty() && gentle.indices.size() / 3 <= stuck_ratio * tris) {
                     const float gentle_sampled = sampled_deviation(out.positions, merged, gentle.indices);
                     if (gentle_sampled < sampled) {
@@ -385,7 +409,33 @@ lod_mesh build_lod(const mesh& m, bool verbose) {
                 }
             }
             const float measured = mesh_deviation(out.positions, merged, s.indices, 0.1f, bounds.radius * 1e-6f);
-            const float error = child_error + std::max(s.error, measured);
+            // skinned: the same two surfaces in every pose.
+            float posed = 0;
+            if (!poses.empty() && m.skinned()) {
+                std::vector<uint32_t> local_merged(merged), local_simplified(s.indices), verts(merged);
+                std::sort(verts.begin(), verts.end());
+                verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+                auto local = [&](uint32_t v) { return uint32_t(std::lower_bound(verts.begin(), verts.end(), v) - verts.begin()); };
+                for (uint32_t& v : local_merged) v = local(v);
+                for (uint32_t& v : local_simplified) v = local(v);
+                std::vector<vec3> at(verts.size());
+                for (const std::vector<float>& rows : poses) {
+                    for (size_t i = 0; i < verts.size(); ++i) {
+                        const vec3 p = out.positions[verts[i]];
+                        vec3 q(0, 0, 0);
+                        for (int k = 0; k < 4; ++k) {
+                            const float w = m.skin_weights[4 * size_t(verts[i]) + k] / 255.0f;
+                            if (w == 0) continue;
+                            const float* r = &rows[12 * size_t(m.skin_joints[4 * size_t(verts[i]) + k])];
+                            q += vec3(r[0] * p.x + r[1] * p.y + r[2] * p.z + r[3], r[4] * p.x + r[5] * p.y + r[6] * p.z + r[7],
+                                      r[8] * p.x + r[9] * p.y + r[10] * p.z + r[11]) * w;
+                        }
+                        at[i] = q;
+                    }
+                    posed = std::max(posed, sampled_deviation(at, local_merged, local_simplified));
+                }
+            }
+            const float error = child_error + std::max({s.error, measured, posed});
             make_clusters(s.indices, s.corners, made[g]);
             made_wedges[g] = std::move(s.new_wedges);
             for (lod_cluster& c : made[g]) {

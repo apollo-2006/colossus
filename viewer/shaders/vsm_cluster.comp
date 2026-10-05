@@ -20,15 +20,16 @@ void main() {
     if (cluster >= m.first_cluster + m.cluster_count) return;
     const Cluster c = load_cluster(cluster);
     const float texel = vsm_texel(level);
-    const float stretch = deform_stretch_of(inst);
-    const float self_error = c.lod_error * inst.scale * stretch / texel;
-    const bool coarse_enough = c.parent_error * inst.scale * stretch / texel > frame.lod_threshold;
+    // errors grown as lod_test() grows them (common.glsl); a texel is the same size everywhere.
+    const float self_error = grown_error(inst, c.lod_error) * inst.scale / texel;
+    const bool coarse_enough = grown_error(inst, c.parent_error) * inst.scale / texel > frame.lod_threshold;
     const bool finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
     const bool wants_finer = self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
     const bool loaded = page_table[c.group] != NO_PAGE;
     if (!coarse_enough || (self_error > frame.lod_threshold && finer_resident)) return;
-    const vec2 center = vsm_light_space(to_world(inst, c.center)).xy;
-    const float radius = (c.radius + deform_reach_of(inst)) * inst.scale;
+    const vec4 drawn = drawn_sphere(inst, c.group, c.center, c.radius);
+    const vec2 center = vsm_light_space(to_world(inst, drawn.xyz)).xy;
+    const float radius = drawn.w * inst.scale;
     if (!vsm_touches(layer, level, center, radius)) return;
     // a stand-in, or unloaded (in the first frames, even the roots): its pages
     // are unfinished, render them again next frame.

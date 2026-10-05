@@ -26,6 +26,8 @@ geometry pack(const lod_mesh& lod) {
     g.positions.reserve(3 * lod.positions.size());
     for (const vec3& p : lod.positions) g.positions.insert(g.positions.end(), {p.x, p.y, p.z});
     for (const vec3& n : lod.normals) g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
+    g.skin_joints = lod.skin_joints;
+    g.skin_weights = lod.skin_weights;
     if (!lod.wedge_uvs.empty()) {
         g.wedge_vertex = lod.wedge_vertex;
         g.wedge_uvs = lod.wedge_uvs;
@@ -133,6 +135,11 @@ geometry trim(const geometry& g, size_t max_triangles) {
                 const size_t src = 3 * size_t(g.vertex_of(w));
                 out.positions.insert(out.positions.end(), &g.positions[src], &g.positions[src + 3]);
                 out.normals.insert(out.normals.end(), &g.normals[src], &g.normals[src + 3]);
+                if (g.skinned()) {
+                    const size_t sv = 4 * size_t(g.vertex_of(w));
+                    out.skin_joints.insert(out.skin_joints.end(), &g.skin_joints[sv], &g.skin_joints[sv + 4]);
+                    out.skin_weights.insert(out.skin_weights.end(), &g.skin_weights[sv], &g.skin_weights[sv + 4]);
+                }
             }
             if (!g.textured()) {
                 out.cluster_vertices.push_back(v);

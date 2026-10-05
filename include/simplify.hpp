@@ -47,8 +47,13 @@ struct wedges {
 // outlines fixed. refuses flips and link-condition violations. border vertices
 // only slide along the border, where planes through each border edge price
 // moving the outline.
+//
+// with poses (each a full set of positions, the mesh posed: a skinned mesh's animations), each
+// vertex also carries a quadric per pose, of its triangles posed, and a collapse costs what
+// it costs in every pose (mohr and gleicher 2003): flat in the rest pose isn't flat when bent.
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
-                         const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w = nullptr);
+                         const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w = nullptr,
+                         const std::vector<std::vector<vec3>>* poses = nullptr);
 
 // vertex clustering (rossignac and borrel): each vertex snaps to one vertex of
 // its grid cell, the grid coarsened until at most target_triangles remain;

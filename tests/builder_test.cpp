@@ -10,6 +10,8 @@
 #include "paged_file.hpp"
 #include "simplify.hpp"
 #include "texture_file.hpp"
+#include "gltf.hpp"
+#include "skeleton.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -407,6 +409,161 @@ void test_texture() {
     CHECK(worst <= 12);
 }
 
+std::string base64_of(const std::string& bytes) {
+    static const char* d = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    for (size_t i = 0; i < bytes.size(); i += 3) {
+        uint32_t v = uint8_t(bytes[i]) << 16 | (i + 1 < bytes.size() ? uint8_t(bytes[i + 1]) << 8 : 0) |
+                     (i + 2 < bytes.size() ? uint8_t(bytes[i + 2]) : 0);
+        out += d[v >> 18 & 63];
+        out += d[v >> 12 & 63];
+        out += i + 1 < bytes.size() ? d[v >> 6 & 63] : '=';
+        out += i + 2 < bytes.size() ? d[v & 63] : '=';
+    }
+    return out;
+}
+
+// a skinned gltf: a bar along x from 0 to 2, two triangles a unit square, joint 0 at the
+// origin and joint 1 (its child) at x = 1; points left of 1 follow joint 0, right of it
+// joint 1, those at 1 both. joint 1 turns a quarter about z over one second.
+std::string bent_bar_gltf() {
+    std::vector<float> pos, wts;
+    std::vector<uint16_t> jts;
+    std::vector<uint16_t> idx;
+    for (int x = 0; x <= 2; ++x)
+        for (int y = 0; y <= 1; ++y) {
+            pos.insert(pos.end(), {float(x), float(y), 0});
+            jts.insert(jts.end(), {0, 1, 0, 0});
+            const float w1 = x == 0 ? 0.0f : x == 1 ? 0.5f : 1.0f;
+            wts.insert(wts.end(), {1 - w1, w1, 0, 0});
+        }
+    for (uint16_t x = 0; x < 2; ++x) {
+        const uint16_t a = 2 * x, b = a + 1, c = a + 2, e = a + 3;
+        idx.insert(idx.end(), {a, c, b, b, c, e});
+    }
+    const float ibm[32] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
+                           1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 1};
+    const float times[2] = {0, 1};
+    const float rot[8] = {0, 0, 0, 1, 0, 0, 0.70710678f, 0.70710678f};
+    std::string bin;
+    auto add = [&](const void* p, size_t n) { size_t at = bin.size(); bin.append(static_cast<const char*>(p), n); while (bin.size() % 4) bin += char(0); return at; };
+    const size_t o_pos = add(pos.data(), pos.size() * 4), o_jts = add(jts.data(), jts.size() * 2), o_wts = add(wts.data(), wts.size() * 4),
+                 o_idx = add(idx.data(), idx.size() * 2), o_ibm = add(ibm, sizeof ibm), o_t = add(times, sizeof times), o_r = add(rot, sizeof rot);
+    char json[4096];
+    std::snprintf(json, sizeof json, R"({
+  "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0, 2]}],
+  "nodes": [{"name": "j0", "children": [1]}, {"name": "j1", "translation": [1, 0, 0]}, {"mesh": 0, "skin": 0}],
+  "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2}, "indices": 3}]}],
+  "skins": [{"joints": [0, 1], "inverseBindMatrices": 4}],
+  "animations": [{"name": "bend", "channels": [{"sampler": 0, "target": {"node": 1, "path": "rotation"}}],
+                  "samplers": [{"input": 5, "output": 6}]}],
+  "buffers": [{"byteLength": %zu, "uri": "data:application/octet-stream;base64,%s"}],
+  "bufferViews": [{"buffer": 0, "byteOffset": %zu, "byteLength": 72}, {"buffer": 0, "byteOffset": %zu, "byteLength": 48},
+                  {"buffer": 0, "byteOffset": %zu, "byteLength": 96}, {"buffer": 0, "byteOffset": %zu, "byteLength": 24},
+                  {"buffer": 0, "byteOffset": %zu, "byteLength": 128}, {"buffer": 0, "byteOffset": %zu, "byteLength": 8},
+                  {"buffer": 0, "byteOffset": %zu, "byteLength": 32}],
+  "accessors": [{"bufferView": 0, "componentType": 5126, "count": 6, "type": "VEC3"},
+                {"bufferView": 1, "componentType": 5123, "count": 6, "type": "VEC4"},
+                {"bufferView": 2, "componentType": 5126, "count": 6, "type": "VEC4"},
+                {"bufferView": 3, "componentType": 5123, "count": 12, "type": "SCALAR"},
+                {"bufferView": 4, "componentType": 5126, "count": 2, "type": "MAT4"},
+                {"bufferView": 5, "componentType": 5126, "count": 2, "type": "SCALAR"},
+                {"bufferView": 6, "componentType": 5126, "count": 2, "type": "VEC4"}]
+})", bin.size(), base64_of(bin).c_str(), o_pos, o_jts, o_wts, o_idx, o_ibm, o_t, o_r);
+    return json;
+}
+
+vec3 apply_rows(const float* r, vec3 p) {
+    return {r[0] * p.x + r[1] * p.y + r[2] * p.z + r[3], r[4] * p.x + r[5] * p.y + r[6] * p.z + r[7],
+            r[8] * p.x + r[9] * p.y + r[10] * p.z + r[11]};
+}
+
+vec3 skinned(const mesh& m, const std::vector<float>& rows, size_t v) {
+    vec3 out(0, 0, 0);
+    for (int k = 0; k < 4; ++k)
+        out += apply_rows(&rows[12 * m.skin_joints[4 * v + k]], m.positions[v]) * (m.skin_weights[4 * v + k] / 255.0f);
+    return out;
+}
+
+// gltf reading and posing: the rest pose is the identity, joint 1's quarter turn bends the
+// bar's right end up, the same once the model is placed (joints conjugated), and the skin
+// survives subdivision, the hierarchy and pages, its page bounds only growing to the roots.
+void test_skinning() {
+    std::printf("skinning\n");
+    const std::string path = temp_path("bar.gltf");
+    std::ofstream(path) << bent_bar_gltf();
+    skeleton sk;
+    mesh m = load_mesh(path, &sk);
+    CHECK(m.skinned() && m.positions.size() == 6 && m.triangle_count() == 4);
+    CHECK(sk.joints.size() == 2 && sk.animations.size() == 1 && sk.animations[0].duration == 1);
+    std::vector<float> rows;
+    pose_joints(sk, -1, 0, rows);
+    float worst = 0;
+    for (size_t v = 0; v < m.positions.size(); ++v) worst = std::max(worst, length(skinned(m, rows, v) - m.positions[v]));
+    CHECK(worst < 1e-5f);
+    pose_joints(sk, 0, 1 - 1e-6f, rows);  // the turn's end (time wraps at the duration)
+    // (2, 0) follows joint 1 alone: turned a quarter about (1, 0) to (1, 1); (1, y) stays.
+    CHECK(length(skinned(m, rows, 4) - vec3(1, 1, 0)) < 1e-3f);
+    CHECK(length(skinned(m, rows, 2) - m.positions[2]) < 1e-3f);
+
+    weld(m);
+    for (int k = 0; k < 3; ++k) subdivide(m);
+    CHECK(m.skinned() && m.skin_weights.size() == 4 * m.positions.size());
+    bool sums = true;
+    for (size_t v = 0; v < m.positions.size(); ++v)
+        sums &= m.skin_weights[4 * v] + m.skin_weights[4 * v + 1] + m.skin_weights[4 * v + 2] + m.skin_weights[4 * v + 3] == 255;
+    CHECK(sums);
+    // placed: every vertex posed then placed is the placed vertex posed with conjugated joints.
+    pose_joints(sk, 0, 0.6f, rows);
+    std::vector<vec3> posed(m.positions.size());
+    for (size_t v = 0; v < posed.size(); ++v) posed[v] = skinned(m, rows, v);
+    sk.place = normalize_placement(m, false);
+    pose_joints(sk, 0, 0.6f, rows);
+    float placed_worst = 0;
+    for (size_t v = 0; v < posed.size(); ++v)
+        placed_worst = std::max(placed_worst, length(skinned(m, rows, v) - (posed[v] - sk.place.base) * sk.place.scale));
+    CHECK(placed_worst < 1e-5f);
+
+    const lod_mesh lod = build_lod(m, false);
+    const geometry g = pack(lod);
+    const paged_geometry pg = page(g);
+    CHECK(pg.skin.size() == pg.pages.size());
+    size_t shrinking = 0, wrong = 0;
+    for (const gpu_cluster& c : pg.clusters) {
+        if (c.creator == no_page) continue;
+        const page_skin &fine = pg.skin[c.creator], &coarse = pg.skin[c.group];
+        shrinking += (fine.joints & ~coarse.joints) != 0;
+    }
+    // every vertex's joints and weights out of its page as they went in.
+    std::map<uint32_t, uint32_t> page_start;
+    for (size_t i = 0; i < pg.clusters.size(); ++i) {
+        const gpu_cluster& c = g.clusters[i];
+        const uint32_t* base = &pg.data[pg.pages[pg.clusters[i].group].offset / 4];
+        for (uint32_t k = 0; k < c.vertex_count; ++k) {
+            uint32_t j, w;
+            decode_skin(pg.clusters[i], base, k, j, w);
+            const size_t v = 4 * size_t(g.vertex_of(g.cluster_vertices[c.vertex_offset + k]));
+            for (int a = 0; a < 4; ++a) wrong += (j >> (8 * a) & 255) != g.skin_joints[v + a] || (w >> (8 * a) & 255) != g.skin_weights[v + a];
+        }
+        // its page's joints cover its vertices.
+        for (uint32_t k = 0; k < c.vertex_count; ++k) {
+            const size_t v = 4 * size_t(g.vertex_of(g.cluster_vertices[c.vertex_offset + k]));
+            for (int a = 0; a < 4; ++a)
+                if (g.skin_weights[v + a]) wrong += !(pg.skin[pg.clusters[i].group].joints >> g.skin_joints[v + a] & 1);
+        }
+    }
+    std::printf("  %zu triangles, %zu pages; skin bounds shrinking toward the roots: %zu, skin data wrong: %zu\n",
+                m.triangle_count(), pg.pages.size(), shrinking, wrong);
+    CHECK(shrinking == 0);
+    CHECK(wrong == 0);
+    // the file round trip.
+    sk.pages = pg.skin;
+    save_skeleton(sk, temp_path("bar.cskn"));
+    const skeleton back = load_skeleton(temp_path("bar.cskn"));
+    CHECK(back.joints == sk.joints && back.pages.size() == sk.pages.size() && back.animations.size() == 1 &&
+          back.animations[0].channels[0].values == sk.animations[0].channels[0].values);
+}
+
 }  // namespace
 
 // packed normal cones (packed_cluster) never cull what the exact cone keeps: the culling test
@@ -488,6 +645,7 @@ void test_deviation_bound() {
 }
 
 int main() {
+    test_skinning();
     test_texture();
     test_deviation_bound();
     test_packed_cones();

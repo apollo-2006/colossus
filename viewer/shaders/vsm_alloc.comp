@@ -43,14 +43,15 @@ void render_new(uint slot) {
 
 // the fastest any point of a moving instance goes, world units a second: animate()'s turn (0.7
 // rad/s about its origin) and drift (0.2 round a circle at 0.9 rad/s), deform()'s sway and
-// ripple (at most 1.3 a + 2.2 b of the radius a second).
+// ripple (at most 1.3 a + 2.2 b of the radius a second), and a skinned pose's fastest point.
 float mover_speed(Instance inst, Mesh m) {
     float speed = 0.0;
     if ((inst.anim & 512u) != 0u) {
         const vec3 origin = vec3(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
-        speed += 0.7 * (length(to_world(inst, m.bounds.xyz) - origin) + (m.bounds.w + deform_reach_of(inst)) * inst.scale) + 0.18;
+        speed += 0.7 * (length(to_world(inst, m.bounds.xyz) - origin) + instance_sphere(inst, m.bounds, false).w * inst.scale) + 0.18;
     }
-    if (deforming(inst)) speed += (1.3 * deform_a + 2.2 * deform_b) * m.bounds.w * inst.scale;
+    if (skinned(inst)) speed += pose_info[pose_slot(inst)].z * inst.scale;
+    else if (deforming(inst)) speed += (1.3 * deform_a + 2.2 * deform_b) * m.bounds.w * inst.scale;
     return speed;
 }
 
@@ -90,10 +91,13 @@ void main() {
         const uint i = moving_instances[group];
         const Instance now = load_instance(i), then = load_prev_instance(i);
         const Mesh m = meshes[now.mesh];
-        const float radius = (m.bounds.w + deform_reach_of(now)) * now.scale;
+        const vec4 sphere = instance_sphere(now, m.bounds, false);
+        const float radius = sphere.w * now.scale;
         const float speed = mover_speed(now, m);
-        invalidate(to_world(then, m.bounds.xyz), radius, speed, gl_LocalInvocationIndex);
-        invalidate(to_world(now, m.bounds.xyz), radius, speed, gl_LocalInvocationIndex);
+        // skinned: the sphere grown by a step of the speed (invalidate()) already holds last
+        // frame's.
+        if (!skinned(now)) invalidate(to_world(then, m.bounds.xyz), radius, speed, gl_LocalInvocationIndex);
+        invalidate(to_world(now, sphere.xyz), radius, speed, gl_LocalInvocationIndex);
     } else if (push.level == 0u) {
         if (k >= vsm_slots) return;
         const VsmEntry e = vsm_entries[k];

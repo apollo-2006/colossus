@@ -19,6 +19,11 @@
 // word u0 | v0 << 16, the cluster's corner on a 65535-step grid over [0, 1], a word bu | bv << 5,
 // then per vertex its offsets from the corner in bu and bv bits.
 //
+// a skinned model's clusters then carry per vertex two words, its four joints and its four
+// weights (summing to 255), a byte each: after the texture coordinates, or after the vertex
+// run's following word when untextured. which models are skinned, and each page's joints, are
+// in the model's .cskn (skeleton.hpp).
+//
 // shared vertices snap to the same grid point in each cluster: no cracks.
 //
 // clusters are stored packed (packed_cluster, 48 bytes): what a group's clusters
@@ -29,6 +34,7 @@
 // only while they are, so a cluster can always stand in for missing finer ones:
 // see viewer/streamer.hpp.
 #include "geometry_file.hpp"
+#include "skeleton.hpp"
 
 #include <cstdint>
 #include <string>
@@ -86,6 +92,7 @@ struct paged_geometry {
     std::vector<page_info> pages;
     std::vector<uint32_t> deps;
     std::vector<lod_level_stats> levels;
+    std::vector<page_skin> skin;  // per page, if skinned; saved in the .cskn, not here
     uint64_t data_offset = 0;     // where page data starts in the file
     uint64_t data_size = 0;
     std::vector<uint32_t> data;   // page data, if loaded
@@ -111,5 +118,7 @@ vec3 decode_normal(const gpu_cluster& c, const uint32_t* page, uint32_t k);
 // texture coordinates of vertex k of a textured cluster.
 vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k);
 inline bool cluster_textured(const gpu_cluster& c) { return (c.level >> 23) & 1; }
+// vertex k's joints and weights (a byte each) in a skinned model's cluster.
+void decode_skin(const gpu_cluster& c, const uint32_t* page, uint32_t k, uint32_t& joints, uint32_t& weights);
 // triangle t of a cluster (a | b << 8 | c << 16) from its page.
 uint32_t decode_triangle(const gpu_cluster& c, const uint32_t* page, uint32_t t);

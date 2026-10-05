@@ -1,7 +1,10 @@
 #include "mesh.hpp"
 
+#include "gltf.hpp"
+
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -304,11 +307,12 @@ mesh load_obj(const std::string& data, const std::string& path) {
 
 }  // namespace
 
-mesh load_mesh(const std::string& path) {
+mesh load_mesh(const std::string& path, skeleton* skin) {
+    if (ends_with(path, ".gltf") || ends_with(path, ".glb")) return load_gltf(path, skin);
     const std::string data = read_file(path);
     if (ends_with(path, ".ply")) return load_ply(data);
     if (ends_with(path, ".obj")) return load_obj(data, path);
-    throw std::runtime_error("unknown mesh format: " + path + " (want .ply or .obj)");
+    throw std::runtime_error("unknown mesh format: " + path + " (want .ply, .obj, .gltf or .glb)");
 }
 
 void weld(mesh& m) {
@@ -324,11 +328,14 @@ void weld(mesh& m) {
     };
     std::unordered_map<vec3, uint32_t, key_hash, key_eq> index;
     index.reserve(m.positions.size());
-    std::vector<uint32_t> remap(m.positions.size());
+    std::vector<uint32_t> remap(m.positions.size()), first;  // first: each welded vertex's first original
     std::vector<vec3> positions;
     for (size_t i = 0; i < m.positions.size(); ++i) {
         auto [it, added] = index.emplace(m.positions[i], static_cast<uint32_t>(positions.size()));
-        if (added) positions.push_back(m.positions[i]);
+        if (added) {
+            positions.push_back(m.positions[i]);
+            first.push_back(static_cast<uint32_t>(i));
+        }
         remap[i] = it->second;
     }
 
@@ -353,17 +360,26 @@ void weld(mesh& m) {
         if (m.textured()) corners.insert(corners.end(), &m.corners[3 * t], &m.corners[3 * t + 3]);
     }
 
-    // drop unused vertices.
+    // drop unused vertices. a skinned vertex keeps its first copy's joints and weights.
     std::vector<uint32_t> used(positions.size(), UINT32_MAX);
+    std::vector<uint8_t> joints, weights;
     m.positions.clear();
     for (uint32_t& i : indices) {
         if (used[i] == UINT32_MAX) {
             used[i] = static_cast<uint32_t>(m.positions.size());
             m.positions.push_back(positions[i]);
+            if (m.skinned()) {
+                joints.insert(joints.end(), &m.skin_joints[4 * first[i]], &m.skin_joints[4 * first[i] + 4]);
+                weights.insert(weights.end(), &m.skin_weights[4 * first[i]], &m.skin_weights[4 * first[i] + 4]);
+            }
         }
         i = used[i];
     }
     m.indices = std::move(indices);
+    if (m.skinned()) {
+        m.skin_joints = std::move(joints);
+        m.skin_weights = std::move(weights);
+    }
 
     // wedges: one per welded vertex and texture coordinate, only those still used. each
     // vertex's corners in a row (counting sort), equal coordinates merged within it.
@@ -396,8 +412,8 @@ void weld(mesh& m) {
     m.wedge_vertex = std::move(wedge_vertex);
 }
 
-void normalize_placement(mesh& m, bool up_z) {
-    if (m.positions.empty()) return;
+placement normalize_placement(mesh& m, bool up_z) {
+    if (m.positions.empty()) return {};
     if (up_z)
         for (vec3& p : m.positions) p = {p.x, p.z, -p.y};
     // wind counterclockwise from outside (shadow rays skip back faces). the
@@ -418,6 +434,100 @@ void normalize_placement(mesh& m, bool up_z) {
     const float scale = 1 / std::max({size.x, size.y, size.z});
     const vec3 base = {0.5f * (lo.x + hi.x), lo.y, 0.5f * (lo.z + hi.z)};
     for (vec3& p : m.positions) p = (p - base) * scale;
+    return {up_z, base, scale};
+}
+
+void subdivide(mesh& m) {
+    const size_t n = m.triangle_count(), nv = m.positions.size();
+    // edges: their midpoint vertex, triangle count and the corners facing them.
+    struct edge_info { uint32_t mid = 0, uses = 0, far[2] = {0, 0}; };
+    std::unordered_map<uint64_t, edge_info> edges;
+    edges.reserve(3 * n);
+    auto key = [](uint32_t a, uint32_t b) { return a < b ? uint64_t(a) << 32 | b : uint64_t(b) << 32 | a; };
+    for (size_t t = 0; t < n; ++t)
+        for (int c = 0; c < 3; ++c) {
+            edge_info& e = edges[key(m.indices[3 * t + c], m.indices[3 * t + (c + 1) % 3])];
+            if (e.uses < 2) e.far[e.uses] = m.indices[3 * t + (c + 2) % 3];
+            ++e.uses;
+        }
+    std::vector<vec3> positions(m.positions);
+    // old vertices: smoothed over their neighbours, or along their creases.
+    std::vector<vec3> ring(nv, vec3(0, 0, 0)), crease(nv, vec3(0, 0, 0));
+    std::vector<uint32_t> ring_count(nv, 0), crease_count(nv, 0);
+    for (auto& [k, e] : edges) {
+        const uint32_t a = uint32_t(k >> 32), b = uint32_t(k);
+        ring[a] += m.positions[b]; ring[b] += m.positions[a];
+        ++ring_count[a]; ++ring_count[b];
+        if (e.uses != 2) {
+            crease[a] += m.positions[b]; crease[b] += m.positions[a];
+            ++crease_count[a]; ++crease_count[b];
+        }
+    }
+    for (size_t v = 0; v < nv; ++v) {
+        if (crease_count[v] == 2) positions[v] = m.positions[v] * 0.75f + crease[v] * 0.125f;
+        else if (crease_count[v] == 0 && ring_count[v] >= 3) {
+            const float k = float(ring_count[v]), beta = ring_count[v] == 3 ? 3.0f / 16 : 3.0f / (8 * k);
+            positions[v] = m.positions[v] * (1 - k * beta) + ring[v] * beta;
+        }  // a corner of creases stays put
+    }
+    // skin weights of a new vertex: the average of the edge's ends, four largest kept.
+    auto mix_skin = [&](uint32_t a, uint32_t b) {
+        uint32_t j[8];
+        float w[8];
+        for (int k = 0; k < 4; ++k) {
+            j[k] = m.skin_joints[4 * a + k]; w[k] = m.skin_weights[4 * a + k] * 0.5f;
+            j[4 + k] = m.skin_joints[4 * b + k]; w[4 + k] = m.skin_weights[4 * b + k] * 0.5f;
+        }
+        for (int x = 0; x < 8; ++x)
+            for (int y = x + 1; y < 8; ++y)
+                if (w[x] > 0 && w[y] > 0 && j[x] == j[y]) { w[x] += w[y]; w[y] = 0; }
+        int order[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        std::sort(order, order + 8, [&](int x, int y) { return w[x] > w[y]; });
+        float total = 0;
+        for (int k = 0; k < 4; ++k) total += w[order[k]];
+        uint8_t q[4];
+        int sum = 0;
+        for (int k = 0; k < 4; ++k) { q[k] = uint8_t(std::lround(w[order[k]] / total * 255)); sum += q[k]; }
+        q[0] = uint8_t(q[0] + 255 - sum);
+        for (int k = 0; k < 4; ++k) {
+            m.skin_joints.push_back(q[k] ? uint8_t(j[order[k]]) : 0);
+            m.skin_weights.push_back(q[k]);
+        }
+    };
+    for (auto& [k, e] : edges) {
+        const uint32_t a = uint32_t(k >> 32), b = uint32_t(k);
+        e.mid = uint32_t(positions.size());
+        positions.push_back(e.uses == 2 ? (m.positions[a] + m.positions[b]) * 0.375f + (m.positions[e.far[0]] + m.positions[e.far[1]]) * 0.125f
+                                        : (m.positions[a] + m.positions[b]) * 0.5f);
+        if (m.skinned()) mix_skin(a, b);
+    }
+    // new wedges at midpoints: one per pair of wedges, so a seam stays a seam.
+    std::unordered_map<uint64_t, uint32_t> mid_wedge;
+    std::vector<uint32_t> indices, corners;
+    indices.reserve(12 * n);
+    for (size_t t = 0; t < n; ++t) {
+        const uint32_t* v = &m.indices[3 * t];
+        uint32_t mid[3], wmid[3] = {0, 0, 0};
+        for (int c = 0; c < 3; ++c) mid[c] = edges[key(v[c], v[(c + 1) % 3])].mid;
+        if (m.textured()) {
+            const uint32_t* w = &m.corners[3 * t];
+            for (int c = 0; c < 3; ++c) {
+                auto [it, added] = mid_wedge.emplace(key(w[c], w[(c + 1) % 3]), uint32_t(m.wedge_uvs.size()));
+                if (added) {
+                    const vec2 a = m.wedge_uvs[w[c]], b = m.wedge_uvs[w[(c + 1) % 3]];
+                    m.wedge_uvs.push_back({0.5f * (a.x + b.x), 0.5f * (a.y + b.y)});
+                    m.wedge_vertex.push_back(mid[c]);
+                }
+                wmid[c] = it->second;
+            }
+            corners.insert(corners.end(), {w[0], wmid[0], wmid[2], wmid[0], w[1], wmid[1], wmid[2], wmid[1], w[2],
+                                           wmid[0], wmid[1], wmid[2]});
+        }
+        indices.insert(indices.end(), {v[0], mid[0], mid[2], mid[0], v[1], mid[1], mid[2], mid[1], v[2], mid[0], mid[1], mid[2]});
+    }
+    m.positions = std::move(positions);
+    m.indices = std::move(indices);
+    if (m.textured()) m.corners = std::move(corners);
 }
 
 std::vector<vec3> vertex_normals(const mesh& m) {

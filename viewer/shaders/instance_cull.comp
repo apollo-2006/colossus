@@ -48,12 +48,16 @@ void main() {
     if (valid) {
         const Instance inst = load_instance(i);
         const Mesh m = meshes[inst.mesh];
-        const vec3 center = to_world(inst, m.bounds.xyz);
-        const float radius = (m.bounds.w + deform_reach_of(inst)) * inst.scale;
+        const vec4 sphere = instance_sphere(inst, m.bounds, false);
+        const vec3 center = to_world(inst, sphere.xyz);
+        const float radius = sphere.w * inst.scale;
         bool keep = hidden_before || (frame.flags & flag_frustum_culling) == 0u || sphere_in_frustum(center, radius);
-        // pass 1: was it hidden last frame, where it was last frame.
-        const vec3 then = pass == 0u && inst.anim != 0u ? to_world(load_prev_instance(i), m.bounds.xyz) : center;
-        if (keep && occluded(then, radius)) {
+        // pass 1: was it hidden last frame, where it was last frame. (skinned: where it is
+        // now, grown by how far a point moved since.)
+        const bool skin = skinned(inst);
+        const vec3 then = pass == 0u && inst.anim != 0u && !skin ? to_world(load_prev_instance(i), m.bounds.xyz) : center;
+        const float then_r = skin && pass == 0u ? radius + pose_info[pose_slot(inst)].z * (frame.time - frame.prev_time) * inst.scale : radius;
+        if (keep && occluded(then, then_r)) {
             if (pass == 0u) late_instances[atomicAdd(late_instance_count, 1u)] = i;
             else atomicAdd(stats.instances_occluded, 1u);
             keep = false;
@@ -61,10 +65,11 @@ void main() {
         if (keep) {
             atomicAdd(stats.instances_visible, 1u);
             // projected_error()'s worst over the sphere holding every lod sphere.
-            const vec3 lc = to_world(inst, m.lod_bounds.xyz) - frame.cull_origin.xyz;
-            const float r = (m.lod_bounds.w + deform_reach_of(inst)) * inst.scale;
+            const vec4 ls = instance_sphere(inst, m.lod_bounds, true);
+            const vec3 lc = to_world(inst, ls.xyz) - frame.cull_origin.xyz;
+            const float r = ls.w * inst.scale;
             const float z = max(dot(lc, frame.cull_planes[4].xyz) - r, frame.near_z);
-            const float limit = frame.lod_threshold * z / (inst.scale * deform_stretch_of(inst) * frame.lod_scale * projected_sec(lc, r));
+            const float limit = error_floor(inst, frame.lod_threshold * z / (inst.scale * frame.lod_scale * projected_sec(lc, r)));
             uint lo = 0, hi = m.cluster_count;
             while (lo < hi) {
                 const uint mid = (lo + hi) / 2;

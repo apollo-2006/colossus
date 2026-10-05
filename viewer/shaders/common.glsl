@@ -49,6 +49,7 @@ struct Mesh {
     vec4 lod_bounds;  // holds every lod sphere
     vec4 grid;        // position snapping: xyz grid point 0, w step
     uvec4 tex;        // texture tiles: first page, levels (0: none), width, height (texture.glsl)
+    uvec4 skin;       // skinned: joints (0: none), first pose slot, its first joint, pose slots
 };
 
 // a model placed by rotation, uniform scale, translation.
@@ -57,7 +58,7 @@ struct Instance {
     uint mesh;
     float scale;
     uint material;  // into shade.comp's materials
-    uint anim;      // 0: still. phase in low 8 bits; bit 8 reverses; bit 9 moves (animate()); bit 10 deforms (deform())
+    uint anim;      // 0: still. phase in low 8 bits; bit 8 reverses; bit 9 moves (animate()); bit 10 deforms (deform()); bit 11 skinned, its pose slot from bit 16
 };
 
 layout(set = 0, binding = 0, scalar) uniform Frame {
@@ -312,6 +313,164 @@ vec3 deform_normal(Instance inst, vec4 bounds, vec3 p, vec3 n, float t) {
 float deform_reach_of(Instance inst) { return deforming(inst) ? deform_reach * meshes[inst.mesh].bounds.w : 0.0; }
 float deform_stretch_of(Instance inst) { return deforming(inst) ? deform_stretch : 1.0; }
 
+// skinning (include/skeleton.hpp). each skinned instance follows a pose slot, an animation at a
+// phase, posed on the cpu each frame: per joint three rows of its matrix and the spectral norm
+// of its linear part less the identity; per slot how far its joints carry the model's spheres
+// from its anchor joint, and the fastest any point moves (model units a second).
+struct Joint {
+    vec4 rows[3];
+    vec4 norms;  // x: |A - I|, y: |A - A_anchor| (spectral)
+};
+layout(set = 0, binding = 38, scalar) readonly buffer PoseNow { Joint pose_now[]; };
+layout(set = 0, binding = 39, scalar) readonly buffer PosePrev { Joint pose_prev[]; };
+// per slot: growth of the model's bounds and lod bounds (instance_sphere()), fastest point.
+layout(set = 0, binding = 40, scalar) readonly buffer PoseInfo { vec4 pose_info[]; };
+// per page: the joints its group's vertices use (skeleton.hpp).
+layout(set = 0, binding = 41, scalar) readonly buffer PageSkins { uvec2 page_skin[]; };
+
+bool skinned(Instance inst) { return (inst.anim & 2048u) != 0u; }
+uint pose_slot(Instance inst) { return inst.anim >> 16u; }
+// the instance's first joint in the pose buffers.
+uint joint_base(Instance inst) {
+    const uvec4 sk = meshes[inst.mesh].skin;
+    return sk.z + (pose_slot(inst) - sk.y) * sk.x;
+}
+
+vec3 joint_point(Joint j, vec3 p) { return vec3(dot(j.rows[0], vec4(p, 1.0)), dot(j.rows[1], vec4(p, 1.0)), dot(j.rows[2], vec4(p, 1.0))); }
+vec3 joint_dir(Joint j, vec3 d) { return vec3(dot(j.rows[0].xyz, d), dot(j.rows[1].xyz, d), dot(j.rows[2].xyz, d)); }
+
+// a sphere around a skinned sphere's points, nested level to level for the lod test: centred
+// on the model's anchor joint's image of the centre (skeleton.hpp), grown by how far each of
+// the page's joints carries points from where the anchor does. a point blends its joints'
+// images, each within |M_j c - M_a c| + |A_j - A_a| r of the anchor's image of it, which is
+// within |A_a| r of M_a c. the anchor is fixed and M_j - M_a affine, so a sphere inside
+// another grows to one inside the other's. unskinned: grown by deform's reach.
+vec4 lod_sphere(Instance inst, uint page, vec3 center, float radius) {
+    if (!skinned(inst)) return vec4(center, radius + deform_reach_of(inst));
+    const uint at = joint_base(inst);
+    const Joint a = pose_now[at + meshes[inst.mesh].skin.w];
+    const vec3 c = joint_point(a, center);
+    const uvec2 bits = page_skin[page];
+    float grow = 0.0;
+    for (uint h = 0u; h < 2u; ++h) {
+        uint b = h == 0u ? bits.x : bits.y;
+        while (b != 0u) {
+            const uint j = findLSB(b) + 32u * h;
+            b &= b - 1u;
+            const Joint jt = pose_now[at + j];
+            grow = max(grow, length(joint_point(jt, center) - c) + jt.norms.y * radius);
+        }
+    }
+    return vec4(c, (1.0 + a.norms.x) * radius + grow);
+}
+
+// a sphere around where a cluster is drawn (model space), for culling: centred on its lowest
+// joint's image of the centre instead of the anchor's, which is tighter for a cluster whose
+// joints move together (a leaf on a swinging leg), but not nested level to level, so only for
+// culling.
+vec4 drawn_sphere(Instance inst, uint page, vec3 center, float radius) {
+    if (!skinned(inst)) return vec4(center, radius + deform_reach_of(inst));
+    const uint at = joint_base(inst);
+    const uvec2 bits = page_skin[page];
+    if (bits == uvec2(0u)) return vec4(center, radius);
+    const uint first = bits.x != 0u ? findLSB(bits.x) : 32u + findLSB(bits.y);
+    const Joint a = pose_now[at + first];
+    const vec3 c = joint_point(a, center);
+    float grow = 0.0;
+    for (uint h = 0u; h < 2u; ++h) {
+        uint b = h == 0u ? bits.x : bits.y;
+        while (b != 0u) {
+            const uint j = findLSB(b) + 32u * h;
+            b &= b - 1u;
+            const Joint jt = pose_now[at + j];
+            const vec3 d0 = jt.rows[0].xyz - a.rows[0].xyz, d1 = jt.rows[1].xyz - a.rows[1].xyz, d2 = jt.rows[2].xyz - a.rows[2].xyz;
+            grow = max(grow, length(joint_point(jt, center) - c) + sqrt(dot(d0, d0) + dot(d1, d1) + dot(d2, d2)) * radius);
+        }
+    }
+    return vec4(c, (1.0 + a.norms.x) * radius + grow);
+}
+
+// the other nested sphere: the rest sphere grown by how far the page's joints move its points
+// at all, |M_j c - c| + |A_j - I| r. better than lod_sphere() when the anchor moves and the
+// rest stays (a fox looking round, feet planted); worse when everything moves together.
+vec4 rest_sphere(Instance inst, uint page, vec3 center, float radius) {
+    const uint at = joint_base(inst);
+    const uvec2 bits = page_skin[page];
+    float reach = 0.0;
+    for (uint h = 0u; h < 2u; ++h) {
+        uint b = h == 0u ? bits.x : bits.y;
+        while (b != 0u) {
+            const uint j = findLSB(b) + 32u * h;
+            b &= b - 1u;
+            const Joint jt = pose_now[at + j];
+            reach = max(reach, length(joint_point(jt, center) - center) + jt.norms.x * radius);
+        }
+    }
+    return vec4(center, radius + reach);
+}
+
+// the same for a model's whole sphere (bounds) or its sphere around every lod sphere
+// (lod_bounds), from the growth the cpu worked out over all joints.
+vec4 instance_sphere(Instance inst, vec4 sphere, bool lod) {
+    if (!skinned(inst)) return vec4(sphere.xyz, sphere.w + deform_reach_of(inst));
+    const Joint a = pose_now[joint_base(inst) + meshes[inst.mesh].skin.w];
+    const vec4 info = pose_info[pose_slot(inst)];
+    return vec4(joint_point(a, sphere.xyz), (1.0 + a.norms.x) * sphere.w + (lod ? info.y : info.x));
+}
+
+// an error once the instance is drawn: a deforming one's stretched by the sway. a skinned
+// one's already holds its animations (measured posed when built: build_lod() in dag.hpp).
+float grown_error(Instance inst, float error) { return skinned(inst) ? error : error * deform_stretch_of(inst); }
+
+// for the binary search over a model's clusters by parent error: errors (model units) that
+// could grow past `limit`, which is in the same units after growth.
+float error_floor(Instance inst, float limit) { return skinned(inst) ? limit : limit / deform_stretch_of(inst); }
+
+// words from a cluster's vertex run to its skin (paged_file.hpp): past its texture coordinates
+// if it has them.
+uint skin_run(uint base, Cluster c) {
+    const uvec4 b = cluster_widths(c);
+    const uint at = (c.vertex_count * (b.x + b.y + b.z + 22u) + 31u) / 32u + 1u;
+    if ((c.level & 0x800000u) == 0u) return at;
+    const uint widths = pool[base + c.vertex_offset + at + 1u];
+    const uint bu = min(widths & 31u, 16u), bv = min((widths >> 5u) & 31u, 16u);
+    return at + 2u + (c.vertex_count * (bu + bv) + 31u) / 32u;
+}
+
+// vertex k skinned: its joints' images blended by its weights; now, or as last frame.
+vec3 skin_point(Instance inst, uint base, Cluster c, uint k, vec3 p, bool prev) {
+    const uint run = base + c.vertex_offset + skin_run(base, c) + 2u * k;
+    const uint js = pool[run], ws = pool[run + 1u];
+    const uint at = joint_base(inst), last = meshes[inst.mesh].skin.x - 1u;
+    vec3 out_p = vec3(0.0);
+    for (uint i = 0u; i < 4u; ++i) {
+        const float w = float((ws >> (8u * i)) & 255u) / 255.0;
+        if (w == 0.0) continue;
+        const uint j = at + min((js >> (8u * i)) & 255u, last);
+        out_p += w * joint_point(prev ? pose_prev[j] : pose_now[j], p);
+    }
+    return out_p;
+}
+
+vec3 skin_dir(Instance inst, uint base, Cluster c, uint k, vec3 d) {
+    const uint run = base + c.vertex_offset + skin_run(base, c) + 2u * k;
+    const uint js = pool[run], ws = pool[run + 1u];
+    const uint at = joint_base(inst), last = meshes[inst.mesh].skin.x - 1u;
+    vec3 out_d = vec3(0.0);
+    for (uint i = 0u; i < 4u; ++i) {
+        const float w = float((ws >> (8u * i)) & 255u) / 255.0;
+        if (w != 0.0) out_d += w * joint_dir(pose_now[at + min((js >> (8u * i)) & 255u, last)], d);
+    }
+    return out_d;
+}
+
+// vertex k of a cluster as drawn now (model space): skinned, or swaying, or as stored.
+vec3 drawn_vertex(Instance inst, uint base, Cluster c, uint k) {
+    const Mesh m = meshes[inst.mesh];
+    const vec3 p = cluster_position(base, c, m.grid, k);
+    return skinned(inst) ? skin_point(inst, base, c, k, p, false) : deform(inst, m.bounds, p, frame.time);
+}
+
 // cells of up to 64 neighbouring instances, culled first (cell_cull.comp): a
 // sphere over all, consecutive instances.
 struct Cell {
@@ -521,12 +680,25 @@ bool occluded(vec3 center, float radius) {
 // while their stand-ins are (viewer/streamer.hpp), so one level per path.
 // wants_finer: drawn only for want of finer clusters.
 bool lod_test(Instance inst, Cluster c, out bool wants_finer, out float self_error) {
-    // a deforming instance: points up to its reach away, errors stretched (deform()).
-    const float s = inst.scale, reach = deform_reach_of(inst), stretch = deform_stretch_of(inst);
-    self_error = projected_error(to_world(inst, c.lod_center), (c.lod_radius + reach) * s, c.lod_error * s * stretch);
-    const bool coarse_enough =
-        projected_error(to_world(inst, c.parent_center), (c.parent_radius + reach) * s, c.parent_error * s * stretch) >
-        frame.lod_threshold;
+    // a deforming or skinned instance: spheres where the points are (lod_sphere()), errors grown
+    // (grown_error()). the lod sphere is grown by the creator page's joints (a leaf's, its own
+    // page's: its sphere is its own), the parent sphere by its own page's, so a test of one
+    // group's values is the same computation from either side.
+    const float s = inst.scale;
+    const uint lod_page = c.creator != NO_PAGE ? c.creator : c.group;
+    const vec4 lod = lod_sphere(inst, lod_page, c.lod_center, c.lod_radius);
+    const vec4 parent = lod_sphere(inst, c.group, c.parent_center, c.parent_radius);
+    const float lod_e = grown_error(inst, c.lod_error) * s, parent_e = grown_error(inst, c.parent_error) * s;
+    self_error = projected_error(to_world(inst, lod.xyz), lod.w * s, lod_e);
+    float parent_error = projected_error(to_world(inst, parent.xyz), parent.w * s, parent_e);
+    // skinned: either nested sphere bounds it, and the smaller of two nested bounds nests too.
+    if (skinned(inst)) {
+        const vec4 lod_r = rest_sphere(inst, lod_page, c.lod_center, c.lod_radius);
+        const vec4 parent_r = rest_sphere(inst, c.group, c.parent_center, c.parent_radius);
+        self_error = min(self_error, projected_error(to_world(inst, lod_r.xyz), lod_r.w * s, lod_e));
+        parent_error = min(parent_error, projected_error(to_world(inst, parent_r.xyz), parent_r.w * s, parent_e));
+    }
+    const bool coarse_enough = parent_error > frame.lod_threshold;
     const bool finer_resident = c.creator != NO_PAGE && page_table[c.creator] != NO_PAGE;
     wants_finer = self_error > frame.lod_threshold && c.creator != NO_PAGE && !finer_resident;
     return page_table[c.group] != NO_PAGE && coarse_enough && (self_error <= frame.lod_threshold || !finer_resident);

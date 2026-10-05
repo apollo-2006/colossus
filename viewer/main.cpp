@@ -14,6 +14,7 @@
 //     colossus --model models/lucy.cgeo --grid 10
 //     colossus --model a.cgeo --model b.cgeo --grid 40 --headless --frames 60 --screenshot out.png
 #include "paged_file.hpp"
+#include "skeleton.hpp"
 #include "texture_file.hpp"
 #include "streamer.hpp"
 #include "png.hpp"
@@ -132,6 +133,8 @@ struct gpu_mesh {
     float grid[4];  // grid point 0 and step: see paged_file.hpp
     // texture tiles: first page, level count (0: untextured), width, height (texture_file.hpp)
     uint32_t texture[4];
+    // skinned: joints (0: none), first pose slot, its first joint in the pose buffers, anchor joint
+    uint32_t skin[4];
 };
 struct gpu_instance {
     float rows[3][4];
@@ -251,7 +254,36 @@ struct options {
     bool prefetch = true;
     bool merge_reads = true;   // pages close in the file share a read
     bool gi_rt = false;        // --gi rt: bounce light traced in world space
+    std::string animation;     // skinned models: play only this animation (default: each at random)
 };
+
+// pose slots: a skinned instance follows one of a model's animations at one of this many
+// phases, so a crowd shares a few poses, each posed once a frame.
+constexpr uint32_t pose_phases = 16;
+
+// the largest stretch of a 3x3 matrix (rows of a 3x4), its spectral norm, less the identity
+// first if asked: power iteration on m'm.
+float spectral_norm(const float* rows, bool less_identity) {
+    float a[3][3];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) a[r][c] = rows[4 * r + c] - (less_identity && r == c ? 1.0f : 0.0f);
+    float ata[3][3] = {};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k) ata[i][j] += a[k][i] * a[k][j];
+    float v[3] = {0.577f, 0.577f, 0.577f}, lambda = 0;
+    for (int it = 0; it < 32; ++it) {
+        float w[3] = {};
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) w[i] += ata[i][j] * v[j];
+        const float l = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        if (l < 1e-20f) return 0;
+        lambda = l;
+        for (int i = 0; i < 3; ++i) v[i] = w[i] / l;
+    }
+    // power iteration approaches from below: a little over, to stay a bound.
+    return std::sqrt(lambda) * 1.01f + 1e-6f;
+}
 
 struct camera {
     vec3 eye{0, 0.6f, 2.5f};
@@ -305,6 +337,19 @@ struct scene {
     float shadow_lod_error[4] = {};          // each shadow copy's largest error over the models
     std::vector<float> shadow_positions;
     std::vector<uint32_t> shadow_indices;
+    // skinning: each skinned model's skeleton, the pose slots, and per global page its joints
+    // and weight spread (zero for unskinned pages).
+    struct pose_slot {
+        uint32_t skeleton;
+        int32_t animation;  // -1: the rest pose
+        float phase;        // of the animation's duration
+        uint32_t mesh;
+    };
+    std::vector<skeleton> skeletons;
+    std::vector<pose_slot> pose_slots;
+    uint32_t pose_joints = 0;              // all slots' joints
+    std::vector<page_skin> page_skins;
+    std::vector<float> skin_reach;         // per model: the farthest any pose moves its sphere
     size_t instanced_triangles = 0;  // at full detail, all instances
     size_t moving = 0;               // moving instances
     uint64_t total_page_bytes = 0;
@@ -445,6 +490,47 @@ void make_scene(const options& opt, scene& s) {
             std::printf("  texture %u x %u: %zu levels, %u tiles, %.0f MB\n", t.width, t.height, t.levels.size(), t.tile_count(),
                         t.tile_count() * double(tile_bytes) / 1048576.0);
         }
+        // a skeleton beside the model makes it skinned: its pages' skin bounds, and pose slots
+        // (every animation at pose_phases phases).
+        const std::string cskn = path.substr(0, path.find_last_of('.')) + ".cskn";
+        float reach = 0;
+        if (access(cskn.c_str(), R_OK) == 0) {
+            skeleton sk = load_skeleton(cskn);
+            if (sk.pages.size() != g.pages.size()) throw std::runtime_error(cskn + " does not match " + path + ": rebuild both");
+            if (s.page_skins.size() < page_base + g.pages.size()) s.page_skins.resize(page_base + g.pages.size());
+            std::copy(sk.pages.begin(), sk.pages.end(), s.page_skins.begin() + page_base);
+            const uint32_t joints = static_cast<uint32_t>(sk.joints.size());
+            m.skin[0] = joints;
+            m.skin[1] = static_cast<uint32_t>(s.pose_slots.size());
+            m.skin[2] = s.pose_joints;
+            const int anims = static_cast<int>(sk.animations.size());
+            for (int a = anims ? 0 : -1; a < std::max(anims, 0); ++a)
+                for (uint32_t ph = 0; ph < (a < 0 ? 1u : pose_phases); ++ph) {
+                    s.pose_slots.push_back({uint32_t(s.skeletons.size()), a, float(ph) / pose_phases, uint32_t(s.meshes.size())});
+                    s.pose_joints += joints;
+                }
+            m.skin[3] = sk.anchor;
+            // the farthest any pose moves the model's sphere, sampled finely and given a tenth
+            // more: cells (instance groups) are culled by it.
+            std::vector<float> rows;
+            const vec3 c = g.bounds.center;
+            for (int a = anims ? 0 : -1; a < std::max(anims, 0); ++a)
+                for (int k = 0; k < 256; ++k) {
+                    pose_joints(sk, a, a < 0 ? 0 : sk.animations[size_t(a)].duration * k / 256, rows);
+                    for (uint32_t j = 0; j < joints; ++j) {
+                        const float* r = &rows[12 * j];
+                        const vec3 moved(r[0] * c.x + r[1] * c.y + r[2] * c.z + r[3], r[4] * c.x + r[5] * c.y + r[6] * c.z + r[7],
+                                         r[8] * c.x + r[9] * c.y + r[10] * c.z + r[11]);
+                        reach = std::max(reach, length(moved - c) + spectral_norm(r, true) * g.bounds.radius);
+                    }
+                }
+            reach *= 1.1f;
+            std::printf("  skeleton: %u joints, %d animations", joints, anims);
+            for (const animation& an : sk.animations) std::printf(" %s (%.2fs)", an.name.c_str(), an.duration);
+            std::printf(", reach %.3g of radius %.3g\n", reach, g.bounds.radius);
+            s.skeletons.push_back(std::move(sk));
+        }
+        s.skin_reach.push_back(reach);
         m.shadow_error = shadow_error;
         m.first_cluster = static_cast<uint32_t>(s.clusters.size());
         m.cluster_count = static_cast<uint32_t>(g.clusters.size());
@@ -462,6 +548,7 @@ void make_scene(const options& opt, scene& s) {
         s.shared_bounds.insert(s.shared_bounds.end(), g.shared_bounds.begin(), g.shared_bounds.end());
     }
 
+    s.page_skins.resize(std::max<size_t>(s.pages.size(), 1));  // texture pages and unskinned models: none
     std::mt19937 rng(7), material_rng(11), motion_rng(13);
     std::uniform_real_distribution<float> chance(0, 1);
     std::uniform_real_distribution<float> turn(0, 6.2831853f), size(0.85f, 1.15f);
@@ -489,6 +576,18 @@ void make_scene(const options& opt, scene& s) {
             // (deform() in common.glsl), shadows and motion vectors as for movers.
             if (chance(motion_rng) < opt.moving) inst.anim = 512u | (motion_rng() & 511u);
             if (opt.deforming > 0 && chance(motion_rng) < opt.deforming) inst.anim |= 1024u | (inst.anim ? 0u : motion_rng() & 255u);
+            // skinned: an animation (the named one, or one at random) at a random phase; bit 11
+            // and the pose slot from bit 16 (common.glsl). no sway on top.
+            if (const uint32_t* sk = s.meshes[mesh].skin; sk[0]) {
+                const skeleton& skel = s.skeletons[s.pose_slots[sk[1]].skeleton];
+                const uint32_t anims = std::max<uint32_t>(uint32_t(skel.animations.size()), 1);
+                uint32_t a = motion_rng() % anims;
+                for (uint32_t k = 0; k < skel.animations.size(); ++k)
+                    if (skel.animations[k].name == opt.animation) a = k;
+                const uint32_t phases = skel.animations.empty() ? 1 : pose_phases;
+                const uint32_t slot = sk[1] + a * phases + motion_rng() % phases;
+                inst.anim = (inst.anim & ~1024u) | 2048u | slot << 16;
+            }
             s.moving += inst.anim != 0;
             placed[size_t(z) * n + x] = inst;
             s.instanced_triangles += leaf_triangles[mesh];
@@ -510,7 +609,7 @@ void make_scene(const options& opt, scene& s) {
                     for (int r = 0; r < 3; ++r)
                         (&c.x)[r] += inst.rows[r][0] * local.x + inst.rows[r][1] * local.y + inst.rows[r][2] * local.z;
                     // deforming: points move up to the reach (deform_reach in common.glsl).
-                    float radius = (m.bounds[3] * ((inst.anim & 1024u) ? 1.1f : 1.0f)) * inst.scale;
+                    float radius = (m.bounds[3] * ((inst.anim & 1024u) ? 1.1f : 1.0f) + s.skin_reach[inst.mesh]) * inst.scale;
                     if (inst.anim & 512u) {
                         radius += length(c - origin) + 0.2f;
                         c = origin;
@@ -576,13 +675,14 @@ public:
             vkDestroyQueryPool(ctx_.device, f.queries, nullptr);
             ctx_.destroy(f.frame);
             ctx_.destroy(f.stats);
+            for (vk::buffer* b : {&f.pose_now, &f.pose_prev, &f.pose_info}) ctx_.destroy(*b);
         }
         for (frame_slot& f : slots_)
             for (vk::buffer* b : {&f.staging, &f.request_readback, &f.used_readback}) ctx_.destroy(*b);
         for (vk::buffer* b : {&clusters_, &page_table_, &pool_buffer_, &page_used_, &requests_, &request_stamp_, &shadow_positions_, &meshes_,
                               &instances_, &work_, &visible_, &draw_args_, &readback_, &late_instances_, &late_clusters_,
                               &cells_, &cell_lists_, &vsm_entries_, &vsm_phys_, &vsm_lists_, &vsm_atlas_, &vsm_work_,
-                              &vsm_visible_, &vsm_args_, &moving_instances_})
+                              &vsm_visible_, &vsm_args_, &moving_instances_, &page_skins_})
             ctx_.destroy(*b);
         vkDestroySampler(ctx_.device, history_sampler_, nullptr);
         for (VkPipeline p : {instance_cull_, args_, shade_, raster_, hzb_, cluster_cull_, sw_raster_, shadow_, taa_, expand_, tlas_update_, cell_cull_,
@@ -804,6 +904,7 @@ public:
 
         gpu_frame fr = frame_in;
         fr.prev_time = history_valid_ ? prev_time_ : fr.time;
+        pose_slots(f, fr.time, fr.prev_time);
         if (sc_.moving) fr.flags |= flag_moving;
         fr.vsm_atlas_side = vsm_side_;
         // traced bounce light needs ray queries that read hit vertices (position fetch).
@@ -1019,6 +1120,7 @@ public:
 private:
     static constexpr uint32_t timestamp_count = 6 + vsm_profile_steps;
 
+
     struct frame_slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
@@ -1026,11 +1128,75 @@ private:
         VkQueryPool queries = VK_NULL_HANDLE;
         VkDescriptorSet set = VK_NULL_HANDLE;
         vk::buffer frame, stats;
+        vk::buffer pose_now, pose_prev, pose_info;  // skinning: this frame's and last frame's joints, per slot bounds
         vk::buffer staging;           // pages loaded for this frame, then the page table
         vk::buffer request_readback;  // this frame's requests
         vk::buffer used_readback;     // frame each page was last drawn from
         bool used = false;
     };
+
+    // poses every skinned slot at time t (an animation at its phase) into this frame's
+    // buffers, with last frame's joints for motion, and per slot: how far its joints carry the
+    // model's bounds and lod bounds from its anchor joint (instance_sphere() in common.glsl),
+    // and the fastest a point goes.
+    void pose_slots(frame_slot& f, float t, float prev_t) {
+        if (sc_.pose_slots.empty()) return;
+        float* now = static_cast<float*>(f.pose_now.mapped);
+        float* info = static_cast<float*>(f.pose_info.mapped);
+        std::vector<float> rows;
+        const float dt = t - prev_t;
+        const bool have_last = last_pose_.size() == 16ull * sc_.pose_joints;
+        uint32_t at = 0;
+        for (size_t k = 0; k < sc_.pose_slots.size(); ++k) {
+            const scene::pose_slot& ps = sc_.pose_slots[k];
+            const skeleton& sk = sc_.skeletons[ps.skeleton];
+            const float duration = ps.animation < 0 ? 0.0f : sk.animations[size_t(ps.animation)].duration;
+            pose_joints(sk, ps.animation, t + ps.phase * duration, rows);
+            const gpu_mesh& m = sc_.meshes[ps.mesh];
+            const vec3 c = {m.bounds[0], m.bounds[1], m.bounds[2]};
+            const float r = m.bounds[3];
+            const vec3 lc = {m.lod_bounds[0], m.lod_bounds[1], m.lod_bounds[2]};
+            const float lr = m.lod_bounds[3];
+            auto apply = [](const float* q, vec3 p) {
+                return vec3(q[0] * p.x + q[1] * p.y + q[2] * p.z + q[3], q[4] * p.x + q[5] * p.y + q[6] * p.z + q[7],
+                            q[8] * p.x + q[9] * p.y + q[10] * p.z + q[11]);
+            };
+            const float* anchor = &rows[12 * size_t(m.skin[3])];
+            float grow = 0, lod_grow = 0, speed = 0;
+            for (size_t j = 0; j < sk.joints.size(); ++j, ++at) {
+                const float* jr = &rows[12 * j];
+                float* out = now + 16 * size_t(at);
+                std::copy_n(jr, 12, out);
+                out[12] = spectral_norm(jr, true);
+                // relative to the anchor: |M_j c - M_a c| + |A_j - A_a| r.
+                float diff[12];
+                for (int i = 0; i < 12; ++i) diff[i] = jr[i] - anchor[i];
+                const float apart = spectral_norm(diff, false);
+                out[13] = apart;
+                out[14] = out[15] = 0;
+                grow = std::max(grow, length(apply(jr, c) - apply(anchor, c)) + apart * r);
+                lod_grow = std::max(lod_grow, length(apply(jr, lc) - apply(anchor, lc)) + apart * lr);
+                if (have_last && dt > 0) {
+                    // the change since last frame: the centre's move and the linear part's.
+                    const float* q = &last_pose_[16 * size_t(at)];
+                    float d[12];
+                    for (int i = 0; i < 12; ++i) d[i] = jr[i] - q[i];
+                    for (int i = 0; i < 3; ++i) d[4 * i + i] += 1;  // spectral_norm(.., true) takes it off
+                    const vec3 dc(d[0] * c.x + d[1] * c.y + d[2] * c.z + d[3] - c.x, d[4] * c.x + d[5] * c.y + d[6] * c.z + d[7] - c.y,
+                                  d[8] * c.x + d[9] * c.y + d[10] * c.z + d[11] - c.z);
+                    speed = std::max(speed, (length(dc) + spectral_norm(d, true) * r) / dt);
+                }
+            }
+            info[4 * k] = grow;
+            info[4 * k + 1] = lod_grow;
+            info[4 * k + 2] = speed;
+            info[4 * k + 3] = 0;
+        }
+        const size_t bytes = 64ull * sc_.pose_joints;
+        // last frame's joints: kept from last frame, or this frame's on the first.
+        std::memcpy(f.pose_prev.mapped, have_last ? last_pose_.data() : now, bytes);
+        last_pose_.assign(now, now + 16ull * sc_.pose_joints);
+    }
 
     vk::context& ctx_;
     const scene& sc_;
@@ -1039,6 +1205,8 @@ private:
     uint32_t slot_ = 0;
 
     vk::buffer clusters_, page_table_, pool_buffer_, page_used_, requests_, request_stamp_, shadow_positions_, meshes_, instances_;
+    vk::buffer page_skins_;
+    std::vector<float> last_pose_;  // last frame's joints (16 floats each), for motion
     vk::buffer work_, visible_, draw_args_, vis_, readback_, late_instances_, late_clusters_, cells_, cell_lists_;
     // virtual shadow maps: see vsm.glsl.
     uint32_t vsm_side_ = 1;
@@ -1334,6 +1502,7 @@ private:
             build_shadow_scene();
         }
         meshes_ = ctx_.upload(sc_.meshes, ssbo);
+        page_skins_ = ctx_.upload(sc_.page_skins, ssbo);
         instances_ = ctx_.upload(sc_.instances, ssbo);
         cells_ = ctx_.upload(sc_.cells, ssbo);
         const VkBufferUsageFlags filled = ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1370,6 +1539,10 @@ private:
         VK_CHECK(vkCreateSampler(ctx_.device, &sci, nullptr, &sampler_));
         for (frame_slot& f : slots_) {
             f.frame = ctx_.make_buffer(sizeof(gpu_frame), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+            const uint64_t joint_bytes = std::max<uint64_t>(64ull * sc_.pose_joints, 64);
+            f.pose_now = ctx_.make_buffer(joint_bytes, ssbo, true);
+            f.pose_prev = ctx_.make_buffer(joint_bytes, ssbo, true);
+            f.pose_info = ctx_.make_buffer(std::max<uint64_t>(16ull * sc_.pose_slots.size(), 16), ssbo, true);
             f.stats = ctx_.make_buffer(sizeof(gpu_stats), ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
             f.staging = ctx_.make_buffer(upload_bytes_ + pages * 4, src, true);
             f.request_readback = ctx_.make_buffer(16 + uint64_t(max_requests) * 8, dst, true);
@@ -1520,7 +1693,7 @@ private:
 
     void create_descriptors() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        for (uint32_t i = 0; i <= 37; ++i) {
+        for (uint32_t i = 0; i <= 41; ++i) {
             if ((i == 18 || i == 23 || i == 24) && !ctx_.ray_query) continue;
             VkDescriptorSetLayoutBinding x{};
             x.binding = i;
@@ -1539,7 +1712,7 @@ private:
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &set_layout_));
 
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames_in_flight},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 28 * frames_in_flight},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (3 + max_hzb_levels + ao_depth_levels) * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * frames_in_flight},
                                               {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2 * frames_in_flight}};
@@ -1561,10 +1734,12 @@ private:
                                            &late_clusters_, nullptr, nullptr,   nullptr,         &request_stamp_,
                                            nullptr,         nullptr, nullptr,   as_moving_.handle ? &as_moving_ : nullptr,
                                            nullptr,         &cells_, &cell_lists_, &vsm_entries_, &vsm_phys_, &vsm_lists_,
-                                           &vsm_atlas_,     &vsm_work_, &vsm_visible_, &vsm_args_, &moving_instances_};
-            VkDescriptorBufferInfo infos[35];
+                                           &vsm_atlas_,     &vsm_work_, &vsm_visible_, &vsm_args_, &moving_instances_,
+                                           nullptr,         nullptr,   nullptr,       &f.pose_now, &f.pose_prev,
+                                           &f.pose_info,    &page_skins_};
+            VkDescriptorBufferInfo infos[42];
             std::vector<VkWriteDescriptorSet> writes;
-            for (uint32_t i = 0; i < 35; ++i) {
+            for (uint32_t i = 0; i < 42; ++i) {
                 if (!buffers[i]) continue;  // visibility buffer and output image: written by resize()
                 infos[i] = {buffers[i]->handle, 0, VK_WHOLE_SIZE};
                 VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1939,6 +2114,7 @@ options parse(int argc, char** argv) {
         }
         else if (a == "--moving") o.moving = std::stof(next());
         else if (a == "--deforming") o.deforming = std::stof(next());
+        else if (a == "--animation") o.animation = next();
         else if (a == "--pool-mb") o.pool_mb = std::clamp<uint64_t>(std::stoull(next()), 16, 4095);
         else if (a == "--upload-mb") o.upload_mb = std::clamp<uint64_t>(std::stoull(next()), 1, 1024);
         else if (a == "--warmup") o.warmup = std::stoi(next());

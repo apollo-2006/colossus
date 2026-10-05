@@ -308,15 +308,24 @@ void main() {
         } else if (frame.debug_mode == 0u) {
             const vec4 bounds = meshes[inst.mesh].bounds;
             const float radius = bounds.w;
-            // detail is fixed to the rest surface: a swaying statue's grain bends with it.
+            // detail is fixed to the rest surface: a swaying statue's grain bends with it. a
+            // skinned one has no inverse: the pixel's weights on the triangle's rest corners.
             const vec3 drawn = from_world(inst, s.hit);
-            const vec3 q = undeform(inst, bounds, drawn, frame.time) / radius;
+            vec3 rest = undeform(inst, bounds, drawn, frame.time);
+            if (skinned(inst)) {
+                const vec4 grid = meshes[inst.mesh].grid;
+                rest = cluster_position(s.base, c, grid, s.corners.x) * (1.0 - s.bary.x - s.bary.y) +
+                       cluster_position(s.base, c, grid, s.corners.y) * s.bary.x + cluster_position(s.base, c, grid, s.corners.z) * s.bary.y;
+            }
+            const vec3 q = rest / radius;
             const Detail d = surface_detail(m, min(inst.material, 5u), q, s.t / (frame.lod_scale * inst.scale * radius), ao, s.n.y);
             m = d.m;
             wrap = d.wrap;
             coat = d.coat;
             // the height gradient to world space (rotation; heights are in radii, so scale cancels).
-            const vec3 g = to_world_dir(inst, deform_gradient(inst, bounds, drawn, d.grad, frame.time)) / inst.scale;
+            // skinned: turned by the nearest corner's joints (rotations: the inverse transpose).
+            const vec3 model_g = skinned(inst) ? skin_dir(inst, s.base, c, s.corners.x, d.grad) : deform_gradient(inst, bounds, drawn, d.grad, frame.time);
+            const vec3 g = to_world_dir(inst, model_g) / inst.scale;
             n = normalize(s.n - (g - dot(g, s.n) * s.n));
         }
         if (frame.debug_mode != 0u) m = Material(vec3(0.56, 0.52, 0.47), 0.6, 0.0);

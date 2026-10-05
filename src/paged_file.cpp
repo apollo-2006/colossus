@@ -88,6 +88,15 @@ uint32_t uv_run(const gpu_cluster& c) {
     return (c.vertex_count * (width(c, 0) + width(c, 1) + width(c, 2) + 22) + 31) / 32 + 1;
 }
 
+// words from a cluster's vertex run to its skin: past the texture coordinates if any.
+uint32_t skin_run(const gpu_cluster& c, const uint32_t* page) {
+    const uint32_t at = uv_run(c);
+    if (!cluster_textured(c)) return at;
+    const uint32_t widths = page[c.vertex_offset + at + 1];
+    const uint32_t bu = std::min(widths & 31, 16u), bv = std::min(widths >> 5 & 31, 16u);
+    return at + 2 + (c.vertex_count * (bu + bv) + 31) / 32;
+}
+
 }  // namespace
 
 namespace {
@@ -115,6 +124,12 @@ vec2 decode_uv(const gpu_cluster& c, const uint32_t* page, uint32_t k) {
     const uint32_t bu = run[1] & 31, bv = run[1] >> 5 & 31;
     const uint64_t at = 64 + uint64_t(k) * (bu + bv);
     return {float((run[0] & 0xffff) + read_bits(run, at, bu)) / uv_max, float((run[0] >> 16) + read_bits(run, at + bu, bv)) / uv_max};
+}
+
+void decode_skin(const gpu_cluster& c, const uint32_t* page, uint32_t k, uint32_t& joints, uint32_t& weights) {
+    const uint32_t* run = page + c.vertex_offset + skin_run(c, page);
+    joints = run[2 * k];
+    weights = run[2 * k + 1];
 }
 
 packed_cluster pack_cluster(const gpu_cluster& c) {
@@ -308,6 +323,19 @@ paged_geometry page(const geometry& g) {
                     uw.put(q[1][k] - lo[1], bv);
                 }
             }
+            if (g.skinned()) {
+                if (!g.textured()) words.push_back(0);  // the word after the vertex run
+                for (uint32_t k = 0; k < src.vertex_count; ++k) {
+                    const size_t v = 4 * size_t(g.vertex_of(g.cluster_vertices[src.vertex_offset + k]));
+                    uint32_t j = 0, w = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        j |= uint32_t(g.skin_joints[v + i]) << (8 * i);
+                        w |= uint32_t(g.skin_weights[v + i]) << (8 * i);
+                    }
+                    words.push_back(j);
+                    words.push_back(w);
+                }
+            }
             dst.triangle_offset = static_cast<uint32_t>(words.size());
             bit_writer tw{words};
             for (uint32_t t = 0; t < src.triangle_count; ++t) {
@@ -352,6 +380,40 @@ paged_geometry page(const geometry& g) {
     // from the original, so they carry it.
     const float snapping = p.grid_step * std::sqrt(3.0f) * 0.5f;
     for (size_t pg = 1; pg < p.shared_bounds.size(); ++pg) p.shared_bounds[pg].error += snapping;
+    // skinned: per page the joints its group's vertices use, which bound how far skinning
+    // moves its spheres. a cluster's lod sphere is its creator page's and its parent sphere its
+    // own page's, so both must only grow toward the roots, as the spheres do: a page takes in
+    // the pages its clusters were made from, until nothing changes.
+    if (g.skinned()) {
+        p.skin.assign(p.pages.size(), page_skin{});
+        for (uint32_t pg = 0; pg < members.size(); ++pg) {
+            uint64_t mask = 0;
+            for (uint32_t i : members[pg]) {
+                const gpu_cluster& c = g.clusters[i];
+                for (uint32_t k = 0; k < c.vertex_count; ++k) {
+                    const size_t v = 4 * size_t(g.vertex_of(g.cluster_vertices[c.vertex_offset + k]));
+                    for (int a = 0; a < 4; ++a)
+                        if (g.skin_weights[v + a]) {
+                            if (g.skin_joints[v + a] >= 64) throw std::logic_error("joint past 64");
+                            mask |= uint64_t(1) << g.skin_joints[v + a];
+                        }
+                }
+            }
+            p.skin[pg] = {mask};
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const gpu_cluster& c : p.clusters) {
+                if (c.creator == no_page) continue;
+                page_skin& to = p.skin[c.group];
+                const page_skin& from = p.skin[c.creator];
+                if ((to.joints | from.joints) != to.joints) {
+                    to.joints |= from.joints;
+                    changed = true;
+                }
+            }
+        }
+    }
     p.packed.reserve(p.clusters.size());
     for (gpu_cluster& c : p.clusters) {
         p.packed.push_back(pack_cluster(c));

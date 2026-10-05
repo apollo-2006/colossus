@@ -7,13 +7,17 @@
 #     models/fetch.sh lucy          # lucy, 28M triangles
 #     models/fetch.sh washington    # textured: horatio greenough's george washington
 #                                   # (1840), 17M triangles, a 720 mb download
+#     models/fetch.sh fox           # skinned and animated: the khronos gltf fox,
+#                                   # 576 triangles subdivided to 590 thousand
 #
 # the dragon and lucy are from the stanford 3d scanning repository,
 # http://graphics.stanford.edu/data/3Dscanrep/, which asks credit to the
 # stanford computer graphics laboratory (and, for the dragon, xyz rgb inc.) and
 # allows no commercial use without permission. washington is the smithsonian
 # american art museum's scan, released cc0 through smithsonian open access
-# (https://3d.si.edu). its texture is converted to ppm with ffmpeg.
+# (https://3d.si.edu). its texture is converted to ppm with ffmpeg. the fox is from the
+# khronos gltf sample assets: model by pixelmannen (cc0), rigging and animation by
+# tomkranis (cc by 4.0), gltf conversion by asobostudio and scurest (cc by 4.0).
 set -euo pipefail
 cd "$(dirname "$0")"
 names=("$@")
@@ -48,6 +52,15 @@ for name in "${names[@]}"; do
       fi
       [[ -f $stem-texture.ppm ]] || ffmpeg -v error -y -i "$stem-texture.jpg" "$stem-texture.ppm"
       $download_only || $build "$stem-geometry.obj" washington.cgeo ;;
-    *) echo "unknown model $name (dragon, lucy, washington)"; exit 2 ;;
+    fox)
+      if [[ ! -f fox/Fox.gltf ]]; then
+        mkdir -p fox
+        for f in Fox.gltf Fox.bin Texture.png; do
+          curl -fL -o "fox/$f" "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Fox/glTF/$f"
+        done
+      fi
+      [[ -f fox/Texture.ppm ]] || ffmpeg -v error -y -i fox/Texture.png fox/Texture.ppm
+      $download_only || $build fox/Fox.gltf fox.cgeo --subdivide 5 ;;
+    *) echo "unknown model $name (dragon, lucy, washington, fox)"; exit 2 ;;
   esac
 done

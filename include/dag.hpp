@@ -58,12 +58,19 @@ struct lod_mesh {
     std::vector<uint32_t> wedge_vertex, wedge_chart;
     std::vector<vec2> wedge_uvs;  // empty if untextured
     std::string texture;
+    std::vector<uint8_t> skin_joints, skin_weights;  // per vertex, empty if unskinned (mesh.hpp)
     std::vector<lod_cluster> clusters;  // level 0, then each level
     std::vector<lod_level_stats> levels;
 };
 
 // builds the hierarchy over a welded mesh. one log line per level if verbose.
-lod_mesh build_lod(const mesh& m, bool verbose);
+//
+// skinned, with poses (joint matrices, 3x4 rows each, in the mesh's space): each group's
+// simplification is also measured posed, every pose (sampled distance between the posed
+// surfaces), and the worst joins its error. linear blend skinning moves a coarse triangle off
+// the fine surface where its interpolated weights differ, by however far apart the joints
+// carry a point: the animations are known, so measured over them rather than bounded.
+lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<float>>& poses = {});
 
 // cone and bounds of a cluster.
 void cluster_bounds(const std::vector<vec3>& positions, lod_cluster& c);

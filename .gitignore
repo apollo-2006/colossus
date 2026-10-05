@@ -5,6 +5,8 @@
 /models/*.cgeo
 /models/*.ctex
 /models/washington/
+/models/fox/
+/models/*.cskn
 /models/dragon_recon/
 *.png
 !/docs/*.png
