@@ -31,17 +31,19 @@ void main() {
     const vec2 center = vsm_light_space(to_world(inst, drawn.xyz)).xy;
     const float radius = drawn.w * inst.scale;
     if (!vsm_touches(layer, level, center, radius)) return;
-    // a stand-in, or unloaded (in the first frames, even the roots): its pages
-    // are unfinished, render them again next frame.
-    // (the moving layer redraws whenever anything moves.)
-    if ((wants_finer || !loaded) && layer == vsm_still) {
+    // a stand-in, or unloaded (in the first frames, even the roots): its pages are
+    // unfinished, render them again next frame: the still layer's marked provisional, the
+    // moving layer's dirty (it redraws only where something moves, a mover's coarse levels
+    // only every few frames).
+    if (wants_finer || !loaded) {
+        const uint mark = layer == vsm_still ? vsm_provisional : vsm_dirty;
         const float size = texel * float(vsm_page);
         const ivec4 r = vsm_rendered(layer, level);
         const ivec2 lo = max(ivec2(floor((center - radius) / size)), r.xy);
         const ivec2 hi = min(ivec2(floor((center + radius) / size)), r.zw);
         for (int y = lo.y; y <= hi.y; ++y)
             for (int x = lo.x; x <= hi.x; ++x)
-                if (vsm_in_window(level, ivec2(x, y))) atomicOr(vsm_entries[vsm_slot(level, ivec2(x, y))].flags, vsm_provisional);
+                if (vsm_in_window(level, ivec2(x, y))) atomicOr(vsm_entries[vsm_slot(level, ivec2(x, y))].flags, mark);
     }
     // its stand-ins ask for its page, unless none touches a page it does (spheres are loose):
     // then it would mark the page unfinished every frame. so it asks too.
