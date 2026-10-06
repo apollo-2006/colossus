@@ -79,14 +79,14 @@ export const camera = {
   },
 };
 
-// in place of the demo: frames from the native viewer, and the flythrough video if there is
+// in place of the demo: frames from the native viewer, and the captioned video if there is
 // one. for browsers without webgpu, gpus without enough storage buffers, and ?fallback.
 function fallback(reason) {
   for (const id of ['view', 'panel', 'loading']) $(id)?.remove();
   document.body.classList.add('fallback');
   $('fallback-reason').textContent = reason;
   $('fallback').hidden = false;
-  fetch('flythrough.mp4', { method: 'HEAD' }).then((r) => { if (r.ok) $('fallback-video').hidden = false; }, () => {});
+  fetch('colossus.mp4', { method: 'HEAD' }).then((r) => { if (r.ok) $('fallback-video').hidden = false; }, () => {});
   // the live part: one statue in webgl2 (lite.js), where there is webgl2.
   $('lite').hidden = false;
   import('./lite.js').then(({ startLite }) => startLite($('lite-view'), {

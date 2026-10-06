@@ -18,6 +18,8 @@ webgpu port, with the debug views, the error threshold and the crowd size to pla
 checked, streaming, textures, skinning, foliage, a comparison with meshoptimizer, and where
 the proofs ran out.
 
+[![a minute of colossus: the forest, the crowd, the error slider on lucy's clusters, a museum scan, skinned foxes and a million instances](docs/video.jpg)](https://apollo-2006.github.io/colossus/colossus.mp4)
+
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
 900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
