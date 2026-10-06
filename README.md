@@ -14,8 +14,9 @@ shadows and shading all live in this repository.
 webgpu port, with the debug views, the error threshold and the crowd size to play with.
 
 **[read how it was built →](https://abirdeol.tech/abir-deol-colossus-within-a-pixel.pdf)**
-*within a pixel*, a 9 page write-up: the hierarchy, the proven error bound and how it's
-checked, streaming, textures, skinning, foliage, and where the proofs ran out.
+*within a pixel*, a 10 page write-up: the hierarchy, the proven error bound and how it's
+checked, streaming, textures, skinning, foliage, a comparison with meshoptimizer, and where
+the proofs ran out.
 
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
@@ -58,14 +59,16 @@ story; in short:
 * **real content.** textures stream as tiles through the same pool, wedges carrying
   coordinates and materials through simplification. skinned gltf models play their
   animations, errors measured in their poses. foliage, thousands of needles that edge
-  collapse won't delete, falls back to vertex clustering that keeps outlines whole.
+  collapse won't delete, falls back to vertex clustering that keeps outlines whole, grows
+  what's left to keep the area of what merged away, and counts lost area in its error, so
+  crowns stay full at a distance.
 
 the commit messages have every step's numbers.
 
 ![a pine forest at eye level: tall pines and firs, saplings, ferns, grass and mossy rocks in hazy light](docs/forest.png)
 
 poly haven's cc0 pine forest (`python3 models/forest.py`): 55 models scattered into 14,780
-instances, 753 million triangles at full detail, 89.8 million drawn in 5.63 ms at
+instances, 753 million triangles at full detail, 138.9 million drawn in 7.26 ms at
 1920x1080.
 
 ![horatio greenough's george washington, scanned by the smithsonian, close up in its own texture](docs/washington.png)
@@ -103,6 +106,46 @@ at one pixel every pixel whose coverage changes touches the full-detail silhouet
 most a diagonal step from it. what's left is shading: a coarse triangle interpolates
 normals over a larger span, and the bound says nothing about normals.
 
+foliage needed more than a distance. a crown with half its needles gone is still close to
+every needle that's left, so a hausdorff bound lets it thin. a foliage group's error now
+also counts the area it lost (its square root, so a cut at t pixels loses about t² pixels
+of coverage a group), and clustered pieces grow back the area of what merged into them. one
+pine at 200 m keeps 0.95 of its full-detail coverage at 1 px (0.88 before), 0.85 at 4 px
+(0.72), 0.60 at 16 px (0.45). it costs triangles honestly: the forest draws 139 million
+where it drew 90, 7.26 ms where it took 5.63. at equal coverage it needs about half as
+many as before.
+
+## against meshoptimizer
+
+`docs/compare` builds lucy and the dragon with meshoptimizer's
+[clusterlod](https://github.com/zeux/meshoptimizer/blob/master/demo/clusterlod.h), its
+reference nanite-style builder at its own defaults, into colossus's format, and measures
+both through the same renderer: only the builder differs (`make compare`, then
+`python3 docs/compare/compare.py`).
+
+| view | builder | threshold | triangles | coverage differs | farthest from silhouette | flip |
+|---|---|---|---|---|---|---|
+| lucy, close | colossus | 1 px | 374.1k | 0.011% | 1.41 px | 0.0119 |
+| lucy, close | clusterlod | 0.5 px | 365.0k | 0.012% | 1.41 px | 0.0097 |
+| dragon, whole | colossus | 1 px | 273.9k | 0.007% | 0.00 px | 0.0044 |
+| dragon, whole | clusterlod | 0.5 px | 240.9k | 0.012% | 0.00 px | 0.0038 |
+| crowd of nine | colossus | 2 px | 518.6k | 0.038% | 0.00 px | 0.0129 |
+| crowd of nine | clusterlod | 1 px | 462.3k | 0.068% | 1.41 px | 0.0124 |
+| crowd of nine | colossus | 4 px | 235.5k | 0.076% | 2.24 px | 0.0178 |
+| crowd of nine | clusterlod | 2 px | 230.9k | 0.132% | 8.00 px | 0.0167 |
+
+at about the same triangles, clusterlod shades as well or better (its simplifier weighs
+normals; colossus's measures position), and colossus keeps silhouettes tighter: half the
+coverage change or less, and never more than 2.24 px out where clusterlod's stray 8 to 9.
+the thresholds mean different things: clusterlod's is an estimate, and its 1 px draws about
+what colossus's 2 to 4 px does. through the same renderer a triangle costs the same, so the
+crowd at 1 px is 1.54 ms against 1.42 (measured the same day), the price of the guarantee.
+clusterlod builds 1.6 to 3.4 times faster (lucy 78 s against 264) and its files are 4% smaller.
+
+pricing collapses by the change of normal too (`--normal-weight 1`) closes some of the
+shading gap: flip 5 to 10% lower at equal triangles, though each pixel of threshold then
+takes more triangles. it's off by default.
+
 ## performance
 
 rx 9070 xt (radv, mesa 26.2.4), 1920x1080, the 900 instance scene, median of 200 frames
@@ -119,7 +162,7 @@ after 100 of streaming. shading includes shadows and antialiasing.
 | a million instances | 1.81 ms |
 | a million, 1% moving | 2.01 ms |
 | 900 skinned foxes | 1.86 ms |
-| the forest | 5.63 ms |
+| the forest | 7.26 ms |
 | in chrome (webgpu), 900 statues | 1.73 ms |
 
 ## in the browser
@@ -191,10 +234,10 @@ builds the viewer on every push.
   pages every frame (a million foxes: 8.77 ms, 4.32 of it shadows).
 * textures are colour only, with no alpha: a card meant as a cutout draws as its whole
   quad. the browser takes one texture per model.
-* foliage simplifies by vertex clustering, which thins crowns at a distance, and costs the
-  most of anything here: the forest draws 90 million triangles where 900 statues draw 4.8.
-  a scene whose pages outgrow the pool thrashes (the forest in 1 gb: 24.6 ms instead of
-  5.6), so scene files can ask for a bigger pool.
+* foliage costs the most of anything here: keeping crowns full, the forest draws 139
+  million triangles where 900 statues draw 4.8. coverage is measured as area, which
+  overlapping needles overstate. a scene whose pages outgrow the pool thrashes, so scene
+  files can ask for a bigger pool.
 * every number here is from one gpu, an rx 9070 xt on radv.
 
 ## models

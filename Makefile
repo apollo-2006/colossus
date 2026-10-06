@@ -57,4 +57,10 @@ clean:
 
 -include $(LIB_OBJS:.o=.d)
 
-.PHONY: all clean test
+# the meshoptimizer comparison (docs/compare): a meshoptimizer clone beside this one.
+MESHOPT ?= ../meshoptimizer
+compare: docs/compare/clod_build
+docs/compare/clod_build: docs/compare/clod_build.cpp $(LIB_OBJS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(MESHOPT)/src -I$(MESHOPT)/demo $< $(LIB_OBJS) $(wildcard $(MESHOPT)/src/*.cpp) -o $@
+
+.PHONY: all clean test compare
