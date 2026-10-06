@@ -70,7 +70,9 @@ export class Streamer {
         const known = pg.error > 0 && Number.isFinite(pg.error);
         for (const c of pg.children) {
           const predicted = known ? priority * (this.pages[c].error / pg.error) : priority * 0.5;
-          if (predicted <= threshold) continue;
+          // a page reached already at this priority or more is done: in a dag a page has many
+          // paths to it, and walking each again blows up where priorities don't fall.
+          if (predicted <= threshold || (best.get(c) ?? -1) >= predicted) continue;
           want(c, predicted);
           stack.push([c, predicted]);
         }
