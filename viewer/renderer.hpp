@@ -498,8 +498,14 @@ public:
             c = c <= 0.0031308f ? 12.92f * c : 1.055f * std::pow(c, 1 / 2.4f) - 0.055f;
             return uint8_t(std::lround(c * 255));
         };
+        // every half to its byte once: a 1080p recording reads back 6 million a frame.
+        static const std::vector<uint8_t> table = [&] {
+            std::vector<uint8_t> t(65536);
+            for (uint32_t h = 0; h < 65536; ++h) t[h] = srgb(to_float(uint16_t(h)));
+            return t;
+        }();
         for (size_t i = 0; i < size_t(width_) * height_; ++i)
-            for (int c = 0; c < 3; ++c) rgb[3 * i + c] = srgb(to_float(half[4 * i + c]));
+            for (int c = 0; c < 3; ++c) rgb[3 * i + c] = table[half[4 * i + c]];
         return rgb;
     }
 

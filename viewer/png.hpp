@@ -1,6 +1,7 @@
 #pragma once
 // 8-bit rgb png writer without a library: a zlib stream of stored deflate
 // blocks, which every reader accepts.
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -9,11 +10,18 @@
 namespace png {
 
 inline uint32_t crc32(const uint8_t* p, size_t n, uint32_t crc = 0) {
+    // a byte at a time from a table of each byte's eight steps.
+    static const auto table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t b = 0; b < 256; ++b) {
+            uint32_t c = b;
+            for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+            t[b] = c;
+        }
+        return t;
+    }();
     crc = ~crc;
-    for (size_t i = 0; i < n; ++i) {
-        crc ^= p[i];
-        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
+    for (size_t i = 0; i < n; ++i) crc = (crc >> 8) ^ table[(crc ^ p[i]) & 255];
     return ~crc;
 }
 
