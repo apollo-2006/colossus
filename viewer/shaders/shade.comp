@@ -315,8 +315,11 @@ void main() {
             m = Material(sample_texture(tex, uv, duv_dx, duv_dy), (rough.y & 255u) != 0u ? sample_texture(rough, uv, duv_dx, duv_dy).x : 0.75, 0.0);
             // a normal map, in the triangle's tangent frame: from its corners' positions and
             // coordinates, so none is stored. its +y is up the image, and v runs down it.
+            // where a pixel covers more than 8 of its texels, a normal map's detail averages
+            // out: skipped (most of a forest's needles, at a distance).
             const uvec4 nx = texture_materials[first + 1u], ny = texture_materials[first + 2u];
-            if ((nx.y & 255u) != 0u) {
+            const float footprint = max(length(duv_dx * vec2(nx.zw)), length(duv_dy * vec2(nx.zw)));
+            if ((nx.y & 255u) != 0u && footprint < 8.0) {
                 const vec3 dp1 = s.p1 - s.p0, dp2 = s.p2 - s.p0;
                 const vec2 d1 = uv1 - uv0, d2 = uv2 - uv0;
                 const float det = d1.x * d2.y - d2.x * d1.y;
