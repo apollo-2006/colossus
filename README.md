@@ -23,10 +23,10 @@ the proofs ran out.
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
 900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
-billion triangles at full detail, drawn at 1920x1080 in 1.48 ms on an rx 9070 xt with
+billion triangles at full detail, drawn at 1920x1080 in 1.51 ms on an rx 9070 xt with
 soft shadows, bounce light, ambient occlusion and antialiasing. about 4.8 million
 triangles reach the screen, from about 20 mb of the 427 mb on disk. a million instances
-(17.6 trillion triangles) take 1.81 ms.
+(17.6 trillion triangles) take 1.78 ms.
 
 ## how it works
 
@@ -63,25 +63,25 @@ story; in short:
   animations, errors measured in their poses. foliage, thousands of needles that edge
   collapse won't delete, falls back to vertex clustering that keeps outlines whole, grows
   what's left to keep the area of what merged away, and counts lost area in its error, so
-  crowns stay full at a distance.
+  crowns stay full at a distance. gltf normal and roughness maps shade the detail.
 
 the commit messages have every step's numbers.
 
 ![a pine forest at eye level: tall pines and firs, saplings, ferns, grass and mossy rocks in hazy light](docs/forest.png)
 
 poly haven's cc0 pine forest (`python3 models/forest.py`): 55 models scattered into 14,780
-instances, 753 million triangles at full detail, 138.9 million drawn in 7.26 ms at
-1920x1080.
+instances, 753 million triangles at full detail, 113 million drawn in 7.49 ms at
+1920x1080, with poly haven's normal and roughness maps.
 
 ![horatio greenough's george washington, scanned by the smithsonian, close up in its own texture](docs/washington.png)
 
 horatio greenough's george washington (1840), the smithsonian american art museum's scan:
-17 million triangles and a 4096x4096 texture, streamed in tiles. 1.04 ms.
+17 million triangles and a 4096x4096 texture, streamed in tiles. 0.80 ms.
 
 ![a crowd of running, walking and watchful foxes, each skinned and animated](docs/foxes.png)
 
 900 khronos foxes, subdivided to 590 thousand triangles each, walking, running and looking
-round: 1.86 ms.
+round: 1.73 ms.
 
 ![the crowd coloured by lod level, blue for full detail through red to magenta for the coarsest](docs/lod_levels.png)
 
@@ -110,12 +110,18 @@ normals over a larger span, and the bound says nothing about normals.
 
 foliage needed more than a distance. a crown with half its needles gone is still close to
 every needle that's left, so a hausdorff bound lets it thin. a foliage group's error now
-also counts the area it lost (its square root, so a cut at t pixels loses about t² pixels
-of coverage a group), and clustered pieces grow back the area of what merged into them. one
-pine at 200 m keeps 0.95 of its full-detail coverage at 1 px (0.88 before), 0.85 at 4 px
-(0.72), 0.60 at 16 px (0.45). it costs triangles honestly: the forest draws 139 million
-where it drew 90, 7.26 ms where it took 5.63. at equal coverage it needs about half as
-many as before.
+also counts the area it lost (half its square root, so a cut at t pixels loses about (2t)²
+pixels of coverage a group), and clustered pieces grow back the area of what merged into
+them. one pine at 1 px, triangles and its share of full-detail coverage:
+
+| pine at | without | counting half the lost area | counting all of it |
+|---|---|---|---|
+| 50 m | 2.52m, 0.972 | 2.94m, 0.981 | 3.93m, 0.989 |
+| 200 m | 730k, 0.882 | 1.01m, 0.912 | 1.86m, 0.951 |
+| 400 m | 346k, 0.916 | 425k, 0.932 | 980k, 0.963 |
+
+half (the default) keeps most of the gain for 1.2 to 1.4 times the triangles. the forest
+draws 113 million where it drew 90.
 
 ## against meshoptimizer
 
@@ -150,22 +156,24 @@ takes more triangles. it's off by default.
 
 ## performance
 
-rx 9070 xt (radv, mesa 26.2.4), 1920x1080, the 900 instance scene, median of 200 frames
-after 100 of streaming. shading includes shadows and antialiasing.
+rx 9070 xt (radv, mesa 26.2.4), 1920x1080, the median of 200 frames after the pages
+settle. shading includes shadows and antialiasing. `docs/bench.sh` measures all of it.
 
-| camera | frame | culling | raster | pass 2 | shadow pages | shading | triangles |
+| scene | frame | culling | raster | pass 2 | shadow pages | shading | triangles |
 |---|---|---|---|---|---|---|---|
-| beside lucy (top image) | 1.48 ms | 0.17 | 0.26 | 0.10 | 0.08 | 0.88 | 4.77m |
-| raised (lod image) | 1.67 ms | 0.11 | 0.36 | 0.09 | 0.08 | 1.03 | 7.44m |
-| ground level | 1.37 ms | 0.14 | 0.22 | 0.10 | 0.07 | 0.83 | 3.86m |
+| 900 statues, beside lucy (top image) | 1.51 ms | 0.17 | 0.27 | 0.10 | 0.08 | 0.89 | 4.78m |
+| 900 statues, raised (lod image) | 1.70 ms | 0.11 | 0.38 | 0.09 | 0.08 | 1.04 | 7.37m |
+| 900 statues, ground level | 1.40 ms | 0.15 | 0.23 | 0.10 | 0.08 | 0.84 | 3.83m |
+| a million statues | 1.78 ms | 0.24 | 0.47 | 0.22 | 0.07 | 0.78 | 13.0m |
+| a million, 1% moving | 1.95 ms | 0.23 | 0.41 | 0.23 | 0.37 | 0.71 | 13.4m |
+| washington, close | 0.80 ms | 0.10 | 0.06 | 0.08 | 0.05 | 0.51 | 357k |
+| 900 skinned foxes | 1.73 ms | 0.14 | 0.34 | 0.08 | 0.70 | 0.46 | 4.59m |
+| the forest | 7.49 ms | 0.93 | 4.95 | 0.33 | 0.06 | 1.22 | 113m |
 
-| scene | frame |
-|---|---|
-| a million instances | 1.81 ms |
-| a million, 1% moving | 2.01 ms |
-| 900 skinned foxes | 1.86 ms |
-| the forest | 7.26 ms |
-| in chrome (webgpu), 900 statues | 1.73 ms |
+in chrome (webgpu), 900 statues take 1.73 ms of gpu time. the forest's raster is bound by
+the visibility buffer's traffic, not its triangles: without the writes it rasterizes 364
+million in 1.33 ms. resolving each cluster in shared memory first was slower at every tile
+size tried (64-bit shared atomics and lost occupancy outweigh the traffic saved).
 
 ## in the browser
 
@@ -233,13 +241,16 @@ builds the viewer on every push.
 * proving bounds makes building slow: 4.4 minutes for lucy.
 * skinning is linear blend, its errors measured over the shipped animations, not proven.
   moving and animated instances are expensive in the shadow maps, which redraw their
-  pages every frame (a million foxes: 8.77 ms, 4.32 of it shadows).
-* textures are colour only, with no alpha: a card meant as a cutout draws as its whole
-  quad. the browser takes one texture per model.
-* foliage costs the most of anything here: keeping crowns full, the forest draws 139
-  million triangles where 900 statues draw 4.8. coverage is measured as area, which
-  overlapping needles overstate. a scene whose pages outgrow the pool thrashes, so scene
-  files can ask for a bigger pool.
+  pages every frame (a million foxes: 7.29 ms, 4.10 of it shadows).
+* at equal triangles meshoptimizer shades better: colossus's error is a distance, so its
+  cuts spend triangles on silhouettes. pricing collapses by normals didn't move that, even as
+  hoppe's attribute quadrics; making shading part of the error would, at the guarantee's cost.
+* textures have no alpha: a card meant as a cutout draws as its whole quad. the browser
+  takes one material's colour.
+* foliage costs the most of anything here: keeping crowns full, the forest draws 113
+  million triangles where 900 statues draw 4.8, bound by the visibility buffer's traffic.
+  coverage is measured as area, which overlapping needles overstate. a scene whose pages
+  outgrow the pool thrashes, so scene files can ask for a bigger pool.
 * every number here is from one gpu, an rx 9070 xt on radv.
 
 ## models
