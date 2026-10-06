@@ -3,97 +3,108 @@
 [![ci](https://github.com/apollo-2006/colossus/actions/workflows/ci.yml/badge.svg)](https://github.com/apollo-2006/colossus/actions/workflows/ci.yml)
 [![license: mit](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-virtualized geometry from scratch, in c++20 and vulkan. a builder turns a scanned model
-into a crack-free hierarchy of clusters; a renderer streams it from disk and draws
-thousands of copies, picking per cluster the coarsest detail within a pixel of the
-original. it's the idea behind unreal engine 5's nanite, built here with nothing but
-vulkan and glfw: clustering, simplification, streaming, culling, both rasterizers,
-shadows and shading all live in this repository.
+hey! colossus is a virtualized geometry renderer I built from scratch in c++20 and vulkan.
+it's the idea behind unreal engine 5's nanite: a builder turns a scanned model into a
+crack-free hierarchy of triangle clusters, and a renderer streams it from disk and draws
+thousands of copies, every cluster picking the coarsest detail that's still within a pixel
+of the original. no engine underneath, just vulkan and glfw, so clustering,
+simplification, streaming, culling, both rasterizers, shadows and shading all live right
+here in this repo.
+
+it started as a "let me actually understand nanite" side project that I didn't even plan
+to put on github, and then I got a little obsessed. the thing I cared about most is making
+"within a pixel" a real, proven bound instead of an estimate, and checking that it holds.
 
 **[fly through it in your browser →](https://apollo-2006.github.io/colossus/)** the
-webgpu port, with the debug views, the error threshold and the crowd size to play with.
+webgpu port, with the debug views, the error threshold and the crowd size to play with
+(needs a desktop gpu).
 
 **[read how it was built →](https://abirdeol.tech/abir-deol-colossus-within-a-pixel.pdf)**
-*within a pixel*, an 11 page write-up (a working draft, still being revised): the hierarchy, the proven error bound and how it's
-checked, streaming, textures, skinning, foliage, a comparison with meshoptimizer, and where
-the proofs ran out.
+*within a pixel*, my write-up of the whole thing (a working draft, still being revised):
+the hierarchy, the error bound and how I check it, streaming, textures, skinning, foliage,
+a comparison with meshoptimizer, and all the places the proofs ran out.
 
 [![a minute of colossus: the forest, the crowd, the error slider on lucy's clusters, a museum scan, skinned foxes and a million instances](docs/video.jpg)](https://apollo-2006.github.io/colossus/colossus.mp4)
 
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
 
-900 instances of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): 15.9
-billion triangles at full detail, drawn at 1920x1080 in 1.51 ms on an rx 9070 xt with
-soft shadows, bounce light, ambient occlusion and antialiasing. about 4.8 million
-triangles reach the screen, from about 20 mb of the 427 mb on disk. a million instances
+900 copies of lucy (28 million triangles) and the xyz rgb dragon (7.2 million): that's 15.9
+billion triangles at full detail, drawn at 1920x1080 in 1.51 ms on my rx 9070 xt, with soft
+shadows, bounce light, ambient occlusion and antialiasing. only about 4.8 million triangles
+actually reach the screen, from about 20 mb of the 427 mb on disk. a million instances
 (17.6 trillion triangles) take 1.78 ms.
 
 ## how it works
 
-the [paper](https://abirdeol.tech/abir-deol-colossus-within-a-pixel.pdf) has the whole
-story; in short:
+the [write-up](https://abirdeol.tech/abir-deol-colossus-within-a-pixel.pdf) has the whole
+story, but here's the short version:
 
-* **a hierarchy of clusters.** clusters of at most 128 triangles, by recursive bisection
-  of the triangle graph. groups of about eight are merged and simplified to half with the
-  vertices they share with other groups locked, so any mix of levels meets edge for edge,
-  level after level up to one small root (`src/cluster.cpp`, `src/dag.cpp`,
-  `src/simplify.cpp`).
-* **errors that are proven.** each group's error is an upper bound on the two-sided
-  distance from what it replaced, not an estimate (`src/deviation.cpp`), and its
-  projection to the screen is bounded too. errors only grow toward the root, so
-  `own error on screen <= 1 pixel < parent error on screen` picks exactly one level on
-  every path: one gpu thread per cluster, no tree to walk.
-* **checked, not trusted.** every level indexes the original vertices, so a crack is
-  exact; `--check` tests 25 cuts and every model here has none. `docs/quality.py`
-  measures the bound in pixels (below).
-* **culling.** cells of instances, then instances, then clusters, each against the
-  frustum and last frame's depth pyramid, with a second pass for anything newly visible.
-* **two rasterizers.** clusters over 32 pixels go to mesh shaders, smaller ones to a
-  compute rasterizer, both into one 64-bit visibility buffer. compute triangles grow by
-  1/256 of a pixel so the seams between the two stay watertight.
-* **streaming.** only bounds and errors stay resident, 48 bytes a cluster. bit-packed
-  pages load into a fixed pool on eight threads, and a page is resident only while its
-  coarser stand-ins are, so exactly one cluster draws on every path whatever has loaded.
-* **shading.** each pixel refetches its triangle for exact barycentrics. virtual shadow
-  maps (a 14 level clipmap drawn from the same hierarchy), gtao ambient occlusion, a
-  bounce of indirect light, taa, and procedural marble, sandstone, granite, gold and
-  bronze for scans with no uvs.
-* **real content.** textures stream as tiles through the same pool, wedges carrying
-  coordinates and materials through simplification. skinned gltf models play their
-  animations, errors measured in their poses. foliage, thousands of needles that edge
-  collapse won't delete, falls back to vertex clustering that keeps outlines whole, grows
-  what's left to keep the area of what merged away, and counts lost area in its error, so
-  crowns stay full at a distance. gltf normal and roughness maps shade the detail.
+* **a hierarchy of clusters.** every model gets cut into clusters of at most 128
+  triangles by recursively bisecting its triangle graph (an earlier greedy approach kept
+  leaving half-empty clusters; bisection fills them). groups of about eight get merged and
+  simplified to half, with the vertices they share with other groups locked in place, so
+  any mix of levels still meets edge for edge. that repeats level after level until one
+  small root is left (`src/cluster.cpp`, `src/dag.cpp`, `src/simplify.cpp`).
+* **errors that are proven.** this is the part I'm proudest of. each group's error is an
+  upper bound on how far it can be from what it replaced, not an estimate
+  (`src/deviation.cpp`), and the way it's projected onto the screen is bounded too. errors
+  only grow toward the root, so one comparison per cluster,
+  `own error on screen <= 1 pixel < parent error on screen`, picks exactly one level on
+  every path. one gpu thread per cluster, no tree to walk.
+* **checked, not trusted.** every level reuses the original vertices, so a crack is easy to
+  spot exactly. `--check` tests 25 cuts, and every model here comes out with none.
+  `docs/quality.py` measures what the bound means in actual pixels (more below).
+* **culling.** cells of instances, then instances, then clusters, each tested against the
+  view and last frame's depth, with a second pass to catch anything newly visible.
+* **two rasterizers.** clusters bigger than 32 pixels go to mesh shaders, smaller ones to
+  a compute rasterizer (pixel-sized triangles are what hardware handles worst), both
+  writing into one 64-bit visibility buffer. compute triangles grow by 1/256 of a pixel so
+  the seams between the two stay watertight. (that one was a fun bug to find.)
+* **streaming.** only bounds and errors stay in memory, 48 bytes a cluster. everything else
+  lives in bit-packed pages that stream into a fixed pool on eight threads, and a page is
+  only ever resident while its coarser stand-ins are, so whatever has loaded, every path
+  draws exactly one cluster.
+* **shading.** each pixel looks its triangle back up for exact barycentrics. there are
+  virtual shadow maps (a 14 level clipmap drawn from the same hierarchy), gtao ambient
+  occlusion, a bounce of indirect light, taa, and procedural marble, sandstone, granite,
+  gold and bronze for the scans that come without textures.
+* **real content.** textures stream as tiles through the same pool. skinned gltf models
+  play their animations, with errors measured in their poses (the proof stops working once
+  things bend, so that part is measured, not proven). foliage was its own adventure:
+  thousands of needles that normal simplification won't delete, so it falls back to vertex
+  clustering, grows what's left back to the area it lost, and counts lost area in its
+  error so crowns stay full at a distance. gltf normal and roughness maps shade the detail.
 
-the commit messages have every step's numbers.
+if you like numbers, the commit messages have every step's before and after.
 
 ![a pine forest at eye level: tall pines and firs, saplings, ferns, grass and mossy rocks in hazy light](docs/forest.png)
 
 poly haven's cc0 pine forest (`python3 models/forest.py`): 55 models scattered into 14,780
-instances, 753 million triangles at full detail, 113 million drawn in 7.49 ms at
+instances, 753 million triangles at full detail. 113 million get drawn, in 7.49 ms at
 1920x1080, with poly haven's normal and roughness maps.
 
 ![horatio greenough's george washington, scanned by the smithsonian, close up in its own texture](docs/washington.png)
 
-horatio greenough's george washington (1840), the smithsonian american art museum's scan:
-17 million triangles and a 4096x4096 texture, streamed in tiles. 0.80 ms.
+horatio greenough's george washington (1840), scanned by the smithsonian american art
+museum: 17 million triangles and a 4096x4096 texture, streamed in tiles. 0.80 ms.
 
 ![a crowd of running, walking and watchful foxes, each skinned and animated](docs/foxes.png)
 
-900 khronos foxes, subdivided to 590 thousand triangles each, walking, running and looking
-round: 1.73 ms.
+900 khronos foxes, each subdivided to 590 thousand triangles, walking, running and looking
+around: 1.73 ms.
 
 ![the crowd coloured by lod level, blue for full detail through red to magenta for the coarsest](docs/lod_levels.png)
 
-lod levels (view 4): near dragons draw mid levels, distant statues the coarsest, and
-single instances mix levels as they recede.
+lod levels (view 4): the nearby dragons draw mid levels, the distant statues the coarsest,
+and you can watch single statues mix levels as they recede.
 
-## quality
+## does "within a pixel" actually hold?
 
+a proof about distances isn't a statement about pixels yet, so I measured it.
 `docs/quality.py` renders five views at a threshold of 0.05 pixels (full detail, near
-enough) and at the threshold under test, with every source of frame-to-frame noise off.
-a coverage view measures how far each pixel whose coverage changed lies from the
-full-detail silhouette; nvidia's [flip](https://github.com/NVlabs/flip) compares the
+enough) and at the threshold being tested, with every source of frame-to-frame noise
+turned off. a coverage view checks how far each pixel that changed lies from the
+full-detail silhouette, and nvidia's [flip](https://github.com/NVlabs/flip) compares the
 shaded images.
 
 | view | full detail | at 1 px | coverage differs | farthest from silhouette | flip | pixels off by over 8/255 |
@@ -104,15 +115,16 @@ shaded images.
 | fox, walking | 554.0k | 62.3k | 0.001% | 0.00 px | 0.0003 | 0.03% |
 | crowd of nine | 21.66m | 1.10m | 0.020% | 1.41 px | 0.0096 | 1.77% |
 
-at one pixel every pixel whose coverage changes touches the full-detail silhouette, at
-most a diagonal step from it. what's left is shading: a coarse triangle interpolates
-normals over a larger span, and the bound says nothing about normals.
+it does: at one pixel, every pixel whose coverage changes touches the full-detail
+silhouette, at most a diagonal step away. what's left over is shading, since a coarse
+triangle blends its normals over a bigger area and the bound says nothing about normals.
 
-foliage needed more than a distance. a crown with half its needles gone is still close to
-every needle that's left, so a hausdorff bound lets it thin. a foliage group's error now
-also counts the area it lost (half its square root, so a cut at t pixels loses about (2t)²
-pixels of coverage a group), and clustered pieces grow back the area of what merged into
-them. one pine at 1 px, triangles and its share of full-detail coverage:
+foliage taught me the bound wasn't the whole story, though. a crown with half its needles
+gone is still "close" to every needle that's left, so a pure distance bound happily lets a
+tree go see-through. so for foliage the error also counts the area a simplification lost
+(half its square root: a cut at t pixels loses about (2t)² pixels of coverage per group),
+and clustered pieces grow back the area of what merged into them. one pine at 1 px,
+triangles and how much of its full-detail coverage it keeps:
 
 | pine at | without | counting half the lost area | counting all of it |
 |---|---|---|---|
@@ -120,16 +132,16 @@ them. one pine at 1 px, triangles and its share of full-detail coverage:
 | 200 m | 730k, 0.882 | 1.01m, 0.912 | 1.86m, 0.951 |
 | 400 m | 346k, 0.916 | 425k, 0.932 | 980k, 0.963 |
 
-half (the default) keeps most of the gain for 1.2 to 1.4 times the triangles. the forest
-draws 113 million where it drew 90.
+half (the default) keeps most of the gain for 1.2 to 1.4 times the triangles. the whole
+forest draws 113 million where it used to draw 90.
 
 ## against meshoptimizer
 
-`docs/compare` builds lucy and the dragon with meshoptimizer's
-[clusterlod](https://github.com/zeux/meshoptimizer/blob/master/demo/clusterlod.h), its
-reference nanite-style builder at its own defaults, into colossus's format, and measures
-both through the same renderer: only the builder differs (`make compare`, then
-`python3 docs/compare/compare.py`).
+I wanted an honest yardstick, so `docs/compare` builds lucy and the dragon with
+meshoptimizer's [clusterlod](https://github.com/zeux/meshoptimizer/blob/master/demo/clusterlod.h),
+the reference nanite-style builder a lot of people use, at its own defaults, converts the
+result into colossus's format, and measures both through the same renderer. only the
+builder changes (`make compare`, then `python3 docs/compare/compare.py`).
 
 | view | builder | threshold | triangles | coverage differs | farthest from silhouette | flip |
 |---|---|---|---|---|---|---|
@@ -142,22 +154,24 @@ both through the same renderer: only the builder differs (`make compare`, then
 | crowd of nine | colossus | 4 px | 235.5k | 0.076% | 2.24 px | 0.0178 |
 | crowd of nine | clusterlod | 2 px | 230.9k | 0.132% | 8.00 px | 0.0167 |
 
-at about the same triangles, clusterlod shades as well or better (its simplifier weighs
-normals; colossus's measures position), and colossus keeps silhouettes tighter: half the
+the result was more interesting than "mine wins". at about the same number of triangles,
+clusterlod shades as well or better, and colossus keeps silhouettes tighter: half the
 coverage change or less, and never more than 2.24 px out where clusterlod's stray 8 to 9.
-the thresholds mean different things: clusterlod's is an estimate, and its 1 px draws about
-what colossus's 2 to 4 px does. through the same renderer a triangle costs the same, so the
-crowd at 1 px is 1.54 ms against 1.42 (measured the same day), the price of the guarantee.
-clusterlod builds 1.6 to 3.4 times faster (lucy 78 s against 264) and its files are 4% smaller.
+the thresholds mean different things too: clusterlod's is an estimate, and its 1 px draws
+about what colossus's 2 to 4 px does. a triangle costs the same through the same renderer,
+so the crowd at 1 px is 1.54 ms against 1.42 (measured the same day), which is basically
+the price of the guarantee. and clusterlod builds 1.6 to 3.4 times faster (lucy in 78 s
+against 264) with files 4% smaller, so that one's all theirs.
 
 pricing collapses by the change of normal too (`--normal-weight 1`) closes some of the
-shading gap: flip 5 to 10% lower at equal triangles, though each pixel of threshold then
-takes more triangles. it's off by default.
+shading gap, flip 5 to 10% lower at equal triangles, but each pixel of threshold then takes
+more triangles, so it's off by default.
 
 ## performance
 
-rx 9070 xt (radv, mesa 26.2.4), 1920x1080, the median of 200 frames after the pages
-settle. shading includes shadows and antialiasing. `docs/bench.sh` measures all of it.
+all of this is on my rx 9070 xt (radv, mesa 26.2.4) at 1920x1080, the median of 200 frames
+once the pages settle. shading includes shadows and antialiasing. `docs/bench.sh` measures
+the whole table, so you can run it on your own gpu.
 
 | scene | frame | culling | raster | pass 2 | shadow pages | shading | triangles |
 |---|---|---|---|---|---|---|---|
@@ -170,26 +184,27 @@ settle. shading includes shadows and antialiasing. `docs/bench.sh` measures all 
 | 900 skinned foxes | 1.73 ms | 0.14 | 0.34 | 0.08 | 0.70 | 0.46 | 4.59m |
 | the forest | 7.49 ms | 0.93 | 4.95 | 0.33 | 0.06 | 1.22 | 113m |
 
-in chrome (webgpu), 900 statues take 1.73 ms of gpu time. the forest's raster is bound by
-the visibility buffer's traffic, not its triangles: without the writes it rasterizes 364
-million in 1.33 ms. resolving each cluster in shared memory first was slower at every tile
-size tried (64-bit shared atomics and lost occupancy outweigh the traffic saved).
+in chrome (webgpu), the 900 statues take 1.73 ms of gpu time. the forest is the heavy one,
+and it turns out its raster is bound by traffic to the visibility buffer, not by its
+triangles: with the writes taken out it gets through 364 million triangles in 1.33 ms.
+the obvious fix, resolving each cluster in shared memory first, was slower at every tile
+size I tried (64-bit shared atomics and lost occupancy cost more than the traffic they
+saved), so that one's still open.
 
 ## in the browser
 
-`web/` is the same renderer in webgpu, which has no mesh shaders, 64-bit atomics or ray
-queries: big clusters use a plain render pipeline, the compute rasterizer runs twice
-(depth, then the triangle where its depth won), and pages stream over http range
-requests. it needs 16 storage buffers per shader stage, which desktop gpus allow; anything
-else gets a webgl2 fallback (`web/lite.js`) that runs the same lod test on the cpu for
-one model. `?still` holds the camera, `?fallback` shows the fallback anywhere.
-`web/build.sh` builds its models.
+`web/` is the same renderer in webgpu. webgpu has no mesh shaders, 64-bit atomics or ray
+queries, so big clusters use a plain render pipeline, the compute rasterizer runs twice
+(depth first, then the triangle wherever its depth won), and pages stream over http range
+requests. it needs 16 storage buffers per shader stage, which desktop gpus have; anything
+else (like most phones) gets a webgl2 fallback (`web/lite.js`) that runs the same lod test
+on the cpu for one model. `?still` holds the camera still and `?fallback` shows the
+fallback anywhere. `web/build.sh` builds its models.
 
 ## build & run
 
-you'll need a gpu with vulkan 1.3 and `VK_EXT_mesh_shader`, the vulkan headers and
-loader, glfw and `glslc`. ray queries are optional, only `--shadows rt` and `--gi rt`
-use them.
+you'll need a gpu with vulkan 1.3 and `VK_EXT_mesh_shader`, the vulkan headers and loader,
+glfw and `glslc`. ray queries are optional, only `--shadows rt` and `--gi rt` use them.
 
 ```bash
 git clone https://github.com/apollo-2006/colossus.git
@@ -215,7 +230,7 @@ python3 models/forest.py                                  # the forest (2.2 gb d
 | w a s d, q e | move, down and up; drag to look; scroll for speed, shift to hurry |
 | 1 to 9, 0 | shaded, clusters, triangles, lod level, groups, instances, holes, rasterizer, shadow levels, ambient occlusion |
 | [ and ] | halve or double the error threshold (1 pixel) |
-| f | freeze culling, then fly out and watch it |
+| f | freeze culling, then fly out and watch it (my favourite one) |
 | c v o r h x | cone culling, frustum culling, occlusion, compute rasterizer, shadows, antialiasing |
 | j g b i | soft shadows, ambient occlusion, bounce light, traced bounce light (`--gi rt`) |
 | t, p | wireframe; print the camera as a `--camera` argument |
@@ -226,34 +241,36 @@ median frame's timings. `docs/shots.sh` renders the images on this page.
 ## tests
 
 `make test` needs no gpu or downloads. `tests/builder_test.cpp` builds full hierarchies
-(closed, holed, flat, textured, multi-material, skinned, and a foliage of islands) and
-crack-checks them at 31 cuts, round-trips the page format exactly, checks the proven
-error against brute force on about 94,000 random points, and checks bc1 tiles and
-truncated files. without the group locks it finds 39,095 cracked edges on the sphere
-alone. `tests/streamer_test.cpp` runs 3,000 frames of random requests into a small pool,
-checking every frame that resident pages' dependencies are resident. ci runs both and
-builds the viewer on every push.
+(closed, holed, flat, textured, multi-material, skinned, and a pile of foliage islands) and
+crack-checks them at 31 cuts, round-trips the page format exactly, checks the proven error
+against brute force on about 94,000 random points, and checks the texture formats and
+truncated files. fun fact: without the group locks, it finds 39,095 cracked edges on the
+test sphere alone. `tests/streamer_test.cpp` throws 3,000 frames of random requests at a
+small pool, checking every frame that resident pages' dependencies are resident. ci runs
+both and builds the viewer on every push, and the demo only publishes once every model
+draws in a real browser.
 
-## limitations
+## what it doesn't do (yet)
 
-* the bound is proven for geometry, not shading: a normal or a shadow can shift by more
-  than a pixel's worth where they depend on detail the cut removed.
+* the bound is proven for geometry, not shading: a normal or a shadow can still shift by
+  more than a pixel's worth where they depend on detail the cut removed.
 * proving bounds makes building slow: 4.4 minutes for lucy.
-* skinning is linear blend, its errors measured over the shipped animations, not proven.
-  moving and animated instances are expensive in the shadow maps, which redraw their
+* skinning is linear blend, with errors measured over the shipped animations rather than
+  proven. moving and animated instances are expensive in the shadow maps, which redraw their
   pages every frame (a million foxes: 7.29 ms, 4.10 of it shadows).
 * at equal triangles meshoptimizer shades better: colossus's error is a distance, so its
-  cuts spend triangles on silhouettes. pricing collapses by normals didn't move that, even as
-  hoppe's attribute quadrics; making shading part of the error would, at the guarantee's cost.
-* textures have no alpha: a card meant as a cutout draws as its whole quad. the browser
-  takes one material's colour.
-* foliage costs the most of anything here: keeping crowns full, the forest draws 113
-  million triangles where 900 statues draw 4.8, bound by the visibility buffer's traffic.
-  coverage is measured as area, which overlapping needles overstate. a scene whose pages
-  outgrow the pool thrashes, so scene files can ask for a bigger pool.
-* every number here is from one gpu, an rx 9070 xt on radv.
+  cuts spend triangles on silhouettes. pricing collapses by normals didn't change that, even
+  with hoppe's attribute quadrics; making shading part of the error would, but that's a
+  different promise.
+* textures have no alpha, so a card meant as a cutout draws as its whole quad. the browser
+  only takes one material's colour.
+* foliage is the most expensive thing here: keeping crowns full, the forest draws 113
+  million triangles where 900 statues draw 4.8, and it's bound by visibility-buffer
+  traffic. coverage is measured as area, which overlapping needles overstate. a scene whose
+  pages outgrow the pool thrashes, so scene files can ask for a bigger pool.
+* every number here comes from one gpu, my rx 9070 xt on radv. nvidia and intel are next.
 
-## models
+## models (and thanks)
 
 lucy and the xyz rgb asian dragon come from the
 [stanford 3d scanning repository](http://graphics.stanford.edu/data/3Dscanrep/), with
@@ -265,3 +282,7 @@ the [khronos gltf sample assets](https://github.com/KhronosGroup/glTF-Sample-Ass
 by pixelmannen (cc0), rigging and animation by tomkranis (cc by 4.0), gltf conversion by
 asobostudio and scurest (cc by 4.0). the forest is [poly haven](https://polyhaven.com)'s
 pine forest collection (cc0), downloaded by `models/forest.py`.
+
+and a big thank you to brian karis, rune stubbe and graham wihlidal for the nanite talks
+that started all of this, and to arseny kapoulkine for meshoptimizer, which was my
+reference the whole way through.
