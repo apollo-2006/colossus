@@ -486,16 +486,47 @@ void grow_to_area(const std::vector<vec3>& positions, const std::vector<uint32_t
         }
         pieces[find(to)].want += a;
     }
-    // grow each piece short of its area about its area's centre; locked vertices stay.
+    // grow each piece short of its area about its area's centre; locked vertices stay. a piece
+    // with a locked vertex stretches unevenly (its fan from that vertex grows faster than the
+    // rest), so the scale is searched for, the piece's area measured at each try.
+    std::unordered_map<uint32_t, std::vector<size_t>> piece_tris;
+    for (size_t t = 0; t < r.indices.size(); t += 3) piece_tris[find(r.indices[t])].push_back(t);
+    // pieces holding more than was attributed to them (clustering folds area in from
+    // elsewhere) keep it, so the rest grow only by what is missing overall, each in proportion
+    // to its shortfall: the result never exceeds the input.
+    double surplus = 0, shortfall = 0;
+    for (const auto& [root, p] : pieces) {
+        if (p.want > p.have) shortfall += p.want - p.have;
+        else surplus += p.have - p.want;
+    }
+    const double share = shortfall > 0 ? std::max(0.0, 1 - surplus / shortfall) : 0;
+    for (auto& [root, p] : pieces)
+        if (p.want > p.have) p.want = p.have + (p.want - p.have) * share;
     std::unordered_map<uint32_t, uint32_t> moved;  // vertex: new_vertex_bit | k
     for (auto& [root, p] : pieces) {
         if (p.have <= 0 || p.want <= p.have * 1.02) continue;
-        const float scale = std::min(float(std::sqrt(p.want / p.have)), max_scale);
         const vec3 centre = p.centre * float(1 / p.have);
+        auto at = [&](uint32_t v, float scale) { return locked[v] ? positions[v] : centre + (positions[v] - centre) * scale; };
+        auto area_at = [&](float scale) {
+            double sum = 0;
+            for (size_t t : piece_tris[root]) {
+                const vec3 a = at(r.indices[t], scale), b = at(r.indices[t + 1], scale), c = at(r.indices[t + 2], scale);
+                sum += 0.5 * length(cross(b - a, c - a));
+            }
+            return sum;
+        };
+        float lo = 1, hi = max_scale;
+        if (area_at(hi) > p.want)
+            for (int k = 0; k < 24; ++k) {
+                const float mid = 0.5f * (lo + hi);
+                (area_at(mid) > p.want ? hi : lo) = mid;
+            }
+        const float scale = area_at(hi) > p.want ? lo : hi;
+        if (scale <= 1) continue;
         for (const auto& [v, rv] : parent) {
             if (locked[v] || find(v) != root) continue;
             moved[v] = new_vertex_bit | uint32_t(r.new_positions.size());
-            r.new_positions.push_back(centre + (positions[v] - centre) * scale);
+            r.new_positions.push_back(at(v, scale));
             r.new_from.push_back(v);
         }
     }

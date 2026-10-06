@@ -124,7 +124,7 @@ mesh grid_textured(mesh m, uint32_t cells) {
 
 // foliage: islands no edge collapse may remove, scattered through a ball: small closed
 // tetrahedra and open cards (two triangles, a hole's rim all round), like needles and leaves.
-mesh islands(int count, unsigned seed) {
+mesh islands(int count, unsigned seed, bool cards_only = false) {
     mesh m;
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> u(-1, 1);
@@ -135,7 +135,7 @@ mesh islands(int count, unsigned seed) {
         const vec3 a(u(rng), u(rng), u(rng)), b(u(rng), u(rng), u(rng));
         const float r = 0.02f;
         const uint32_t base = uint32_t(m.positions.size());
-        if (k % 2) {  // a tetrahedron
+        if (k % 2 && !cards_only) {  // a tetrahedron
             m.positions.insert(m.positions.end(), {c + a * r, c + b * r, c + cross(a, b) * r, c - (a + b) * (r * 0.5f)});
             m.indices.insert(m.indices.end(), {base, base + 1, base + 2, base, base + 3, base + 1, base + 1, base + 3, base + 2,
                                                base + 2, base + 3, base});
@@ -768,7 +768,70 @@ void test_deviation_bound() {
     CHECK(bound <= 1.25f * std::max(brute, sampled));
 }
 
+// foliage keeps its coverage (dag.cpp): grow_to_area() gives clustered pieces back the area
+// of what merged into them without moving a locked vertex, and every foliage group's error is
+// at least its inputs' plus the side of the square of area it lost.
+void test_foliage_coverage() {
+    std::printf("foliage coverage\n");
+    auto area = [](const std::vector<vec3>& p, const std::vector<uint32_t>& idx) {
+        double a = 0;
+        for (size_t t = 0; t < idx.size(); t += 3) a += 0.5 * length(cross(p[idx[t + 1]] - p[idx[t]], p[idx[t + 2]] - p[idx[t]]));
+        return a;
+    };
+
+    // 400 thin cards in a small ball, clustered hard, one vertex locked.
+    mesh m = islands(400, 3, true);
+    for (vec3& p : m.positions) p = p * 0.3f;
+    std::vector<uint8_t> locked(m.positions.size(), 0);
+    locked[m.indices[0]] = 1;
+    simplify_result r = cluster_vertices(m.positions, m.indices, 60, nullptr, &locked);
+    const double before = area(m.positions, m.indices), clustered = area(m.positions, r.indices);
+    grow_to_area(m.positions, m.indices, r, locked, nullptr, 3.0f);
+    std::vector<vec3> all = m.positions;
+    all.insert(all.end(), r.new_positions.begin(), r.new_positions.end());
+    std::vector<uint32_t> grown = r.indices;
+    for (uint32_t& v : grown)
+        if (v & new_vertex_bit) v = uint32_t(m.positions.size()) + (v & ~new_vertex_bit);
+    const double after = area(all, grown);
+    std::printf("  area: %.4f in, %.4f clustered, %.4f grown\n", before, clustered, after);
+    CHECK(clustered < before * 0.9);  // the clustering lost area (else the test tests nothing)
+    CHECK(after > clustered * 1.2 && after <= before * 1.05);
+    for (uint32_t k = 0; k < r.new_from.size(); ++k) CHECK(!locked[r.new_from[k]]);
+    for (uint32_t v : r.indices) CHECK(!(v & new_vertex_bit) || !locked[r.new_from[v & ~new_vertex_bit]]);
+
+    // the error's area term, over a whole hierarchy of cards.
+    m = islands(20000, 9, true);
+    weld(m);
+    const lod_mesh lod = build_lod(m, false);
+    std::map<uint32_t, std::vector<const lod_cluster*>> inputs, outputs;
+    for (const lod_cluster& c : lod.clusters) {
+        if (c.group != UINT32_MAX) inputs[c.group].push_back(&c);
+        if (c.creator != UINT32_MAX) outputs[c.creator].push_back(&c);
+    }
+    size_t groups = 0, short_of = 0;
+    for (const auto& [g, in] : inputs) {
+        if (!outputs.count(g)) continue;
+        std::vector<uint32_t> in_idx, out_idx;
+        float child = 0;
+        for (const lod_cluster* c : in) {
+            in_idx.insert(in_idx.end(), c->indices.begin(), c->indices.end());
+            child = std::max(child, c->lod_error);
+        }
+        float error = INFINITY;
+        for (const lod_cluster* c : outputs[g]) {
+            out_idx.insert(out_idx.end(), c->indices.begin(), c->indices.end());
+            error = std::min(error, c->lod_error);
+        }
+        const double lost = std::max(0.0, area(lod.positions, in_idx) - area(lod.positions, out_idx));
+        ++groups;
+        if (error < (child + std::sqrt(lost)) * 0.999 - 1e-7) ++short_of;
+    }
+    std::printf("  %zu groups, %zu with an error short of the area they lost\n", groups, short_of);
+    CHECK(groups > 100 && short_of == 0);
+}
+
 int main() {
+    test_foliage_coverage();
     test_materials();
     test_skinning();
     test_texture();
