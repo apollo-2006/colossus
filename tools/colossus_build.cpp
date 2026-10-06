@@ -14,6 +14,10 @@
 //     colossus_build pine.gltf pine.cgeo --node pine_a --keep-scale
 //                                            one node of a gltf, in its own units (metres)
 //                                            rather than one unit across: for scenes
+//     colossus_build in.ply out.cgeo --normal-weight 1
+//                                            collapses also priced by the change of
+//                                            normal: better shading per triangle (flip
+//                                            5 to 10% lower), more triangles a pixel
 //
 // a textured model also writes out.ctex beside out.cgeo (include/texture_file.hpp), a texture
 // per material. textures are read as binary ppm: one in another format is looked for under the
@@ -42,6 +46,7 @@ int main(int argc, char** argv) {
     size_t max_triangles = 0;
     int subdivisions = 0;
     bool keep_scale = false;
+    float normal_weight = 0;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--up-z")) up_z = true;
         else if (!std::strcmp(argv[i], "--max-triangles") && i + 1 < argc) max_triangles = std::strtoull(argv[++i], nullptr, 10);
@@ -50,12 +55,13 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--subdivide") && i + 1 < argc) subdivisions = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--node") && i + 1 < argc) node = argv[++i];
         else if (!std::strcmp(argv[i], "--keep-scale")) keep_scale = true;
+        else if (!std::strcmp(argv[i], "--normal-weight") && i + 1 < argc) normal_weight = std::stof(argv[++i]);
         else if (in.empty()) in = argv[i];
         else if (out.empty()) out = argv[i];
         else { std::fprintf(stderr, "unexpected argument %s\n", argv[i]); return 2; }
     }
     if (in.empty() || out.empty()) {
-        std::fprintf(stderr, "usage: colossus_build IN.(ply|obj) OUT.cgeo [--up-z] [--check] [--max-triangles N] [--texture T.ppm] [--subdivide N] [--node NAME] [--keep-scale]\n");
+        std::fprintf(stderr, "usage: colossus_build IN.(ply|obj) OUT.cgeo [--up-z] [--check] [--max-triangles N] [--texture T.ppm] [--subdivide N] [--node NAME] [--keep-scale] [--normal-weight W]\n");
         return 2;
     }
     try {
@@ -88,7 +94,7 @@ int main(int argc, char** argv) {
             std::printf("skinned: %zu joints, %zu animations, errors measured in %zu poses\n", skin.joints.size(),
                         skin.animations.size(), poses.size());
         }
-        const lod_mesh lod = build_lod(m, true, poses);
+        const lod_mesh lod = build_lod(m, true, poses, normal_weight);
         geometry g = pack(lod);
         if (max_triangles) {
             g = trim(g, max_triangles);

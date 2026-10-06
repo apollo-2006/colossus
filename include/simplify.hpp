@@ -62,9 +62,14 @@ struct wedges {
 // with poses (each a full set of positions, the mesh posed: a skinned mesh's animations), each
 // vertex also carries a quadric per pose, of its triangles posed, and a collapse costs what
 // it costs in every pose (mohr and gleicher 2003): flat in the rest pose isn't flat when bent.
+//
+// with normals (per vertex) and a weight, moving a vertex onto another also costs the change
+// of normal times the distance moved, squared and weighted: shading follows the normals, so
+// creases go last. the distance it adds stays proven: this only orders the collapses.
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
                          const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w = nullptr,
-                         const std::vector<std::vector<vec3>>* poses = nullptr);
+                         const std::vector<std::vector<vec3>>* poses = nullptr, const std::vector<vec3>* normals = nullptr,
+                         float normal_weight = 0);
 
 // vertex clustering (rossignac and borrel): each vertex snaps to one vertex of
 // its grid cell, the grid coarsened until at most target_triangles remain;

@@ -52,7 +52,7 @@ struct collapse {
 
 simplify_result simplify(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices,
                          const std::vector<uint8_t>& locked, size_t target_triangles, const wedges* w,
-                         const std::vector<std::vector<vec3>>* poses) {
+                         const std::vector<std::vector<vec3>>* poses, const std::vector<vec3>* normals, float normal_weight) {
     simplify_result out;
     const size_t n = indices.size() / 3;
     if (n <= target_triangles) {
@@ -69,12 +69,14 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
     std::vector<uint32_t> tri(indices.size());
     for (size_t i = 0; i < indices.size(); ++i)
         tri[i] = static_cast<uint32_t>(std::lower_bound(verts.begin(), verts.end(), indices[i]) - verts.begin());
-    std::vector<vec3> pos(nv);
+    std::vector<vec3> pos(nv), nrm(normals && normal_weight > 0 ? nv : 0);
     std::vector<uint8_t> fixed(nv);
     for (size_t v = 0; v < nv; ++v) {
         pos[v] = positions[verts[v]];
         fixed[v] = locked[verts[v]];
+        if (!nrm.empty()) nrm[v] = (*normals)[verts[v]];
     }
+    const double normal_weight2 = double(normal_weight) * normal_weight;
 
     // per corner its wedge; per vertex its wedges by chart (a vertex keeps its own as others
     // collapse onto it).
@@ -181,6 +183,10 @@ simplify_result simplify(const std::vector<vec3>& positions, const std::vector<u
         quadric sum = q[from];
         sum += q[to];
         double cost = sum.error(pos[to]) / std::max(sum.weight, 1e-30);
+        if (!nrm.empty()) {
+            const vec3 dn = nrm[to] - nrm[from], dp = pos[to] - pos[from];
+            cost += normal_weight2 * double(dot(dn, dn)) * double(dot(dp, dp));
+        }
         for (size_t k = 0; k < pose_count; ++k) {
             quadric ps = posed_q[k * nv + from];
             ps += posed_q[k * nv + to];

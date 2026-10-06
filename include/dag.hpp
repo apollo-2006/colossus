@@ -74,7 +74,9 @@ struct lod_mesh {
 // surfaces), and the worst joins its error. linear blend skinning moves a coarse triangle off
 // the fine surface where its interpolated weights differ, by however far apart the joints
 // carry a point: the animations are known, so measured over them rather than bounded.
-lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<float>>& poses = {});
+//
+// normal_weight > 0 also prices collapses by the change of normal (simplify()).
+lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<float>>& poses = {}, float normal_weight = 0);
 
 // cone and bounds of a cluster.
 void cluster_bounds(const std::vector<vec3>& positions, lod_cluster& c);

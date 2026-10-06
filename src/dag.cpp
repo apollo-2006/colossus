@@ -323,7 +323,7 @@ void cluster_bounds(const std::vector<vec3>& positions, lod_cluster& c) {
     }
 }
 
-lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<float>>& poses) {
+lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<float>>& poses, float normal_weight) {
     const auto start = std::chrono::steady_clock::now();
     lod_mesh out;
     out.positions = m.positions;
@@ -443,11 +443,11 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
                 return;
             }
             wedges w{merged_corners, out.wedge_chart, out.wedge_vertex, out.wedge_uvs, out.wedge_material};
-            simplify_result s = simplify(out.positions, merged, locked, tris / 2, &w, priced);
+            simplify_result s = simplify(out.positions, merged, locked, tris / 2, &w, priced, &out.normals, normal_weight);
             // seams of many small texture charts can pin a group: let them move.
             if ((s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) && !out.wedge_uvs.empty()) {
                 w.relax = true;
-                s = simplify(out.positions, merged, locked, tris / 2, &w, priced);
+                s = simplify(out.positions, merged, locked, tris / 2, &w, priced, &out.normals, normal_weight);
             }
             // still stuck: islands (needles, leaves, blades) no collapse may remove, or thin parts.
             // vertex clustering merges them, the group's outline (locked vertices) kept in place
@@ -514,7 +514,7 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
             // coincide, flat parts, a bound cannot reach 0).
             float sampled = sampled_deviation(out.positions, merged, s.indices);
             if (sampled > outlier_ratio * s.error) {
-                simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4, &w, priced);
+                simplify_result gentle = simplify(out.positions, merged, locked, tris * 3 / 4, &w, priced, &out.normals, normal_weight);
                 if (!gentle.indices.empty() && gentle.indices.size() / 3 <= stuck_ratio * tris) {
                     const float gentle_sampled = sampled_deviation(out.positions, merged, gentle.indices);
                     if (gentle_sampled < sampled) {
