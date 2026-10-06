@@ -10,6 +10,9 @@
 /models/dragon_recon/
 /models/forest/
 /models/forest.scene
+/models/forest_old.scene
+/models/normaltest/
+/models/*_clod.cgeo
 *.png
 !/docs/*.png
 *.d
