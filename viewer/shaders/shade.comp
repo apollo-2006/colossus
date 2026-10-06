@@ -296,8 +296,10 @@ void main() {
         float wrap = 0.0, coat = 0.0;
         const Mesh mesh = meshes[inst.mesh];
         if (frame.debug_mode == 0u && mesh.tex.y != 0u && cluster_textured(c)) {
-            // the triangle's material (its corners share one), and its texture.
-            const uvec4 tex = texture_materials[mesh.tex.x + min(cluster_material(s.base, c, s.corners.x), mesh.tex.y - 1u)];
+            // the triangle's material (its corners share one), and its textures: colour, normal x,
+            // normal y, roughness (levels 0 where it has none).
+            const uint first = mesh.tex.x + 4u * min(cluster_material(s.base, c, s.corners.x), mesh.tex.y - 1u);
+            const uvec4 tex = texture_materials[first];
             // a scan's own colour: no procedural detail. texture coordinates where this pixel's
             // ray and its neighbours' meet the triangle's plane: their differences pick the level.
             const vec2 uv0 = mesh.uv_map.xy + cluster_uv(s.base, c, s.corners.x) * mesh.uv_map.z,
@@ -309,7 +311,23 @@ void main() {
             const vec2 uv = uv0 + (uv1 - uv0) * s.bary.x + (uv2 - uv0) * s.bary.y;
             const vec2 duv_dx = (uv1 - uv0) * (bx.x - b.x) + (uv2 - uv0) * (bx.y - b.y);
             const vec2 duv_dy = (uv1 - uv0) * (by.x - b.x) + (uv2 - uv0) * (by.y - b.y);
-            m = Material(sample_texture(tex, uv, duv_dx, duv_dy), 0.75, 0.0);
+            const uvec4 rough = texture_materials[first + 3u];
+            m = Material(sample_texture(tex, uv, duv_dx, duv_dy), (rough.y & 255u) != 0u ? sample_texture(rough, uv, duv_dx, duv_dy).x : 0.75, 0.0);
+            // a normal map, in the triangle's tangent frame: from its corners' positions and
+            // coordinates, so none is stored. its +y is up the image, and v runs down it.
+            const uvec4 nx = texture_materials[first + 1u], ny = texture_materials[first + 2u];
+            if ((nx.y & 255u) != 0u) {
+                const vec3 dp1 = s.p1 - s.p0, dp2 = s.p2 - s.p0;
+                const vec2 d1 = uv1 - uv0, d2 = uv2 - uv0;
+                const float det = d1.x * d2.y - d2.x * d1.y;
+                if (abs(det) > 1e-12) {
+                    const vec3 du = (dp1 * d2.y - dp2 * d1.y) / det, dv = (dp2 * d1.x - dp1 * d2.x) / det;
+                    const vec3 t = normalize(du - n * dot(n, du)), up = normalize(-dv + n * dot(n, dv));
+                    const vec2 xy = vec2(sample_texture(nx, uv, duv_dx, duv_dy).x, sample_texture(ny, uv, duv_dx, duv_dy).x) * 2.0 - 1.0;
+                    const vec3 bent = normalize(t * xy.x + up * xy.y + n * sqrt(max(1.0 - dot(xy, xy), 0.0)));
+                    if (!any(isnan(bent))) n = bent;
+                }
+            }
         } else if (frame.debug_mode == 0u) {
             const vec4 bounds = meshes[inst.mesh].bounds;
             const float radius = bounds.w;

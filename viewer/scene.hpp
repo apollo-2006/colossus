@@ -72,8 +72,9 @@ struct scene {
     std::vector<uint32_t> children;     // global page numbers, for prefetch
     std::vector<int> files;
     std::vector<gpu_mesh> meshes;
-    // per material: its texture's first tile page, level count | repeat << 8 | double sided << 9,
-    // width, height (texture.glsl).
+    // four per material (colour, normal x, normal y, roughness): a texture's first tile page,
+    // level count | repeat << 8 | double sided << 9 | one channel << 10, width, height
+    // (texture.glsl); level count 0 for none.
     std::vector<std::array<uint32_t, 4>> materials;
     std::vector<gpu_instance> instances;
     std::vector<gpu_cell> cells;
@@ -289,18 +290,29 @@ void make_scene(const options& opt, scene& s) {
                 sp.child_first = static_cast<uint32_t>(s.children.size());
                 s.pages.push_back(sp);
             }
+            // per material four entries, colour, normal x, normal y, roughness (texture_kind):
+            // first tile's page, levels | repeat << 8 | double sided << 9 | one channel << 10,
+            // width, height; levels 0 where the material has none.
             m.texture[0] = static_cast<uint32_t>(s.materials.size());
-            m.texture[1] = static_cast<uint32_t>(t.textures.size());
-            for (const texture_entry& e : t.textures) {
-                s.materials.push_back({first + e.levels[0].first_tile,
-                                       uint32_t(e.levels.size()) | uint32_t(e.repeat) << 8 | uint32_t(e.double_sided) << 9, e.width, e.height});
-                m.texture[2] |= e.double_sided ? 1u : 0u;
-            }
+            m.texture[1] = static_cast<uint32_t>(t.materials.size());
+            for (const material_textures& mt : t.materials)
+                for (uint32_t index : mt) {
+                    if (index == UINT32_MAX) {
+                        s.materials.push_back({0, 0, 1, 1});
+                        continue;
+                    }
+                    const texture_entry& e = t.textures[index];
+                    s.materials.push_back({first + e.levels[0].first_tile,
+                                           uint32_t(e.levels.size()) | uint32_t(e.repeat) << 8 | uint32_t(e.double_sided) << 9 |
+                                               uint32_t(e.single) << 10,
+                                           e.width, e.height});
+                    m.texture[2] |= e.double_sided ? 1u : 0u;
+                }
             m.uv_map[0] = t.uv_min.x;
             m.uv_map[1] = t.uv_min.y;
             m.uv_map[2] = t.uv_extent;
             s.total_page_bytes += uint64_t(t.tile_count()) * tile_bytes;
-            std::printf("  %zu textures (%u x %u first), %u tiles, %.0f MB\n", t.textures.size(), t.textures[0].width,
+            std::printf("  %zu materials, %zu textures (%u x %u first), %u tiles, %.0f MB\n", t.materials.size(), t.textures.size(), t.textures[0].width,
                         t.textures[0].height, t.tile_count(), t.tile_count() * double(tile_bytes) / 1048576.0);
         }
         // a skeleton beside the model makes it skinned: its pages' skin bounds, and pose slots

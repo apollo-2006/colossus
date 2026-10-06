@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
@@ -103,32 +104,62 @@ int main(int argc, char** argv) {
         const paged_geometry paged = page(g);
         save_paged(paged, out);
         if (g.textured()) {
-            // a texture per material, as ppm; a material without one, its colour.
-            std::vector<image> images;
-            std::vector<uint8_t> flags;
+            // per material its colour (a ppm, or where it has none its flat colour), and where it
+            // has them a normal map (its red and green as two textures) and a roughness map (its
+            // green). an image used twice is written once.
+            std::vector<texture_source> textures;
+            std::vector<material_textures> materials;
+            std::map<std::string, image> loaded;
+            std::map<std::pair<std::string, int>, uint32_t> written;  // (file, channel or -1): index
+            auto ppm_of = [](std::string file) {
+                const size_t dot = file.find_last_of('.');
+                if (file.compare(dot == std::string::npos ? file.size() : dot, std::string::npos, ".ppm") != 0) file = file.substr(0, dot) + ".ppm";
+                return file;
+            };
+            auto add = [&](const std::string& file, int channel, uint8_t flags) -> uint32_t {
+                const std::string ppm = ppm_of(file);
+                auto key = std::make_pair(ppm, channel);
+                if (auto it = written.find(key); it != written.end()) return it->second;
+                if (!loaded.count(ppm)) {
+                    try {
+                        loaded[ppm] = load_ppm(ppm);
+                    } catch (const std::exception& e) {
+                        if (channel < 0) throw;
+                        std::fprintf(stderr, "warning: %s: %s (no map)\n", ppm.c_str(), e.what());
+                        return UINT32_MAX;
+                    }
+                }
+                textures.push_back({loaded[ppm], channel >= 0, uint8_t(std::max(channel, 0)), flags});
+                return written[key] = uint32_t(textures.size() - 1);
+            };
             for (const material& mat : g.materials) {
-                image im;
+                const uint8_t flags = uint8_t((mat.repeat ? 1 : 0) | (mat.double_sided ? 2 : 0));
+                material_textures mt{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
                 if (mat.texture.empty()) {
+                    image im;
                     im.width = im.height = 4;
                     for (int i = 0; i < 16; ++i)
                         for (int c = 0; c < 3; ++c) {
                             const float l = std::clamp(mat.color[c], 0.0f, 1.0f);  // linear, to srgb
                             im.rgb.push_back(uint8_t(std::lround((l <= 0.0031308f ? 12.92f * l : 1.055f * std::pow(l, 1 / 2.4f) - 0.055f) * 255)));
                         }
+                    textures.push_back({std::move(im), false, 0, flags});
+                    mt[kind_colour] = uint32_t(textures.size() - 1);
                 } else {
-                    std::string ppm = mat.texture;
-                    const size_t dot = ppm.find_last_of('.');
-                    if (ppm.compare(dot == std::string::npos ? ppm.size() : dot, std::string::npos, ".ppm") != 0) ppm = ppm.substr(0, dot) + ".ppm";
-                    im = load_ppm(ppm);
+                    mt[kind_colour] = add(mat.texture, -1, flags);
                 }
-                images.push_back(std::move(im));
-                flags.push_back(uint8_t((mat.repeat ? 1 : 0) | (mat.double_sided ? 2 : 0)));
+                if (!mat.normal_map.empty()) {
+                    mt[kind_normal_x] = add(mat.normal_map, 0, flags);
+                    mt[kind_normal_y] = mt[kind_normal_x] == UINT32_MAX ? UINT32_MAX : add(mat.normal_map, 1, flags);
+                }
+                if (!mat.roughness_map.empty()) mt[kind_roughness] = add(mat.roughness_map, 1, flags);
+                materials.push_back(mt);
             }
             const std::string ctex = out.substr(0, out.find_last_of('.')) + ".ctex";
-            save_textures(images, flags, g.uv_min, g.uv_extent, ctex);
+            save_textures(textures, materials, g.uv_min, g.uv_extent, ctex);
             const texture_info t = load_texture_info(ctex);
-            std::printf("wrote %s: %zu textures, %u tiles, %.0f MB, coordinates over %.3g units (%.1fs)\n", ctex.c_str(),
-                        t.textures.size(), t.tile_count(), t.tile_count() * double(tile_bytes) / 1048576.0, g.uv_extent, since());
+            std::printf("wrote %s: %zu materials, %zu textures, %u tiles, %.0f MB, coordinates over %.3g units (%.1fs)\n", ctex.c_str(),
+                        t.materials.size(), t.textures.size(), t.tile_count(), t.tile_count() * double(tile_bytes) / 1048576.0, g.uv_extent, since());
         }
         if (m.skinned()) {
             const std::string cskn = out.substr(0, out.find_last_of('.')) + ".cskn";

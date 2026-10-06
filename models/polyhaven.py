@@ -1,5 +1,5 @@
 """downloads a poly haven model (cc0, https://polyhaven.com) as gltf with its files, and turns
-its base colour textures to ppm for colossus_build: python3 models/polyhaven.py ASSET [RES] [DIR]
+its base colour, normal and roughness textures to ppm for colossus_build: python3 models/polyhaven.py ASSET [RES] [DIR]
 
 RES is the texture resolution (1k, 2k, 4k, 8k; 2k by default), DIR where it goes (models/ASSET
 by default). files already there are kept. needs ffmpeg for the textures.
@@ -33,8 +33,9 @@ def main():
     fetch(gltf["url"], os.path.join(out, os.path.basename(gltf["url"])))
     for name, f in gltf.get("include", {}).items():
         fetch(f["url"], os.path.join(out, name))
-        # base colour textures (poly haven names them _diff_) as ppm for the builder.
-        if "_diff_" in name and not name.endswith(".ppm"):
+        # base colour, normal (opengl's), arm (ambient occlusion, roughness, metal) and roughness textures
+        # as ppm for the builder.
+        if any(k in name for k in ("_diff_", "_nor_gl_", "_arm_", "_rough_")) and not name.endswith(".ppm"):
             ppm = os.path.join(out, os.path.splitext(name)[0] + ".ppm")
             if not os.path.exists(ppm):
                 subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", os.path.join(out, name), ppm], check=True)

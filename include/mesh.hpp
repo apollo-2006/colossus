@@ -7,9 +7,12 @@
 #include <vector>
 
 // a material: its texture (a file, or where there is none a flat colour), whether its texture
-// coordinates repeat (wrap) or clamp, and whether its triangles are seen from both sides.
+// coordinates repeat (wrap) or clamp, and whether its triangles are seen from both sides; and
+// optionally a normal map (tangent space, opengl's +y up) and a roughness map (its green
+// channel, as gltf's metallicRoughnessTexture has it), sharing the texture's coordinates.
 struct material {
     std::string texture;       // empty: the colour
+    std::string normal_map, roughness_map;  // empty: none
     float color[3] = {0.8f, 0.8f, 0.8f};
     bool repeat = false;
     bool double_sided = false;

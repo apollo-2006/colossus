@@ -291,11 +291,18 @@ mesh load_gltf(const std::string& path, skeleton* skin, const std::string& only_
             const json& pbr = mats[i]["pbrMetallicRoughness"];
             for (int k = 0; k < 3; ++k) mat.color[k] = float(pbr["baseColorFactor"][size_t(k)].num_or(1));
             mat.double_sided = mats[i]["doubleSided"].b;
+            // a texture's image file, if it has one (embedded data isn't read).
+            auto image_of = [&](const json& t) {
+                if (!t.has("index")) return std::string();
+                const json& img = g.root["images"][g.root["textures"][t["index"].index()]["source"].index()];
+                return img.has("uri") && img["uri"].str.compare(0, 5, "data:") != 0 ? g.dir + img["uri"].str : std::string();
+            };
+            mat.normal_map = image_of(mats[i]["normalTexture"]);
+            mat.roughness_map = image_of(pbr["metallicRoughnessTexture"]);
             const json& t = pbr["baseColorTexture"];
             if (t.has("index")) {
                 const json& tex = g.root["textures"][t["index"].index()];
-                const json& img = g.root["images"][tex["source"].index()];
-                if (img.has("uri") && img["uri"].str.compare(0, 5, "data:") != 0) mat.texture = g.dir + img["uri"].str;
+                mat.texture = image_of(t);
                 const json& smp = tex.has("sampler") ? g.root["samplers"][tex["sampler"].index()] : json();
                 mat.repeat = smp["wrapS"].num_or(10497) != 33071 || smp["wrapT"].num_or(10497) != 33071;  // anything but clamp
             }

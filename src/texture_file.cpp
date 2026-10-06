@@ -12,7 +12,8 @@
 
 namespace {
 
-constexpr char magic[8] = {'C', 'T', 'E', 'X', 'v', '0', '0', '2'};
+constexpr char magic[8] = {'C', 'T', 'E', 'X', 'v', '0', '0', '3'};
+constexpr char magic_v2[8] = {'C', 'T', 'E', 'X', 'v', '0', '0', '2'};
 
 float to_linear(uint8_t c) {
     const float s = c / 255.0f;
@@ -152,6 +153,37 @@ void decode_bc1(const uint8_t* block, uint8_t* rgb) {
         for (int c = 0; c < 3; ++c) rgb[3 * i + c] = static_cast<uint8_t>(p[bits >> (2 * i) & 3][c]);
 }
 
+// endpoints at the block's extremes (r0 > r1: six steps between), each value to its nearest.
+void encode_bc4(const uint8_t* v, uint8_t* out) {
+    const uint8_t hi = *std::max_element(v, v + 16), lo = *std::min_element(v, v + 16);
+    out[0] = hi;
+    out[1] = lo;
+    uint64_t bits = 0;
+    if (hi != lo)
+        for (int i = 0; i < 16; ++i) {
+            // palette: 0 hi, 1 lo, 2..7 from hi to lo in sevenths.
+            const int step = int(std::lround(float(hi - v[i]) * 7.0f / float(hi - lo)));  // 0 at hi, 7 at lo
+            const uint64_t index = step == 0 ? 0 : step == 7 ? 1 : uint64_t(step + 1);
+            bits |= index << (3 * i);
+        }
+    for (int k = 0; k < 6; ++k) out[2 + k] = uint8_t(bits >> (8 * k));
+}
+
+void decode_bc4(const uint8_t* block, uint8_t* v) {
+    const int r0 = block[0], r1 = block[1];
+    uint64_t bits = 0;
+    for (int k = 0; k < 6; ++k) bits |= uint64_t(block[2 + k]) << (8 * k);
+    for (int i = 0; i < 16; ++i) {
+        const int index = int(bits >> (3 * i) & 7);
+        int value;
+        if (index == 0) value = r0;
+        else if (index == 1) value = r1;
+        else if (r0 > r1) value = ((8 - index) * r0 + (index - 1) * r1) / 7;
+        else value = index == 6 ? 0 : index == 7 ? 255 : ((6 - index) * r0 + (index - 1) * r1) / 5;
+        v[i] = uint8_t(value);
+    }
+}
+
 image load_ppm(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path);
@@ -216,21 +248,24 @@ std::vector<texture_level> plan_levels(uint32_t w, uint32_t h, uint32_t first) {
 
 }  // namespace
 
-void save_textures(const std::vector<image>& images, const std::vector<uint8_t>& flags, vec2 uv_min, float uv_extent,
-                   const std::string& path) {
+void save_textures(const std::vector<texture_source>& textures, const std::vector<material_textures>& materials,
+                   vec2 uv_min, float uv_extent, const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + path);
     f.write(magic, sizeof magic);
-    const uint32_t count = static_cast<uint32_t>(images.size());
+    const uint32_t count = static_cast<uint32_t>(textures.size()), material_count = static_cast<uint32_t>(materials.size());
     const float map[3] = {uv_min.x, uv_min.y, uv_extent};
     f.write(reinterpret_cast<const char*>(&count), 4);
     f.write(reinterpret_cast<const char*>(map), sizeof map);
+    f.write(reinterpret_cast<const char*>(&material_count), 4);
+    for (const material_textures& m : materials) f.write(reinterpret_cast<const char*>(m.data()), sizeof m);
     std::vector<std::vector<texture_level>> plans;
     uint32_t first = 0;
-    for (size_t t = 0; t < images.size(); ++t) {
-        plans.push_back(plan_levels(images[t].width, images[t].height, first));
+    for (const texture_source& t : textures) {
+        plans.push_back(plan_levels(t.source.width, t.source.height, first));
         first = plans.back().back().first_tile + 1;
-        const uint32_t head[4] = {images[t].width, images[t].height, uint32_t(plans.back().size()), uint32_t(flags[t])};
+        const uint32_t head[4] = {t.source.width, t.source.height, uint32_t(plans.back().size()),
+                                  uint32_t(t.flags & 3) | (t.single ? 4u : 0u)};
         f.write(reinterpret_cast<const char*>(head), sizeof head);
         for (const texture_level& l : plans.back()) {
             const uint32_t v[3] = {l.tiles_x, l.tiles_y, l.first_tile};
@@ -240,39 +275,45 @@ void save_textures(const std::vector<image>& images, const std::vector<uint8_t>&
     while (f && f.tellp() % 16) f.put(0);  // a failed stream's tellp is -1
 
     std::vector<uint8_t> out;
-    for (size_t t = 0; t < images.size(); ++t) {
-        const image& base = images[t];
-        // levels in linear light, box filtered (edges clamped).
-        std::vector<float> linear(base.rgb.size());
-        for (size_t i = 0; i < base.rgb.size(); ++i) linear[i] = to_linear(base.rgb[i]);
+    for (size_t t = 0; t < textures.size(); ++t) {
+        const image& base = textures[t].source;
+        const bool single = textures[t].single;
+        // levels box filtered (edges clamped): colour in linear light, data as it is; one
+        // channel kept for data.
+        const int channels = single ? 1 : 3;
+        std::vector<float> linear(size_t(base.width) * base.height * channels);
+        for (size_t i = 0; i < size_t(base.width) * base.height; ++i)
+            if (single) linear[i] = base.rgb[3 * i + textures[t].channel] / 255.0f;
+            else for (int c = 0; c < 3; ++c) linear[3 * i + c] = to_linear(base.rgb[3 * i + c]);
         uint32_t w = base.width, h = base.height;
         for (size_t li = 0; li < plans[t].size(); ++li) {
             const texture_level& l = plans[t][li];
             if (li > 0) {
                 const uint32_t nw = (w + 1) / 2, nh = (h + 1) / 2;
-                std::vector<float> dst(size_t(nw) * nh * 3);
+                std::vector<float> dst(size_t(nw) * nh * channels);
                 parallel_for(nh, [&](size_t y) {
                     for (uint32_t x = 0; x < nw; ++x)
-                        for (int c = 0; c < 3; ++c) {
+                        for (int c = 0; c < channels; ++c) {
                             float sum = 0;
                             for (uint32_t dy = 0; dy < 2; ++dy)
                                 for (uint32_t dx = 0; dx < 2; ++dx) {
                                     const uint32_t sx = std::min(2 * x + dx, w - 1), sy = std::min(uint32_t(2 * y + dy), h - 1);
-                                    sum += linear[(size_t(sy) * w + sx) * 3 + c];
+                                    sum += linear[(size_t(sy) * w + sx) * channels + c];
                                 }
-                            dst[(y * nw + x) * 3 + c] = sum / 4;
+                            dst[(y * nw + x) * channels + c] = sum / 4;
                         }
                 });
                 linear = std::move(dst);
                 w = nw;
                 h = nh;
             }
-            std::vector<uint8_t> srgb(linear.size());
-            for (size_t i = 0; i < linear.size(); ++i) srgb[i] = to_srgb(linear[i]);
+            std::vector<uint8_t> bytes(linear.size());
+            for (size_t i = 0; i < linear.size(); ++i)
+                bytes[i] = single ? uint8_t(std::lround(std::clamp(linear[i], 0.0f, 1.0f) * 255)) : to_srgb(linear[i]);
             // each tile: 120 texels of the level and a 4 texel border, clamped at the level's
             // edges, or wrapped round them for a repeating texture (filtering across the
             // repeat then has its neighbours).
-            const bool wrap = flags[t] & 1;
+            const bool wrap = textures[t].flags & 1;
             auto at = [&](int x, int y) {
                 if (wrap) {
                     x = ((x % int(w)) + int(w)) % int(w);
@@ -281,7 +322,7 @@ void save_textures(const std::vector<image>& images, const std::vector<uint8_t>&
                     x = std::clamp(x, 0, int(w) - 1);
                     y = std::clamp(y, 0, int(h) - 1);
                 }
-                return &srgb[(size_t(y) * w + x) * 3];
+                return &bytes[(size_t(y) * w + x) * channels];
             };
             out.assign(size_t(l.tiles_x) * l.tiles_y * tile_bytes, 0);
             parallel_for(size_t(l.tiles_x) * l.tiles_y, [&](size_t tile) {
@@ -290,14 +331,28 @@ void save_textures(const std::vector<image>& images, const std::vector<uint8_t>&
                 uint8_t block[48];
                 for (uint32_t by = 0; by < tile_texels / 4; ++by)
                     for (uint32_t bx = 0; bx < tile_texels / 4; ++bx) {
-                        for (int i = 0; i < 16; ++i) std::memcpy(block + 3 * i, at(ox + int(4 * bx) + i % 4, oy + int(4 * by) + i / 4), 3);
-                        encode_bc1(block, &out[tile * tile_bytes + (by * (tile_texels / 4) + bx) * 8]);
+                        for (int i = 0; i < 16; ++i)
+                            std::memcpy(block + channels * i, at(ox + int(4 * bx) + i % 4, oy + int(4 * by) + i / 4), size_t(channels));
+                        uint8_t* dst = &out[tile * tile_bytes + (by * (tile_texels / 4) + bx) * 8];
+                        if (single) encode_bc4(block, dst);
+                        else encode_bc1(block, dst);
                     }
             });
             f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
         }
     }
     if (!f) throw std::runtime_error("writing " + path + " failed");
+}
+
+void save_textures(const std::vector<image>& images, const std::vector<uint8_t>& flags, vec2 uv_min, float uv_extent,
+                   const std::string& path) {
+    std::vector<texture_source> textures;
+    std::vector<material_textures> materials;
+    for (size_t k = 0; k < images.size(); ++k) {
+        textures.push_back({images[k], false, 0, flags[k]});
+        materials.push_back({uint32_t(k), UINT32_MAX, UINT32_MAX, UINT32_MAX});
+    }
+    save_textures(textures, materials, uv_min, uv_extent, path);
 }
 
 void save_texture(const image& base, const std::string& path) { save_textures({base}, {0}, {0, 0}, 1, path); }
@@ -311,22 +366,38 @@ texture_info load_texture_info(const std::string& path) {
     f.read(m, sizeof m);
     f.read(reinterpret_cast<char*>(&count), 4);
     f.read(reinterpret_cast<char*>(map), sizeof map);
-    if (!f || std::memcmp(m, magic, sizeof magic) != 0) throw std::runtime_error(path + " is not a texture file (or an old one: rebuild it)");
-    if (count == 0 || count > 256 || !(map[2] > 0)) throw std::runtime_error(path + ": bad header");
+    const bool v2 = f && std::memcmp(m, magic_v2, sizeof m) == 0;
+    if (!f || (!v2 && std::memcmp(m, magic, sizeof magic) != 0)) throw std::runtime_error(path + " is not a texture file (or an old one: rebuild it)");
+    if (count == 0 || count > 1024 || !(map[2] > 0)) throw std::runtime_error(path + ": bad header");
     texture_info t;
     t.uv_min = {map[0], map[1]};
     t.uv_extent = map[2];
+    if (v2) {
+        for (uint32_t k = 0; k < count; ++k) t.materials.push_back({k, UINT32_MAX, UINT32_MAX, UINT32_MAX});
+    } else {
+        uint32_t materials = 0;
+        f.read(reinterpret_cast<char*>(&materials), 4);
+        if (!f || materials == 0 || materials > 256) throw std::runtime_error(path + ": bad material count");
+        t.materials.resize(materials);
+        for (material_textures& mt : t.materials) {
+            f.read(reinterpret_cast<char*>(mt.data()), sizeof mt);
+            for (uint32_t i : mt)
+                if (!f || (i != UINT32_MAX && i >= count)) throw std::runtime_error(path + ": bad material table");
+            if (mt[kind_colour] == UINT32_MAX) throw std::runtime_error(path + ": a material without colour");
+        }
+    }
     uint32_t first = 0;
     for (uint32_t k = 0; k < count; ++k) {
         uint32_t head[4];
         f.read(reinterpret_cast<char*>(head), sizeof head);
-        if (!f || head[0] == 0 || head[1] == 0 || head[0] > 65536 || head[1] > 65536 || head[2] == 0 || head[2] > 20 || head[3] > 3)
+        if (!f || head[0] == 0 || head[1] == 0 || head[0] > 65536 || head[1] > 65536 || head[2] == 0 || head[2] > 20 || head[3] > (v2 ? 3u : 7u))
             throw std::runtime_error(path + ": bad texture header");
         texture_entry e;
         e.width = head[0];
         e.height = head[1];
         e.repeat = head[3] & 1;
         e.double_sided = head[3] & 2;
+        e.single = head[3] & 4;
         // the layout follows from the size: checked, not trusted.
         e.levels = plan_levels(e.width, e.height, first);
         if (e.levels.size() != head[2]) throw std::runtime_error(path + ": bad level count");

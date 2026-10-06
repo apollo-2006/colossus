@@ -1,5 +1,5 @@
 // a model's texture, streamed as tiles into the page pool (include/texture_file.hpp): bc1
-// decoded here, bilinear within a tile (its border holds the neighbours), trilinear across
+// (colour, srgb) or bc4 (one channel, linear: tex.y bit 10) decoded here, bilinear within a tile (its border holds the neighbours), trilinear across
 // levels. a missing tile is asked for and its nearest resident coarser copy drawn: tiles are
 // resident only while their coarser copies are (viewer/streamer.hpp), and the coarsest is
 // pinned.
@@ -14,9 +14,26 @@ vec3 unpack565(uint v) {
     return vec3(float(v >> 11u), float((v >> 5u) & 63u), float(v & 31u)) / vec3(31.0, 63.0, 31.0);
 }
 
-// texel t (0 to 127 each way) of the tile at word `at`, linear.
-vec3 tile_texel(uint at, uvec2 t) {
+// bc4: two endpoints, then a 3-bit index per texel (the endpoints, and six or four steps
+// between them with 0 and 1 after).
+float bc4_texel(uint block, uint i) {
+    const uint lo = pool[block], hi = pool[block + 1u];
+    const float r0 = float(lo & 255u), r1 = float((lo >> 8u) & 255u);
+    const uint bit = 16u + 3u * i;
+    const uint index = bit + 3u <= 32u ? (lo >> bit) & 7u : bit >= 32u ? (hi >> (bit - 32u)) & 7u : ((lo >> bit) | (hi << (32u - bit))) & 7u;
+    if (index == 0u) return r0 / 255.0;
+    if (index == 1u) return r1 / 255.0;
+    if (r0 > r1) return (float(8u - index) * r0 + float(index - 1u) * r1) / (7.0 * 255.0);
+    if (index == 6u) return 0.0;
+    if (index == 7u) return 1.0;
+    return (float(6u - index) * r0 + float(index - 1u) * r1) / (5.0 * 255.0);
+}
+
+// texel t (0 to 127 each way) of the tile at word `at`, linear: colour, or a one channel
+// texture's value in each component.
+vec3 tile_texel(uint at, uvec2 t, bool single) {
     const uint block = at + 2u * ((t.y >> 2u) * (tile_texels / 4u) + (t.x >> 2u));
+    if (single) return vec3(bc4_texel(block, (t.y & 3u) * 4u + (t.x & 3u)));
     const uint ends = pool[block], bits = pool[block + 1u];
     const uint c0 = ends & 0xffffu, c1 = ends >> 16u;
     const uint index = (bits >> (2u * ((t.y & 3u) * 4u + (t.x & 3u)))) & 3u;
@@ -69,8 +86,9 @@ vec3 sample_resident(uvec4 tex, vec2 uv, uint level) {
         if (page_used[page] != frame.frame_index) page_used[page] = frame.frame_index;
         // inside the tile, border included: the four texels never leave it.
         const uvec2 t = uvec2(clamp(b - ivec2(tile * tile_payload) + int(tile_border), ivec2(0), ivec2(tile_texels - 2u)));
-        return mix(mix(tile_texel(word, t), tile_texel(word, t + uvec2(1, 0)), f.x),
-                   mix(tile_texel(word, t + uvec2(0, 1)), tile_texel(word, t + uvec2(1, 1)), f.x), f.y);
+        const bool single = (tex.y & 1024u) != 0u;
+        return mix(mix(tile_texel(word, t, single), tile_texel(word, t + uvec2(1, 0), single), f.x),
+                   mix(tile_texel(word, t + uvec2(0, 1), single), tile_texel(word, t + uvec2(1, 1), single), f.x), f.y);
     }
     return vec3(1.0, 0.0, 1.0);  // unreachable: the coarsest tile is pinned
 }

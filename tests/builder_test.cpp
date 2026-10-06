@@ -404,6 +404,50 @@ void test_hierarchy(const char* name, const mesh& input, bool exact = true, doub
 
 // bc1 blocks within a few levels on smooth colour, and a texture file's tiles: each texel of
 // a tile, border included, is its level's texel (clamped at the edges), through bc1.
+// bc4 blocks round trip within a step of their range, and a CTEXv003 file keeps its material
+// table and each texture's format.
+void test_texture_formats() {
+    std::printf("texture formats\n");
+    std::mt19937 rng(4);
+    int worst = 0;
+    for (int b = 0; b < 2000; ++b) {
+        uint8_t v[16], back[16], block[8];
+        const int lo = int(rng() % 200), span = b % 3 == 0 ? 0 : int(rng() % (256 - lo));
+        for (uint8_t& x : v) x = uint8_t(lo + (span ? int(rng() % (span + 1)) : 0));
+        encode_bc4(v, block);
+        decode_bc4(block, back);
+        const int range = *std::max_element(v, v + 16) - *std::min_element(v, v + 16);
+        for (int i = 0; i < 16; ++i) worst = std::max(worst, std::abs(int(back[i]) - int(v[i])) * 14 - range);  // over half a step
+    }
+    std::printf("  bc4: worst error past half a step, in fourteenths of the range: %d\n", worst);
+    CHECK(worst <= 14);  // half a step, rounding to bytes included
+
+    image colour, data;
+    colour.width = colour.height = data.width = data.height = 200;
+    for (int i = 0; i < 200 * 200; ++i) {
+        colour.rgb.insert(colour.rgb.end(), {uint8_t(i % 251), uint8_t(i % 7 * 30), 90});
+        data.rgb.insert(data.rgb.end(), {uint8_t(i % 200), uint8_t(255 - i % 200), 0});
+    }
+    const std::string path = temp_path("formats.ctex");
+    save_textures({{colour, false, 0, 1}, {data, true, 0, 1}, {data, true, 1, 1}},
+                  {{0, 1, 2, UINT32_MAX}, {0, UINT32_MAX, UINT32_MAX, 2}}, {0, 0}, 1, path);
+    const texture_info t = load_texture_info(path);
+    CHECK(t.textures.size() == 3 && t.materials.size() == 2);
+    CHECK(!t.textures[0].single && t.textures[1].single && t.textures[2].single && t.textures[0].repeat);
+    CHECK(t.materials[0][kind_normal_y] == 2 && t.materials[1][kind_normal_x] == UINT32_MAX && t.materials[1][kind_roughness] == 2);
+    // the second texture's first tile is the red channel, unfiltered at level 0.
+    std::ifstream f(path, std::ios::binary);
+    std::vector<uint8_t> tile(tile_bytes);
+    f.seekg(std::streamoff(t.data_offset + uint64_t(t.textures[1].levels[0].first_tile) * tile_bytes));
+    f.read(reinterpret_cast<char*>(tile.data()), tile_bytes);
+    uint8_t v[16];
+    decode_bc4(&tile[(1 * 32 + 1) * 8], v);  // block (1, 1): texels (0..3, 0..3) of the level
+    int off = 0;
+    for (int i = 0; i < 16; ++i) off = std::max(off, std::abs(int(v[i]) - int(data.rgb[3 * ((i / 4) * 200 + i % 4)])));
+    std::printf("  data texel off by at most %d\n", off);
+    CHECK(off <= 2);
+}
+
 void test_texture() {
     std::printf("textures\n");
     uint8_t rgb[48], back[48], block[8];
@@ -831,6 +875,7 @@ void test_foliage_coverage() {
 }
 
 int main() {
+    test_texture_formats();
     test_foliage_coverage();
     test_materials();
     test_skinning();
