@@ -1,6 +1,7 @@
 #include "simplify.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <unordered_map>
 #include <queue>
@@ -422,7 +423,97 @@ simplify_result cluster_vertices(const std::vector<vec3>& positions, const std::
         }
         r.indices = std::move(out);
         r.corners = std::move(corners);
-        if (r.indices.size() / 3 <= target_triangles || cells == 1) break;
+        if (r.indices.size() / 3 <= target_triangles || cells == 1) {
+            for (const auto& [v, b] : border) r.snapped[v] = target(v);
+            break;
+        }
     }
     return r;
+}
+
+void grow_to_area(const std::vector<vec3>& positions, const std::vector<uint32_t>& input, simplify_result& r,
+                  const std::vector<uint8_t>& locked, const wedges* w, float max_scale) {
+    if (r.indices.empty()) return;
+    auto area = [&](const uint32_t* t) {
+        return 0.5f * length(cross(positions[t[1]] - positions[t[0]], positions[t[2]] - positions[t[0]]));
+    };
+    // pieces: the result's triangles joined through shared vertices.
+    std::unordered_map<uint32_t, uint32_t> parent;
+    std::function<uint32_t(uint32_t)> find = [&](uint32_t v) {
+        uint32_t root = v;
+        while (parent[root] != root) root = parent[root];
+        while (parent[v] != root) { const uint32_t next = parent[v]; parent[v] = root; v = next; }
+        return root;
+    };
+    for (uint32_t v : r.indices) parent.emplace(v, v);
+    for (size_t t = 0; t < r.indices.size(); t += 3) {
+        const uint32_t a = find(r.indices[t]);
+        for (int k = 1; k < 3; ++k) {
+            const uint32_t b = find(r.indices[t + k]);
+            if (a != b) parent[b] = a;
+        }
+    }
+    struct piece { double have = 0, want = 0; vec3 centre{0, 0, 0}; };
+    std::unordered_map<uint32_t, piece> pieces;
+    for (size_t t = 0; t < r.indices.size(); t += 3) {
+        const float a = area(&r.indices[t]);
+        piece& p = pieces[find(r.indices[t])];
+        p.have += a;
+        p.centre += (positions[r.indices[t]] + positions[r.indices[t + 1]] + positions[r.indices[t + 2]]) * (a / 3);
+    }
+    // each input triangle's area to the piece its first corner snapped into, else the piece
+    // with the nearest vertex (a needle that collapsed to a point).
+    std::vector<uint32_t> kept;
+    for (const auto& [v, root] : parent) kept.push_back(v);
+    std::sort(kept.begin(), kept.end());
+    for (size_t t = 0; t < input.size(); t += 3) {
+        const float a = area(&input[t]);
+        auto it = r.snapped.find(input[t]);
+        uint32_t to = it == r.snapped.end() ? input[t] : it->second;
+        if (!parent.count(to)) {
+            float best = INFINITY;
+            for (uint32_t v : kept) {
+                const vec3 off = positions[v] - positions[input[t]];
+                const float d = dot(off, off);
+                if (d < best) { best = d; to = v; }
+            }
+        }
+        pieces[find(to)].want += a;
+    }
+    // grow each piece short of its area about its area's centre; locked vertices stay.
+    std::unordered_map<uint32_t, uint32_t> moved;  // vertex: new_vertex_bit | k
+    for (auto& [root, p] : pieces) {
+        if (p.have <= 0 || p.want <= p.have * 1.02) continue;
+        const float scale = std::min(float(std::sqrt(p.want / p.have)), max_scale);
+        const vec3 centre = p.centre * float(1 / p.have);
+        for (const auto& [v, rv] : parent) {
+            if (locked[v] || find(v) != root) continue;
+            moved[v] = new_vertex_bit | uint32_t(r.new_positions.size());
+            r.new_positions.push_back(centre + (positions[v] - centre) * scale);
+            r.new_from.push_back(v);
+        }
+    }
+    if (moved.empty()) return;
+    // corners follow: untextured, a corner is its vertex; textured, a moved vertex gets a wedge
+    // per wedge it had, with the same coordinates.
+    std::unordered_map<uint64_t, uint32_t> made;
+    for (size_t i = 0; i < r.indices.size(); ++i) {
+        auto it = moved.find(r.indices[i]);
+        if (it == moved.end()) continue;
+        if (!w || w->uv.empty()) {
+            if (!r.corners.empty()) r.corners[i] = it->second;
+        } else {
+            const uint32_t old = r.corners[i];
+            const uint64_t key = uint64_t(it->second) << 32 | old;
+            auto [m, added] = made.emplace(key, new_wedge_bit | uint32_t(r.new_wedges.size()));
+            if (added) {
+                const bool fresh = old & new_wedge_bit;
+                const new_wedge& from = fresh ? r.new_wedges[old & ~new_wedge_bit] : new_wedge{};
+                r.new_wedges.push_back({fresh ? from.uv : w->uv[old], it->second, fresh ? from.chart : w->chart[old],
+                                        fresh ? from.material : (w->material.empty() ? uint8_t(0) : w->material[old])});
+            }
+            r.corners[i] = m->second;
+        }
+        r.indices[i] = it->second;
+    }
 }

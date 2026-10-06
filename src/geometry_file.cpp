@@ -28,6 +28,7 @@ geometry pack(const lod_mesh& lod) {
     for (const vec3& n : lod.normals) g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
     g.skin_joints = lod.skin_joints;
     g.skin_weights = lod.skin_weights;
+    g.vertex_source = lod.vertex_source;
     if (!lod.wedge_uvs.empty()) {
         g.wedge_vertex = lod.wedge_vertex;
         g.wedge_uvs = lod.wedge_uvs;

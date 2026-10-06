@@ -49,6 +49,7 @@ struct geometry {
     vec2 uv_min;
     float uv_extent = 1;
     std::vector<uint8_t> skin_joints, skin_weights;  // per vertex, four each, if skinned
+    std::vector<uint32_t> vertex_source;  // lod_mesh::vertex_source (in memory only, for the check)
     std::vector<uint32_t> cluster_vertices;  // wedges
     std::vector<uint32_t> cluster_triangles;  // a | b << 8 | c << 16
     std::vector<lod_level_stats> levels;

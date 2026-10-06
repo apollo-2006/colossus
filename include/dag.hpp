@@ -60,6 +60,9 @@ struct lod_mesh {
     std::vector<uint8_t> wedge_material;
     std::vector<material> materials;
     std::vector<uint8_t> skin_joints, skin_weights;  // per vertex, empty if unskinned (mesh.hpp)
+    // per vertex, the vertex it was grown from (itself if not grown: grow_to_area()); empty if
+    // none was. the crack check follows it to the original.
+    std::vector<uint32_t> vertex_source;
     std::vector<lod_cluster> clusters;  // level 0, then each level
     std::vector<lod_level_stats> levels;
 };

@@ -56,6 +56,9 @@ std::vector<cut_report> check_cuts(const geometry& g, int steps) {
         single_edges(cluster_triangles(g, [](const gpu_cluster& c) { return c.level == 0; }), g, original_area);
     std::vector<uint8_t> on_border(g.positions.size() / 3, 0);
     for (const tri_edge& e : original_border) on_border[e.a] = on_border[e.b] = 1;
+    // a vertex grown from another (foliage, grow_to_area()) is on a rim if what it grew from is.
+    for (uint32_t v = 0; v < g.vertex_source.size(); ++v)
+        if (g.vertex_source[v] != v) on_border[v] = on_border[g.vertex_source[v]];
 
     float top = 0;
     for (const gpu_cluster& c : g.clusters) top = std::max(top, c.lod_error);

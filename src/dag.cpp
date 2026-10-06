@@ -22,6 +22,40 @@ constexpr uint32_t max_levels = 48;
 // retried more gently (see build_lod).
 constexpr float outlier_ratio = 4.0f;
 constexpr size_t min_group_triangles = 64;
+// clustered foliage grows back the area its thin pieces lost (grow_to_area()), at most this
+// much across.
+constexpr bool preserve_area = true;
+constexpr float max_growth = 3.0f;
+constexpr float foliage_rims = 0.25f;  // share of a group's edges on rims that makes it foliage
+
+// the total area of triangles.
+float area(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices) {
+    double sum = 0;
+    for (size_t t = 0; t < indices.size(); t += 3)
+        sum += 0.5 * length(cross(positions[indices[t + 1]] - positions[indices[t]], positions[indices[t + 2]] - positions[indices[t]]));
+    return float(sum);
+}
+
+// the share of edges used an odd number of times (rims).
+float rim_share(const std::vector<uint32_t>& indices) {
+    std::vector<uint64_t> e;
+    e.reserve(indices.size());
+    for (size_t t = 0; t < indices.size(); t += 3)
+        for (int c = 0; c < 3; ++c) {
+            const uint32_t a = indices[t + c], b = indices[t + (c + 1) % 3];
+            e.push_back(uint64_t(std::min(a, b)) << 32 | std::max(a, b));
+        }
+    std::sort(e.begin(), e.end());
+    size_t edges = 0, rims = 0;
+    for (size_t k = 0; k < e.size();) {
+        size_t j = k;
+        while (j < e.size() && e[j] == e[k]) ++j;
+        ++edges;
+        rims += (j - k) % 2;
+        k = j;
+    }
+    return edges ? float(rims) / float(edges) : 0;
+}
 // go on until one cluster of at most this many triangles remains: every
 // instance draws at least its root.
 constexpr size_t root_triangles = 32;
@@ -363,9 +397,9 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
         const auto groups = partition(out.clusters, level);
         stats.groups = groups.size();
 
-        // a vertex is locked if two groups use it.
-        std::fill(owner.begin(), owner.end(), UINT32_MAX);
-        std::fill(locked.begin(), locked.end(), 0);
+        // a vertex is locked if two groups use it. (foliage grows new vertices: sized afresh.)
+        owner.assign(out.positions.size(), UINT32_MAX);
+        locked.assign(out.positions.size(), 0);
         for (uint32_t g = 0; g < groups.size(); ++g)
             for (uint32_t c : groups[g])
                 for (uint32_t v : out.clusters[c].indices) {
@@ -376,6 +410,7 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
         std::vector<std::vector<lod_cluster>> made(groups.size());
         std::vector<std::vector<new_wedge>> made_wedges(groups.size());
         std::vector<uint8_t> stuck(groups.size(), 0);
+        std::vector<std::pair<std::vector<vec3>, std::vector<uint32_t>>> grown(groups.size());  // new vertices, and whose
         parallel_for(groups.size(), [&](size_t g) {
             std::vector<uint32_t> merged, merged_corners;
             float child_error = 0;
@@ -417,11 +452,61 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
             // still stuck: islands (needles, leaves, blades) no collapse may remove, or thin parts.
             // vertex clustering merges them, the group's outline (locked vertices) kept in place
             // so its neighbours still meet it; the last group has no outline.
-            if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris)
+            bool clustered = false;
+            if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) {
                 s = cluster_vertices(out.positions, merged, std::max<size_t>(tris / 2, 1), &w, &locked);
+                clustered = true;
+            }
             if (s.indices.empty() || s.indices.size() / 3 > stuck_ratio * tris) {
                 stuck[g] = 1;
                 return;
+            }
+            // clustered foliage (a group mostly of open rims: needles, blades, cards) loses the
+            // pieces thinner than a cell: what's left grows to keep their area. closed surfaces
+            // (scans) are left as they are. (growing after edge collapses too compounded level on
+            // level until groups stuck: the pine never reached a root.)
+            const bool foliage = rim_share(merged) > foliage_rims;
+            if (clustered && preserve_area && foliage) {
+                grow_to_area(out.positions, merged, s, locked, &w, max_growth);
+                if (!s.new_positions.empty()) {
+                    // the group on its own vertices, the new ones after: errors and clusters from
+                    // these, indices back to the shared numbering (new ones still marked) after.
+                    std::vector<uint32_t> verts(merged);
+                    for (uint32_t v : s.indices)
+                        if (!(v & new_vertex_bit)) verts.push_back(v);
+                    std::sort(verts.begin(), verts.end());
+                    verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+                    std::vector<vec3> at(verts.size());
+                    for (size_t i = 0; i < verts.size(); ++i) at[i] = out.positions[verts[i]];
+                    at.insert(at.end(), s.new_positions.begin(), s.new_positions.end());
+                    auto local = [&](uint32_t v) {
+                        return v & new_vertex_bit ? uint32_t(verts.size()) + (v & ~new_vertex_bit)
+                                                  : uint32_t(std::lower_bound(verts.begin(), verts.end(), v) - verts.begin());
+                    };
+                    auto shared = [&](uint32_t l) { return l < verts.size() ? verts[l] : new_vertex_bit | uint32_t(l - verts.size()); };
+                    std::vector<uint32_t> local_merged(merged), local_simplified(s.indices);
+                    for (uint32_t& v : local_merged) v = local(v);
+                    for (uint32_t& v : local_simplified) v = local(v);
+                    const float measured = mesh_deviation(at, local_merged, local_simplified, 0.1f, bounds.radius * 1e-6f);
+                    const float lost = foliage ? std::sqrt(std::max(0.0f, area(at, local_merged) - area(at, local_simplified))) : 0.0f;
+                    const float error = child_error + std::max({s.error, measured, lost});
+                    for (const auto& tris_of : clusterize(at, local_simplified, out.wedge_uvs.empty() ? nullptr : &s.corners)) {
+                        lod_cluster c;
+                        for (uint32_t t : tris_of) {
+                            c.indices.insert(c.indices.end(), &local_simplified[3 * t], &local_simplified[3 * t + 3]);
+                            c.corners.insert(c.corners.end(), &s.corners[3 * t], &s.corners[3 * t + 3]);
+                        }
+                        cluster_bounds(at, c);
+                        for (uint32_t& v : c.indices) v = shared(v);
+                        c.lod_bounds = bounds;
+                        c.lod_error = error;
+                        c.level = depth + 1;
+                        made[g].push_back(std::move(c));
+                    }
+                    made_wedges[g] = std::move(s.new_wedges);
+                    grown[g] = {std::move(s.new_positions), std::move(s.new_from)};
+                    return;
+                }
             }
             // choosing between the two simplifications by sampled distance (cheap, and the
             // choice need not be proven), then proving the chosen one's: refined until within
@@ -465,7 +550,11 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
                     posed = std::max(posed, sampled_deviation(at, local_merged, local_simplified));
                 }
             }
-            const float error = child_error + std::max({s.error, measured, posed});
+            // foliage: the error is also the side of the square of area it lost, so a cut drawn at
+            // t pixels loses at most about t * t pixels of coverage per group. a hausdorff bound
+            // alone lets a crown lose half its needles: each removed one lies near a kept one.
+            const float lost = foliage ? std::sqrt(std::max(0.0f, area(out.positions, merged) - area(out.positions, s.indices))) : 0.0f;
+            const float error = child_error + std::max({s.error, measured, posed, lost});
             make_clusters(s.indices, s.corners, made[g]);
             made_wedges[g] = std::move(s.new_wedges);
             for (lod_cluster& c : made[g]) {
@@ -492,15 +581,41 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
                 out.clusters[c].parent_error = made[g][0].lod_error;
                 out.clusters[c].group = group_id;
             }
-            // wedges the group's relaxed seams made, numbered after the rest.
-            const uint32_t wedge_base = static_cast<uint32_t>(out.wedge_uvs.size());
+            // vertices grown foliage moved, numbered after the rest, each copying its source's
+            // normal and skin (untextured, its wedge is itself).
+            const uint32_t vertex_base = static_cast<uint32_t>(out.positions.size());
+            const auto& [new_positions, new_from] = grown[g];
+            if (!new_positions.empty() && out.vertex_source.empty()) {
+                out.vertex_source.resize(vertex_base);
+                std::iota(out.vertex_source.begin(), out.vertex_source.end(), 0u);
+            }
+            for (size_t k = 0; k < new_positions.size(); ++k) {
+                out.vertex_source.push_back(new_from[k]);
+                out.positions.push_back(new_positions[k]);
+                out.normals.push_back(out.normals[new_from[k]]);
+                if (!out.skin_weights.empty())
+                    for (int j = 0; j < 4; ++j) {
+                        out.skin_joints.push_back(out.skin_joints[4 * size_t(new_from[k]) + j]);
+                        out.skin_weights.push_back(out.skin_weights[4 * size_t(new_from[k]) + j]);
+                    }
+                if (out.wedge_uvs.empty()) {
+                    out.wedge_vertex.push_back(vertex_base + uint32_t(k));
+                    out.wedge_chart.push_back(0);
+                }
+            }
+            auto real_vertex = [&](uint32_t v) { return v & new_vertex_bit ? vertex_base + (v & ~new_vertex_bit) : v; };
+            // wedges the group's relaxed seams (or grown vertices) made, numbered after the rest.
+            const uint32_t wedge_base = static_cast<uint32_t>(out.wedge_uvs.empty() ? 0 : out.wedge_uvs.size());
             for (const new_wedge& nw : made_wedges[g]) {
                 out.wedge_uvs.push_back(nw.uv);
                 out.wedge_material.push_back(nw.material);
-                out.wedge_vertex.push_back(nw.vertex);
+                out.wedge_vertex.push_back(real_vertex(nw.vertex));
                 out.wedge_chart.push_back(nw.chart);
             }
             for (lod_cluster& c : made[g]) {
+                for (uint32_t& v : c.indices) v = real_vertex(v);
+                if (out.wedge_uvs.empty())
+                    for (uint32_t& k : c.corners) k = real_vertex(k);
                 for (uint32_t& k : c.corners)
                     if (k & new_wedge_bit) k = wedge_base + (k & ~new_wedge_bit);
                 c.creator = group_id;
