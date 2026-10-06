@@ -6,7 +6,7 @@ name: demo
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'include/**', 'tools/**', 'web/**', 'models/fetch.sh', 'Makefile', '.github/workflows/pages.yml']
+    paths: ['src/**', 'include/**', 'tools/**', 'web/**', 'models/fetch.sh', 'Makefile', 'tests/web_screenshot.mjs', '.github/workflows/pages.yml']
   workflow_dispatch:
 
 permissions:
@@ -52,6 +52,16 @@ jobs:
       - name: Build the web models
         if: steps.models.outputs.cache-hit != 'true'
         run: web/build.sh
+      # no gpu here, so the page falls back to webgl2 in chrome's own renderer: each model
+      # must load, stream and draw without a page error before anything is published.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check the page draws every model
+        run: |
+          for m in lucy dragon washington fox; do
+            node tests/web_screenshot.mjs --software --check --query "fallback&still&model=$m" --wait 25 --out "/tmp/web_$m.png"
+          done
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web

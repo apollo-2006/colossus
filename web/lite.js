@@ -636,6 +636,9 @@ export async function startLite(canvas, ui) {
       frames = 0;
     }
   };
+  // ?model=washington (or lucy, dragon, fox) opens on that model.
+  const asked = new URLSearchParams(location.search).get('model');
+  if (asked && [...ui.model.options].some((o) => o.value === `models/${asked}`)) ui.model.value = `models/${asked}`;
   await load(ui.model.value);
   requestAnimationFrame(frame);
   return true;
