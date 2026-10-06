@@ -14,7 +14,7 @@ shadows and shading all live in this repository.
 webgpu port, with the debug views, the error threshold and the crowd size to play with.
 
 **[read how it was built →](https://abirdeol.tech/abir-deol-colossus-within-a-pixel.pdf)**
-*within a pixel*, an 11 page write-up: the hierarchy, the proven error bound and how it's
+*within a pixel*, an 11 page write-up (a working draft, still being revised): the hierarchy, the proven error bound and how it's
 checked, streaming, textures, skinning, foliage, a comparison with meshoptimizer, and where
 the proofs ran out.
 
