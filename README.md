@@ -15,6 +15,10 @@ it started as a "let me actually understand nanite" side project that I didn't e
 to put on github, and then I got a little obsessed. the thing I cared about most is making
 "within a pixel" a real, proven bound instead of an estimate, and checking that it holds.
 
+I'd been prototyping it locally since february 2026, outside of git, so the commit
+history here only starts in october, when I moved it into a repo and got it ready to
+publish.
+
 **[fly through it in your browser →](https://apollo-2006.github.io/colossus/)** the
 webgpu port, with the debug views, the error threshold and the crowd size to play with
 (needs a desktop gpu).
