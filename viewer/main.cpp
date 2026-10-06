@@ -203,7 +203,12 @@ int main(int argc, char** argv) {
             std::vector<double> service_ms;
             const auto loop_start = std::chrono::steady_clock::now();
             double settled_ms = 0;
+            const std::vector<camera_key> path = opt.path.empty() ? std::vector<camera_key>{} : read_camera_path(opt.path, opt.threshold);
             for (int i = 0; i < total + 2; ++i) {
+                if (!path.empty()) {
+                    sample_camera_path(path, path[0].t + std::max(i - opt.warmup, 0) / 60.0f, v.cam, v.threshold);
+                    v.cull_cam = v.cam;
+                }
                 if (opt.fly != 0 && i > 0) {
                     v.cam.eye += v.cam.forward() * opt.fly;
                     v.cam.yaw += 0.004f;

@@ -21,6 +21,7 @@ struct options {
     int frames = 0;  // headless: frames drawn and timed
     std::string screenshot;
     std::string record;  // headless: every frame after the warmup as DIR/frame_NNNNN.png
+    std::string path;    // headless: a camera path (camera.hpp) followed from the first recorded frame
     float threshold = 1.0f;
     uint32_t mode = 0;
     bool camera_set = false;
@@ -68,6 +69,7 @@ options parse(int argc, char** argv) {
         else if (a == "--frames") o.frames = std::stoi(next());
         else if (a == "--screenshot") o.screenshot = next();
         else if (a == "--record") o.record = next();
+        else if (a == "--path") o.path = next();
         else if (a == "--threshold") o.threshold = std::stof(next());
         else if (a == "--mode") o.mode = std::min<uint32_t>(std::stoul(next()), mode_count - 1);
         else if (a == "--validate") o.validate = true;
