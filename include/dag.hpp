@@ -67,6 +67,12 @@ struct lod_mesh {
     std::vector<lod_level_stats> levels;
 };
 
+// foliage (a group mostly of open rims) errors are at least this times the root of the area its
+// simplification lost: a cut at t pixels loses about (t / weight)^2 pixels of coverage a group. 1
+// kept a pine at 200 m 95% covered at 1 px for 2.5 times the triangles; a half keeps 91% (88%
+// without) for 1.4 times.
+constexpr float foliage_coverage_weight = 0.5f;
+
 // builds the hierarchy over a welded mesh. one log line per level if verbose.
 //
 // skinned, with poses (joint matrices, 3x4 rows each, in the mesh's space): each group's

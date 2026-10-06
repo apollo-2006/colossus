@@ -27,6 +27,7 @@ constexpr size_t min_group_triangles = 64;
 constexpr bool preserve_area = true;
 constexpr float max_growth = 3.0f;
 constexpr float foliage_rims = 0.25f;  // share of a group's edges on rims that makes it foliage
+constexpr float coverage_weight = foliage_coverage_weight;
 
 // the total area of triangles.
 float area(const std::vector<vec3>& positions, const std::vector<uint32_t>& indices) {
@@ -488,7 +489,7 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
                     for (uint32_t& v : local_merged) v = local(v);
                     for (uint32_t& v : local_simplified) v = local(v);
                     const float measured = mesh_deviation(at, local_merged, local_simplified, 0.1f, bounds.radius * 1e-6f);
-                    const float lost = foliage ? std::sqrt(std::max(0.0f, area(at, local_merged) - area(at, local_simplified))) : 0.0f;
+                    const float lost = foliage ? coverage_weight * std::sqrt(std::max(0.0f, area(at, local_merged) - area(at, local_simplified))) : 0.0f;
                     const float error = child_error + std::max({s.error, measured, lost});
                     for (const auto& tris_of : clusterize(at, local_simplified, out.wedge_uvs.empty() ? nullptr : &s.corners)) {
                         lod_cluster c;
@@ -553,7 +554,7 @@ lod_mesh build_lod(const mesh& m, bool verbose, const std::vector<std::vector<fl
             // foliage: the error is also the side of the square of area it lost, so a cut drawn at
             // t pixels loses at most about t * t pixels of coverage per group. a hausdorff bound
             // alone lets a crown lose half its needles: each removed one lies near a kept one.
-            const float lost = foliage ? std::sqrt(std::max(0.0f, area(out.positions, merged) - area(out.positions, s.indices))) : 0.0f;
+            const float lost = foliage ? coverage_weight * std::sqrt(std::max(0.0f, area(out.positions, merged) - area(out.positions, s.indices))) : 0.0f;
             const float error = child_error + std::max({s.error, measured, posed, lost});
             make_clusters(s.indices, s.corners, made[g]);
             made_wedges[g] = std::move(s.new_wedges);

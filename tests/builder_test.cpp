@@ -814,7 +814,7 @@ void test_deviation_bound() {
 
 // foliage keeps its coverage (dag.cpp): grow_to_area() gives clustered pieces back the area
 // of what merged into them without moving a locked vertex, and every foliage group's error is
-// at least its inputs' plus the side of the square of area it lost.
+// at least its inputs' plus foliage_coverage_weight times the side of the square of area it lost.
 void test_foliage_coverage() {
     std::printf("foliage coverage\n");
     auto area = [](const std::vector<vec3>& p, const std::vector<uint32_t>& idx) {
@@ -868,7 +868,7 @@ void test_foliage_coverage() {
         }
         const double lost = std::max(0.0, area(lod.positions, in_idx) - area(lod.positions, out_idx));
         ++groups;
-        if (error < (child + std::sqrt(lost)) * 0.999 - 1e-7) ++short_of;
+        if (error < (child + foliage_coverage_weight * std::sqrt(lost)) * 0.999 - 1e-7) ++short_of;
     }
     std::printf("  %zu groups, %zu with an error short of the area they lost\n", groups, short_of);
     CHECK(groups > 100 && short_of == 0);
