@@ -23,11 +23,6 @@ publish.
 webgpu port, with the debug views, the error threshold and the crowd size to play with
 (needs a desktop gpu).
 
-**[read how it was built →](https://abirdeol.tech/abir-deol-colossus-within-a-pixel.pdf)**
-*within a pixel*, my write-up of the whole thing (a working draft, still being revised):
-the hierarchy, the error bound and how I check it, streaming, textures, skinning, foliage,
-a comparison with meshoptimizer, and all the places the proofs ran out.
-
 [![a minute of colossus: the forest, the crowd, the error slider on lucy's clusters, a museum scan, skinned foxes and a million instances](docs/video.jpg)](https://apollo-2006.github.io/colossus/colossus.mp4)
 
 ![900 instances of lucy and the xyz rgb dragon in sunlight, shadowed by virtual shadow maps](docs/crowd.png)
@@ -40,8 +35,7 @@ actually reach the screen, from about 20 mb of the 427 mb on disk. a million ins
 
 ## how it works
 
-the [write-up](https://abirdeol.tech/abir-deol-colossus-within-a-pixel.pdf) has the whole
-story, but here's the short version:
+the short version:
 
 * **a hierarchy of clusters.** every model gets cut into clusters of at most 128
   triangles by recursively bisecting its triangle graph (an earlier greedy approach kept
